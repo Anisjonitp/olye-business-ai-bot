@@ -1,101 +1,55 @@
-export const DEFAULT_TEMPLATES = {
-  greeting: {
-    title: 'Salomlashish / ariza so‘rash',
-    lead_status: 'new',
-    text: 'Va alaykum assalom. Siz “O‘zbekiston Lider Yoshlari Ensiklopediyasi”ga kirish uchun ariza qoldirgandingizmi?'
-  },
-  application_yes: {
-    title: 'Ariza qoldirganini tasdiqladi',
-    lead_status: 'qualified',
-    text: 'Juda yaxshi. Siz ensiklopediyamizga kirishning foydali jihatlari haqida batafsil ma’lumotga egamisiz?'
-  },
-  application_no: {
-    title: 'Ariza qoldirmagan / adashgan',
-    lead_status: 'not_interested',
-    text: 'Tushunarli, unda bezovta qilgan bo‘lsam uzr. Agar keyinroq loyiha haqida ma’lumot kerak bo‘lsa, bemalol yozishingiz mumkin.'
-  },
-  needs_info: {
-    title: 'Ma’lumot kerak / foydali jihatlarni bilmaydi',
-    lead_status: 'needs_info',
-    text: 'Qisqacha tushuntiraman: ensiklopediyaga kiritilgan ishtirokchi uchun alohida sahifa tayyorlanadi. Bu sahifa internetda ko‘rinadi, portfolio sifatida ishlatiladi va keyinchalik grant, forum, tanlov yoki rasmiy tavsiyanomalarda foyda berishi mumkin. Kirish tartibi va texnik badal haqida ham aytib beraymi?'
-  },
-  info_known: {
-    title: 'Ma’lumotga ega ekanini aytdi',
-    lead_status: 'qualified',
-    text: 'Juda yaxshi. Unda kirish tartibi va yillik texnik badal haqida qisqacha aytib beraymi?'
-  },
-  asks_price: {
-    title: 'Narx / badal so‘radi',
-    lead_status: 'price_asked',
-    text: 'Yillik texnik badal 100 000 so‘m. Bu sahifani tayyorlash, joylashtirish, texnik yuritish va sertifikat bilan bog‘liq xarajatlar uchun. To‘lov tartibini ham yuboraymi?'
-  },
-  wants_to_pay: {
-    title: 'To‘lovga tayyor',
-    lead_status: 'hot',
-    notify_admin: true,
-    text: 'Yaxshi. To‘lov qilish uchun ma’lumotlarni yuboraman. To‘lovdan keyin chek/skrinshotni shu yerga yuborsangiz, sahifani tayyorlash jarayoni boshlanadi.'
-  },
-  trust_objection: {
-    title: 'Ishonchsizlik / isbot so‘radi',
-    lead_status: 'needs_info',
-    text: 'Tushunarli, bunday savol berishingiz tabiiy. Loyiha ishtirokchilarni ensiklopedik sahifa orqali yoritishga qaratilgan: har bir ishtirokchi uchun alohida sahifa tayyorlanadi va tasdiqlovchi sertifikat beriladi. Xohlasangiz, kirish tartibini bosqichma-bosqich tushuntirib beraman.'
-  },
-  certificate_question: {
-    title: 'Sertifikat haqida so‘radi',
-    lead_status: 'needs_info',
-    text: 'Ha, ishtirokchiga loyiha doirasida tasdiqlovchi sertifikat beriladi. Sertifikat sahifa tayyorlanishi va ma’lumotlar tasdiqlanishi bilan bog‘liq jarayondan keyin rasmiylashtiriladi.'
-  },
-  search_visibility: {
-    title: 'Google/qidiruv/AI ko‘rinishi haqida',
-    lead_status: 'needs_info',
-    text: 'Sahifa internetda ochiq joylashtiriladi. Shu sababli u qidiruv tizimlarida ko‘rinishi va keyinchalik portfolio, grant, forum yoki tanlovlarda havola sifatida ishlatilishi mumkin.'
-  },
-  payment_method: {
-    title: 'To‘lov usuli so‘radi',
-    lead_status: 'price_asked',
-    notify_admin: true,
-    text: 'To‘lov ma’lumotlarini yuboraman. To‘lovdan keyin chek/skrinshotni shu yerga tashlab qo‘ysangiz, arizangizni keyingi bosqichga o‘tkazamiz.'
-  },
-  later: {
-    title: 'Keyinroq to‘layman / o‘ylab ko‘raman',
-    lead_status: 'qualified',
-    text: 'Mayli, tushunarli. Sizni ro‘yxatda saqlab turaman. Tayyor bo‘lganingizda yozsangiz, kirish tartibi va to‘lov bo‘yicha yordam beraman.'
-  },
-  not_interested: {
-    title: 'Qiziqmadi / rad etdi',
-    lead_status: 'not_interested',
-    text: 'Tushunarli. Bezovta qilgan bo‘lsam uzr. Keyinchalik kerak bo‘lsa, bemalol yozishingiz mumkin.'
-  },
-  asks_human: {
-    title: 'Operator/odam so‘radi',
-    lead_status: 'human_needed',
-    notify_admin: true,
-    pause_bot: true,
-    text: 'Albatta. Hozir murojaatingizni mas’ul odamga yetkazaman, sizga javob berishadi.'
-  },
-  bot_question: {
-    title: 'Botmisan deb so‘radi',
-    lead_status: 'qualified',
-    text: 'Men murojaatlarga tezroq javob berishga yordam beruvchi avtomatlashtirilgan yordamchiman. Kerak bo‘lsa, mas’ul odamga ham ulab beraman.'
-  },
-  off_topic: {
-    title: 'Mavzudan tashqari',
-    lead_status: 'new',
-    text: 'Men asosan “O‘zbekiston Lider Yoshlari Ensiklopediyasi” bo‘yicha ma’lumot bera olaman. Siz ariza yoki kirish tartibi bo‘yicha so‘rayapsizmi?'
-  },
-  unknown: {
-    title: 'Tushunarsiz xabar',
-    lead_status: 'new',
-    text: 'Tushunarli. Aniqlashtirib olay: siz ensiklopediyaga kirish shartlari, foydali jihatlari yoki texnik badal haqida ma’lumot olmoqchimisiz?'
-  }
+const DEFAULT_TEMPLATES = {
+  start_application_check: `Va alaykum assalom. Siz “O‘zbekiston Lider Yoshlari Ensiklopediyasi”ga kirish uchun ariza qoldirgansiz. Shunaqami?`,
+
+  application_yes: `Ajoyib. Siz ensiklopediyamizga kirishning foydali jihatlari haqida batafsil ma'lumotga egamisiz?`,
+
+  info_intro: `Keling, unda sizga yana bir tanishtirib o‘taman.
+
+“O‘zbekiston Lider Yoshlari Ensiklopediyasi” yoshlarning faoliyati, yutuqlari va biografik ma’lumotlarini ensiklopedik shaklda yoritishga qaratilgan loyiha hisoblanadi.
+
+Ensiklopediyaga kiritilgan nomzod uchun alohida biografik maqola tayyorlanadi. Bu maqola internetda ko‘rinadi, portfolio sifatida ishlatiladi va keyinchalik grant, forum, tanlov yoki rasmiy tavsiyanomalarda foyda berishi mumkin.
+
+Oferta va xabar bilan tanishib chiqing va ayting!!!`,
+
+  ask_acceptable: `Ajoyib, sizga ma’qulmi? Sizga ham biografik maqola yozamizmi unda ensiklopediyamizga kiritish uchun?`,
+
+  biography_questions: `Iltimos, maqolaga asos bo‘ladigan savollarga javob bering!
+Javoblarni yonidan xos tartib raqam qo‘ying.
+Maqola va brending ishlari uchun to‘g‘riga qaragan, rasmiy kiyingan rasmingizni yuboring!
+
+📋 Biografik maqola yozish uchun savollar:
+
+1. To‘liq ismingiz va familiyangiz?
+2. Tug‘ilgan yilingiz, kuni va joyingiz?
+3. Hozirgi yashash joyingiz (viloyat/tuman/shahar)?
+4. Ta’lim darajangiz va o‘qigan o‘quv yurtlaringiz?
+5. Qaysi sohada faoliyat yuritasiz yoki o‘qiyapsiz?
+6. Faoliyatingizni qachondan va qanday boshlagansiz?
+7. Erishgan muhim yutuqlaringiz (tanlovlar, sertifikatlar, loyihalar, mukofotlar)?
+8. Hayotingizda sizga ta’sir qilgan biror shaxs yoki voqea bormi?
+9. Sizni ilhomlantiradigan shior yoki hayotiy prinsipingiz qanday?
+10. Bo‘sh vaqtingizda nima bilan shug‘ullanasiz?
+11. Sizningcha, lider bo‘lish uchun eng muhim fazilat nima?
+12. Kelajakdagi rejalaringiz va orzu-maqsadlaringiz nimalardan iborat?
+13. Sizdan boshqalar nimani o‘rganishlari mumkin deb o‘ylaysiz?
+14. O‘zingiz haqingizda yana qanday qiziqarli yoki muhim ma’lumot bo‘lishi mumkin?
+15. Boshqa yoshlar uchun qanday maslahat yoki motivatsion fikr bildirasiz?
+
+Liderlar.uz | Instagram | @uzlye_rasmiy`,
+
+  price_info: `Bizda maqola joylashning yillik badali bor va u hozirda 100 000 so‘mni tashkil qiladi.
+
+Pullar saytni va maqolalarni texnik jihatdan ta’minlash, sifatli yuritish va saqlashga sarflanadi.
+
+Kelajakda biror yangi loyiha qilsangiz yoki o‘zgartirish kerak bo‘lsa, bir hafta ichida bu xizmatlar bepul bo‘ladi. Agar ko‘rsatilgan muddatdan keyin maqolani o‘zgartirish yoki unga yangilik kiritish kerak bo‘lsa, bu 20 000 so‘mni tashkil qiladi.
+
+Undan tashqari kelajakda turli seminar, podcastlar va reels videolar qilishni rejalayapmiz. Bu ishlarda ham ensiklopediyamizga kirgan nomzodlarning virtual imidjini yaxshilash uchun harakat qilamiz, jumladan sizning ham.
+
+To‘lov bilan muammo bo‘lsa, ushbu pulni 14 kunda bo‘lib-bo‘lib to‘lash imkoni ham bor.`,
+
+  decline: `Ho‘p, fikringiz o‘zgarsa shu yerdamiz.`,
+
+  no_reply: ``
 };
 
-export function templateListForPrompt() {
-  return Object.entries(DEFAULT_TEMPLATES)
-    .map(([key, value]) => `- ${key}: ${value.title}`)
-    .join('\n');
-}
-
-export function renderTemplate(text, vars = {}) {
-  return String(text || '').replace(/\{(\w+)\}/g, (_, key) => vars[key] ?? '');
-}
+module.exports = { DEFAULT_TEMPLATES };
