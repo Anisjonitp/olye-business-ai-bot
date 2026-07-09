@@ -1,16 +1,30 @@
 # OLYE Business AI Bot v5 Lite
 
-Bu bot Telegram Business profilingiz nomidan yangi lidlarni biografik savollargacha olib keladi.
+Telegram Business profilingiz nomidan yangi lidlarni **biografik savollargacha** olib keladigan sodda bot.
 
-Botning vazifasi oddiy:
+Bot CRM emas. Vazifasi bitta: lidni tartibli savdo oqimidan olib o‘tib, bio savollarni yuborish. Bio savollardan keyin bot o‘sha chatda to‘xtaydi, qolganini o‘zingiz qo‘lda davom ettirasiz.
 
-1. Siz odamga Telegramda birinchi yozasiz: `Assalomu alaykum, yaxshimisiz?`
-2. Odam javob bersa, bot xavfsiz rejimda avval admin chatga signal beradi.
-3. Admin `✅ Oqimni boshlash` tugmasini bossa, bot savdo oqimini davom ettiradi.
-4. Agar bu eski yozishma bo'lsa, admin `🔕 Eski chat / botni o'chirish` tugmasini bosadi.
-5. Bot ariza, ma'lumot, oferta va maqola taklifini bosqichma-bosqich olib boradi.
-6. Biografik savollar yuborilgach bot shu chatda to'xtaydi.
-7. Qolgan ishlarni o'zingiz qo'lda davom ettirasiz.
+## Asosiy mantiq
+
+1. Siz Telegramda odamga birinchi yozasiz: `Assalomu alaykum, yaxshimisiz?`
+2. Agar chat DB’da yo‘q bo‘lsa, default rejimda bot mijozga ham, admin chatga ham javob yubormaydi.
+3. Chat `/menu → 🆕 Tasdiq kutayotganlar` ichiga tushadi.
+4. Yangi lid bo‘lsa `▶️ Oqimni boshlash` bosasiz.
+5. Eski chat bo‘lsa `🔕 O‘chirish` bosasiz.
+6. Bot ariza/qiziqish, ma’lumot, oferta, maqola taklifi va bio savollarni bosqichma-bosqich yuboradi.
+7. Bio savollar yuborilgach bot to‘xtaydi.
+
+## Muhim imkoniyatlar
+
+- `silent_queue`: yangi/aniqlanmagan chatlar adminni spam qilmaydi.
+- AI intent: “instagramda qoldirdim”, “do‘stim aytdi”, “yozgandim” kabi g‘alati javoblarni tushunadi.
+- Stage sistemi: “ha” har bosqichda to‘g‘ri talqin qilinadi.
+- AI tushunmasa: mijozga xato javob yubormaydi, oldingi stage saqlanadi va `⚠️ AI tushunmaganlar` ro‘yxatiga tushadi.
+- Rad javob: “kerak emas”, “qiziq emas” desa bot yumshoq yakunlaydi va to‘xtaydi.
+- Keyinroq: “hozir bandman”, “keyinroq” desa bot keyinroqqa qo‘yadi.
+- Narx savoli: “narxi qancha?”, “pullikmi?” desa tayyor shablondan javob beradi.
+- Duplicate protection: bir xil Telegram message qayta kelsa, bot ikki marta javob bermaydi.
+- Admin tugmali panel: ro‘yxatlar, lid kartochkasi, shablon tahrirlash.
 
 ## Fayllar
 
@@ -18,7 +32,8 @@ Botning vazifasi oddiy:
 index.js          Asosiy bot kodi
 package.json      Render uchun Node sozlamalari
 .env.example      Environment variables namunasi
-supabase.sql      Supabase jadvallar va boshlang'ich shablonlar
+supabase.sql      Supabase jadvallar va boshlang‘ich shablonlar
+.gitignore
 ```
 
 ## Render sozlamalari
@@ -37,7 +52,7 @@ node index.js
 
 ## Environment Variables
 
-Render → Environment bo'limiga quyidagilarni qo'shing:
+Render → Environment bo‘limiga quyidagilarni qo‘shing:
 
 ```text
 BOT_TOKEN=
@@ -48,111 +63,98 @@ SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4.1-mini
-FIRST_CONTACT_MODE=approval
+AI_CONFIDENCE_MIN=0.65
+FIRST_CONTACT_MODE=silent_queue
+WEBHOOK_URL=https://your-render-service.onrender.com/webhook
 ```
 
-`OWNER_TELEGRAM_ID` ixtiyoriy, lekin xavfsizlik uchun qo'ygan yaxshi.
+`FIRST_CONTACT_MODE=silent_queue` tavsiya qilinadi. Bu eski chatlarni adashtirib yubormaslik va adminni spam qilmaslik uchun eng xavfsiz rejim.
 
 ## Supabase
 
-1. Supabase loyihangizga kiring.
-2. SQL Editor'ni oching.
-3. `supabase.sql` ichidagi kodni to'liq ishlating.
+Supabase → SQL Editor’da `supabase.sql` faylini to‘liq ishlating.
+
+Agar oldin `admin_sessions` schema xatosi chiqqan bo‘lsa, bu SQL uni tuzatadi, chunki `admin_sessions` jadvali qayta yaratiladi.
 
 ## Webhook ulash
 
-Eng oson yo‘l: Render deploy bo‘lgandan keyin brauzerda shu URL’ni oching:
+Render deploy bo‘lgandan keyin brauzerda oching:
 
 ```text
 https://SENING-RENDER-URL.onrender.com/set-webhook
 ```
 
-Agar JSON ichida `ok: true` va `Webhook ulandi` chiqsa, webhook ulangan bo‘ladi.
-
-Webhook holatini ko‘rish uchun:
+Tekshirish:
 
 ```text
 https://SENING-RENDER-URL.onrender.com/webhook-info
 ```
 
-Qo‘lda curl orqali ulash varianti ham bor:
-
-Render saytingiz URL'i masalan shunday bo'lsa:
+Sog‘lik tekshiruvi:
 
 ```text
-https://olye-business-ai-bot.onrender.com
+https://SENING-RENDER-URL.onrender.com/health
 ```
 
-Webhook URL:
+## Admin menyu
+
+Telegramda admin chatdan botga yuboring:
 
 ```text
-https://olye-business-ai-bot.onrender.com/webhook
+/menu
 ```
 
-Telegram webhook o'rnatish:
-
-```bash
-curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url":"https://olye-business-ai-bot.onrender.com/webhook",
-    "secret_token":"WEBHOOK_SECRET_BU_YERGA",
-    "allowed_updates":["message","callback_query","business_message"]
-  }'
-```
-
-`<BOT_TOKEN>` va `WEBHOOK_SECRET_BU_YERGA` joylariga o'zingiznikini yozing.
-
-
-
-## Eski chatlar xavfsizligi
-
-Telegram Business bot eski yozishmalar tarixini avtomatik ko'ra olmaydi. Shuning uchun DB'da yo'q chat birinchi marta yozsa, bot uni yangi lid deb darrov boshlamaydi.
-
-Default sozlama:
+Menyu bo‘limlari:
 
 ```text
-FIRST_CONTACT_MODE=approval
+📊 Hisobot
+🆕 Tasdiq kutayotganlar
+🟢 Faol lidlar
+🟡 Chala lidlar
+⚠️ AI tushunmaganlar
+✅ Savollargacha yetganlar
+✏️ Shablonlar
+⚙️ Yordam
 ```
 
-Bu rejimda:
+Har bir lid kartochkasida:
 
 ```text
-1. Eski yoki yangi aniqlanmagan chat yozadi.
-2. Bot mijozga javob bermaydi.
-3. Admin chatga xabar keladi.
-4. Admin `✅ Oqimni boshlash` bossa — bot ariza shablonidan boshlaydi.
-5. Admin `🔕 Eski chat / botni o'chirish` bossa — bot shu chatda jim turadi.
+▶️ Oqimni boshlash
+⏸ To‘xtatish
+🔁 Qayta boshlash
+🔔 Yoqish
+🔕 O‘chirish
+📌 Yangilash
 ```
 
-Keyinchalik hammasi toza bo'lib ketgach, avtomatik start kerak bo'lsa:
+AI tushunmagan lidda qo‘shimcha:
 
 ```text
-FIRST_CONTACT_MODE=auto
+✅ Ha deb davom ettirish
+❌ Yo‘q/to‘xtatish
 ```
 
-lekin eski chatlar ko'p bo'lgan holatda `approval` xavfsizroq.
-
-## Admin buyruqlar
+## Asosiy buyruqlar
 
 ```text
-/menu — tugmali menyu
-/report — hisobot
-/stalled — chala lidlar
-/templates — shablonlar
-/gettemplate key — shablonni ko'rish
-/settemplate key matn — shablonni o'zgartirish
-/leadson chat_id — chatda botni yoqish
-/leadsoff chat_id — chatda botni o'chirish
-/status chat_id — lid holati
-/discount_preview — chegirma yuborishni oldindan ko'rish
-/discount_confirm ID — chegirmani tasdiqlab yuborish
-/discount_cancel ID — chegirmani bekor qilish
-/installment chat_id amount — bo'lib to'lashni qayd qilish
-/installments_due — eslatma muddati kelgan bo'lib to'lashlar
+/menu
+/report
+/pending
+/active
+/stalled
+/needsadmin
+/reached
+/templates
+/gettemplate key
+/settemplate key yangi matn
+/status chat_id
+/leadson chat_id
+/leadsoff chat_id
+/restart chat_id
 ```
 
-## Shablon kalitlari
+## Shablon keylari
 
 ```text
 ask_application
@@ -162,35 +164,28 @@ full_intro
 offer_end
 ask_bio_confirm
 bio_questions
-discount_message
+price_reply
+later_reply
+reject_reply
 ```
 
-## Muhim mantiq
+## AI nima qiladi?
 
-AI mijozga erkin javob yozmaydi. AI faqat mijoz javobining niyatini aniqlaydi:
+AI mijozga erkin matn yozmaydi. Faqat quyidagi intentlardan birini aniqlaydi:
 
 ```text
 greeting_positive
-yes
+application_confirmed
+application_denied
 has_info
 no_info
 ok_wait
 read_offer
 agree_bio
-no
+reject
+later
+price_question
 unclear
 ```
 
-Ketma-ketlikni AI emas, Supabase'dagi `stage` ushlab turadi. Shuning uchun `ha` javobi qaysi bosqichda kelganiga qarab tushuniladi.
-
-## Savollardan keyin
-
-`bio_questions` yuborilgach:
-
-```text
-stage = bio_questions_sent
-status = stopped
-bot_enabled = false
-```
-
-Bot shu chatda to'xtaydi va sizga admin chatga signal yuboradi.
+Javoblar faqat Supabase’dagi `reply_templates` jadvalidan chiqadi.

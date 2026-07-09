@@ -15,13 +15,17 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || process.env.SUPABASE_ANON_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
-// approval = yangi ko'rinmagan chatlarda avval admin tasdiqlaydi. auto = eski holat, darrov oqim boshlaydi.
-const FIRST_CONTACT_MODE = (process.env.FIRST_CONTACT_MODE || 'approval').toLowerCase();
+
+// silent_queue = DB'da yo'q chatlarni admin xabarisiz navbatga qo'yadi.
+// approval = yangi chatda admin chatga tugmali signal yuboradi.
+// auto = salomdan keyin avtomatik oqim boshlaydi.
+const FIRST_CONTACT_MODE = (process.env.FIRST_CONTACT_MODE || 'silent_queue').toLowerCase();
+const AI_CONFIDENCE_MIN = Number(process.env.AI_CONFIDENCE_MIN || 0.65);
 
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL missing');
 if (!SUPABASE_KEY) throw new Error('SUPABASE key missing');
-if (!ADMIN_CHAT_ID) console.warn('ADMIN_CHAT_ID missing. Admin menu and alerts will not work.');
+if (!ADMIN_CHAT_ID) console.warn('ADMIN_CHAT_ID missing. Admin menu will not work.');
 
 const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -34,25 +38,39 @@ const STAGE = Object.freeze({
   WAITING_OFFER_READ: 'waiting_offer_read',
   ASKED_BIO_CONFIRM: 'asked_bio_confirm',
   BIO_QUESTIONS_SENT: 'bio_questions_sent',
+  PAUSED: 'paused',
+  NEEDS_ADMIN: 'needs_admin',
   STOPPED: 'stopped',
   DISABLED: 'disabled'
 });
 
-const STOP_STAGES = new Set([STAGE.BIO_QUESTIONS_SENT, STAGE.STOPPED, STAGE.DISABLED]);
-const FINAL_STATUSES = new Set(['stopped', 'disabled']);
+const STATUS = Object.freeze({
+  PENDING: 'pending_approval',
+  ACTIVE: 'active',
+  PAUSED: 'paused',
+  NEEDS_ADMIN: 'needs_admin',
+  STOPPED: 'stopped',
+  DISABLED: 'disabled'
+});
+
+const FINAL_STATUSES = new Set([STATUS.STOPPED, STATUS.DISABLED]);
+const STOP_STAGES = new Set([STAGE.BIO_QUESTIONS_SENT, STAGE.STOPPED, STAGE.DISABLED, STAGE.PAUSED, STAGE.NEEDS_ADMIN]);
+const ACTIVE_STAGES = [STAGE.ASKED_APPLICATION, STAGE.ASKED_INFO, STAGE.WAITING_OFFER_READ, STAGE.ASKED_BIO_CONFIRM];
 
 const TEMPLATE_TITLES = {
-  ask_application: 'Ariza qoldirganini so‘rash',
+  ask_application: 'Ariza/qiziqishni tasdiqlash',
   ask_info: 'Ma’lumot bor-yo‘qligini so‘rash',
   short_intro: 'Qisqa tanishtiruv',
   full_intro: 'To‘liq tanishtiruv',
   offer_end: 'Oferta oxiri',
   ask_bio_confirm: 'Biografik maqola taklifi',
   bio_questions: 'Biografik savollar',
-  discount_message: 'Chegirma xabari'
+  price_reply: 'Narx/badal savoliga javob',
+  later_reply: 'Keyinroq javobi',
+  reject_reply: 'Rad javobi'
 };
 
-// -------------------- General helpers --------------------
+// -------------------- Helpers --------------------
 
 function nowIso() {
   return new Date().toISOString();
@@ -86,6 +104,14 @@ function normalizeText(text = '') {
     .trim();
 }
 
+function parseCommand(text = '') {
+  const trimmed = String(text || '').trim();
+  const [cmdRaw, ...rest] = trimmed.split(/\s+/);
+  const cmd = (cmdRaw || '').split('@')[0].toLowerCase();
+  const args = trimmed.slice((cmdRaw || '').length).trim();
+  return { cmd, args };
+}
+
 function isAdminMessage(msg) {
   const chatId = str(msg?.chat?.id);
   const fromId = str(msg?.from?.id);
@@ -94,15 +120,18 @@ function isAdminMessage(msg) {
   return false;
 }
 
-function parseCommand(text = '') {
-  const trimmed = String(text || '').trim();
-  const [cmdRaw, ...rest] = trimmed.split(/\s+/);
-  const cmd = (cmdRaw || '').split('@')[0].toLowerCase();
-  const args = trimmed.slice(cmdRaw.length).trim();
-  return { cmd, args };
+function leadTitle(lead) {
+  const name = lead.first_name || '-';
+  const username = lead.username ? `@${lead.username}` : '';
+  return `${name}${username ? ' ' + username : ''}`.trim() || lead.chat_id;
 }
 
-// -------------------- Telegram API helpers --------------------
+function leadShortLine(lead, i = null) {
+  const prefix = i === null ? '' : `${i + 1}. `;
+  return `${prefix}${leadTitle(lead)}\nChat ID: ${lead.chat_id}\nStage: ${lead.stage}\nXabar: ${clip(lead.last_user_message || '-', 120)}`;
+}
+
+// -------------------- Telegram helpers --------------------
 
 async function tg(method, payload = {}) {
   const res = await fetch(`${TG_API}/${method}`, {
@@ -114,49 +143,43 @@ async function tg(method, payload = {}) {
   const data = await res.json().catch(() => null);
   if (!res.ok || !data?.ok) {
     console.error('Telegram API error:', method, JSON.stringify(data));
-    throw new Error(`Telegram API error: ${method}`);
+    throw new Error(data?.description || `Telegram API error: ${method}`);
   }
   return data.result;
 }
 
 async function sendMessage(chatId, text, extra = {}) {
-  return tg('sendMessage', {
-    chat_id: chatId,
-    text: clip(text, 4096),
-    ...extra
-  });
+  return tg('sendMessage', { chat_id: chatId, text: clip(text, 4096), ...extra });
 }
 
 async function editMessage(chatId, messageId, text, extra = {}) {
-  return tg('editMessageText', {
-    chat_id: chatId,
-    message_id: messageId,
-    text: clip(text, 4096),
-    ...extra
-  });
+  try {
+    return await tg('editMessageText', { chat_id: chatId, message_id: messageId, text: clip(text, 4096), ...extra });
+  } catch (err) {
+    // Agar eski xabarni edit qilib bo'lmasa, yangi xabar yuboramiz.
+    return sendMessage(chatId, text, extra);
+  }
 }
 
 async function answerCallbackQuery(callbackQueryId, text = '') {
   try {
-    await tg('answerCallbackQuery', {
-      callback_query_id: callbackQueryId,
-      text
-    });
+    await tg('answerCallbackQuery', { callback_query_id: callbackQueryId, text });
   } catch (err) {
     console.error('answerCallbackQuery:', err.message);
   }
 }
 
 async function sendAdmin(text, extra = {}) {
-  if (!ADMIN_CHAT_ID) return;
+  if (!ADMIN_CHAT_ID) return null;
   try {
-    await sendMessage(ADMIN_CHAT_ID, text, { parse_mode: 'HTML', ...extra });
+    return await sendMessage(ADMIN_CHAT_ID, text, { parse_mode: 'HTML', ...extra });
   } catch (err) {
     console.error('sendAdmin:', err.message);
+    return null;
   }
 }
 
-async function sendBusinessMessage({ chatId, businessConnectionId, text, replyMarkup }) {
+async function sendBusinessMessage({ chatId, businessConnectionId, text }) {
   if (!businessConnectionId) {
     console.warn('No business_connection_id for chat:', chatId);
     return null;
@@ -164,28 +187,37 @@ async function sendBusinessMessage({ chatId, businessConnectionId, text, replyMa
   return tg('sendMessage', {
     chat_id: chatId,
     business_connection_id: businessConnectionId,
-    text: clip(text, 4096),
-    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    text: clip(text, 4096)
   });
 }
+
+// -------------------- Keyboards --------------------
 
 function adminMenuKeyboard() {
   return {
     inline_keyboard: [
       [
         { text: '📊 Hisobot', callback_data: 'menu:report' },
-        { text: '🟡 Chala lidlar', callback_data: 'menu:stalled' }
+        { text: '🆕 Tasdiq kutayotganlar', callback_data: 'list:pending' }
+      ],
+      [
+        { text: '🟢 Faol lidlar', callback_data: 'list:active' },
+        { text: '🟡 Chala lidlar', callback_data: 'list:stalled' }
+      ],
+      [
+        { text: '⚠️ AI tushunmaganlar', callback_data: 'list:needs_admin' },
+        { text: '✅ Savollargacha yetganlar', callback_data: 'list:reached' }
       ],
       [
         { text: '✏️ Shablonlar', callback_data: 'tmpl:list' },
-        { text: '🎁 Chegirma', callback_data: 'discount:preview' }
-      ],
-      [
-        { text: '🧾 Bo‘lib to‘lashlar', callback_data: 'installments:due' },
         { text: '⚙️ Yordam', callback_data: 'menu:help' }
       ]
     ]
   };
+}
+
+function backMenuKeyboard() {
+  return { inline_keyboard: [[{ text: '⬅️ Menyu', callback_data: 'menu:main' }]] };
 }
 
 function templateListKeyboard() {
@@ -205,38 +237,45 @@ function templateViewKeyboard(key) {
   };
 }
 
-function leadActionKeyboard(chatId) {
-  return {
-    inline_keyboard: [
-      [
-        { text: '🔕 Botni o‘chirish', callback_data: `lead:off:${chatId}` },
-        { text: '🔔 Botni yoqish', callback_data: `lead:on:${chatId}` }
-      ],
-      [{ text: '📌 Status', callback_data: `lead:status:${chatId}` }]
-    ]
-  };
+function leadListKeyboard(leads, listType = 'active') {
+  const rows = (leads || []).map((lead, i) => [{
+    text: `${i + 1}. ${lead.first_name || lead.chat_id} — ${lead.stage}`.slice(0, 60),
+    callback_data: `lead:view:${lead.chat_id}`
+  }]);
+  rows.push([{ text: '🔄 Yangilash', callback_data: `list:${listType}` }]);
+  rows.push([{ text: '⬅️ Menyu', callback_data: 'menu:main' }]);
+  return { inline_keyboard: rows };
 }
 
-function firstContactApprovalKeyboard(chatId) {
-  return {
-    inline_keyboard: [
-      [{ text: '✅ Oqimni boshlash', callback_data: `lead:start:${chatId}` }],
-      [{ text: '🔕 Eski chat / botni o‘chirish', callback_data: `lead:off:${chatId}` }],
-      [{ text: '📌 Status', callback_data: `lead:status:${chatId}` }]
-    ]
-  };
+function leadCardKeyboard(lead) {
+  const chatId = lead.chat_id;
+  const rows = [];
+
+  if (lead.status === STATUS.PENDING || lead.stage === STAGE.NEW) {
+    rows.push([{ text: '▶️ Oqimni boshlash', callback_data: `lead:start:${chatId}` }]);
+  }
+
+  if (lead.status === STATUS.NEEDS_ADMIN || lead.stage === STAGE.NEEDS_ADMIN) {
+    rows.push([
+      { text: '✅ Ha deb davom ettirish', callback_data: `lead:force_yes:${chatId}` },
+      { text: '❌ Yo‘q/to‘xtatish', callback_data: `lead:force_no:${chatId}` }
+    ]);
+  }
+
+  rows.push([
+    { text: '⏸ To‘xtatish', callback_data: `lead:pause:${chatId}` },
+    { text: '🔁 Qayta boshlash', callback_data: `lead:restart:${chatId}` }
+  ]);
+  rows.push([
+    { text: '🔔 Yoqish', callback_data: `lead:on:${chatId}` },
+    { text: '🔕 O‘chirish', callback_data: `lead:off:${chatId}` }
+  ]);
+  rows.push([{ text: '📌 Yangilash', callback_data: `lead:view:${chatId}` }]);
+  rows.push([{ text: '⬅️ Menyu', callback_data: 'menu:main' }]);
+  return { inline_keyboard: rows };
 }
 
 // -------------------- Supabase helpers --------------------
-
-async function dbOne(queryPromise, label) {
-  const { data, error } = await queryPromise;
-  if (error) {
-    console.error(label, error);
-    throw error;
-  }
-  return data;
-}
 
 async function getTemplate(key) {
   const { data, error } = await supabase
@@ -248,7 +287,7 @@ async function getTemplate(key) {
     console.error('getTemplate:', error);
     return null;
   }
-  return data;
+  return data || null;
 }
 
 async function getTemplateBody(key) {
@@ -289,6 +328,26 @@ async function logEvent(chatId, eventType, message = '') {
   }
 }
 
+async function markProcessed(chatId, messageId) {
+  if (!chatId || !messageId) return true;
+  try {
+    const { error } = await supabase.from('processed_messages').insert({
+      chat_id: str(chatId),
+      message_id: str(messageId),
+      created_at: nowIso()
+    });
+    if (error) {
+      if (error.code === '23505') return false;
+      console.error('markProcessed:', error);
+      return true;
+    }
+    return true;
+  } catch (err) {
+    console.error('markProcessed:', err.message);
+    return true;
+  }
+}
+
 async function getLead(chatId) {
   const { data, error } = await supabase
     .from('business_leads')
@@ -302,18 +361,19 @@ async function getLead(chatId) {
   return data || null;
 }
 
-async function createLead({ chatId, businessConnectionId, from, text }) {
+async function createLead({ chatId, businessConnectionId, from, text, status = STATUS.ACTIVE, botEnabled = true }) {
   const payload = {
     chat_id: str(chatId),
     business_connection_id: businessConnectionId || null,
     first_name: from?.first_name || null,
     username: from?.username || null,
-    status: 'active',
+    status,
     stage: STAGE.NEW,
-    bot_enabled: true,
+    bot_enabled: botEnabled,
     is_old_lead: false,
     last_user_message: text || '',
     last_message_at: nowIso(),
+    review_stage: null,
     updated_at: nowIso()
   };
 
@@ -342,10 +402,10 @@ async function updateLead(chatId, patch) {
     console.error('updateLead:', error);
     return null;
   }
-  return data;
+  return data || null;
 }
 
-async function findOrCreateLead({ chatId, businessConnectionId, from, text }) {
+async function findOrCreateLead({ chatId, businessConnectionId, from, text, status = STATUS.ACTIVE, botEnabled = true }) {
   const existing = await getLead(chatId);
   if (existing) {
     return updateLead(chatId, {
@@ -356,7 +416,7 @@ async function findOrCreateLead({ chatId, businessConnectionId, from, text }) {
       last_message_at: nowIso()
     });
   }
-  return createLead({ chatId, businessConnectionId, from, text });
+  return createLead({ chatId, businessConnectionId, from, text, status, botEnabled });
 }
 
 async function getAdminSession(chatId) {
@@ -394,92 +454,80 @@ async function clearAdminSession(chatId) {
 
 function localIntent(text, stage) {
   const t = normalizeText(text);
-  if (!t) return 'unclear';
+  if (!t) return { intent: 'unclear', confidence: 0.2 };
 
-  const greetings = [
-    'assalomu alaykum', 'assalom', 'salom', 'va alaykum', 'valaykum',
-    'yaxshi', 'ha yaxshi', 'rahmat yaxshi', 'yaxshiman', 'alhamdulillah'
-  ];
+  const rejectWords = ['kerak emas', 'qiziq emas', 'xohlamayman', 'bezovta qilmang', 'yozmang', 'rad etaman'];
+  if (rejectWords.some(w => t.includes(w))) return { intent: 'reject', confidence: 0.92 };
 
-  if (stage === STAGE.NEW) {
-    if (greetings.some(w => t.includes(w))) return 'greeting_positive';
-  }
+  const laterWords = ['keyinroq', 'hozir bandman', 'vaqtim yoq', "vaqtim yo'q", 'ertaga', 'kechqurun', 'keyin yozing', 'keyin gaplashamiz'];
+  if (laterWords.some(w => t.includes(w))) return { intent: 'later', confidence: 0.9 };
 
-  const yesLike = [
-    'ha', 'xa', 'haa', 'haaa', 'ok', 'mayli', 'boladi', "bo'ladi", 'togri', "to'g'ri",
-    'shunaqa', 'qoldirgandim', 'ariza qoldirganman', 'ariza berganman'
-  ];
-  const noLike = ['yoq', "yo'q", 'yoq rahmat', 'kerak emas', 'xohlamayman', 'qiziq emas'];
+  const priceWords = ['narx', 'qancha', 'pullikmi', 'tolov', "to'lov", 'badal', 'necha pul', 'sum', "so'm", 'som'];
+  if (priceWords.some(w => t.includes(w))) return { intent: 'price_question', confidence: 0.86 };
+
+  const greetings = ['assalomu alaykum', 'assalom', 'salom', 'va alaykum', 'valaykum', 'yaxshi', 'ha yaxshi', 'rahmat yaxshi', 'yaxshiman', 'alhamdulillah'];
+  if (stage === STAGE.NEW && greetings.some(w => t.includes(w))) return { intent: 'greeting_positive', confidence: 0.9 };
 
   if (stage === STAGE.ASKED_APPLICATION) {
-    if (noLike.some(w => t.includes(w))) return 'no';
-    if (yesLike.some(w => t === w || t.includes(w))) return 'yes';
+    const applicationYes = [
+      'ha', 'xa', 'haa', 'haaa', 'qoldirdim', 'qoldirgandim', 'ariza', 'anketa',
+      'instagramda', 'instagram', 'instada', 'reklamadan', 'yozgandim', 'yozgan edim',
+      'dostim aytdi', "do'stim aytdi", 'tanishim aytdi', 'aytishgandi', 'ko‘rgandim', "ko'rgandim",
+      'qiziqib yozgandim', 'malumot olmoqchi', "ma'lumot olmoqchi", 'bilmoqchi edim'
+    ];
+    const applicationNo = ['yoq', "yo'q", 'qanaqa ariza', 'men yozmadim', 'adashdingiz', 'tushunmadim', 'eslolmadim'];
+    if (applicationNo.some(w => t.includes(w))) return { intent: 'application_denied', confidence: 0.9 };
+    if (applicationYes.some(w => t.includes(w))) return { intent: 'application_confirmed', confidence: 0.9 };
   }
 
   if (stage === STAGE.ASKED_INFO) {
-    if (
-      t.includes('egaman') ||
-      t.includes('bilaman') ||
-      t.includes('xabardorman') ||
-      t.includes("ma'lumotim bor") ||
-      t.includes('malumotim bor') ||
-      t.includes('ha bor') ||
-      t === 'ha'
-    ) return 'has_info';
-
-    if (
-      t.includes('bilmayman') ||
-      t.includes("ma'lumotim yo") ||
-      t.includes('malumotim yo') ||
-      t.includes('xabardor emasman') ||
-      t.includes('tushuntiring') ||
-      t.includes('bilmadim') ||
-      t.includes('yoq') ||
-      t.includes("yo'q")
-    ) return 'no_info';
+    const hasInfo = ['egaman', 'bilaman', 'xabardorman', "ma'lumotim bor", 'malumotim bor', 'ha bor', 'bor', 'tushunaman'];
+    const noInfo = ['bilmayman', "ma'lumotim yo", 'malumotim yo', 'xabardor emasman', 'tushuntiring', 'bilmadim', 'yoq', "yo'q"];
+    if (hasInfo.some(w => t.includes(w)) || t === 'ha' || t === 'xa') return { intent: 'has_info', confidence: 0.86 };
+    if (noInfo.some(w => t.includes(w))) return { intent: 'no_info', confidence: 0.86 };
   }
 
   if (stage === STAGE.WAITING_OFFER_READ) {
-    if (
-      t.includes('tanishdim') ||
-      t.includes('oqib chiqdim') ||
-      t.includes("o'qib chiqdim") ||
-      t.includes('korib chiqdim') ||
-      t.includes("ko'rib chiqdim") ||
-      t.includes('tushunarli')
-    ) return 'read_offer';
-
-    if (t.includes('hop') || t.includes("ho'p") || t.includes('mayli') || t === 'ok' || t === 'boladi' || t === "bo'ladi") {
-      return 'ok_wait';
-    }
+    const read = ['tanishdim', 'oqib chiqdim', "o'qib chiqdim", 'korib chiqdim', "ko'rib chiqdim", 'tushunarli', 'tanishib chiqdim'];
+    const okWait = ['hop', "ho'p", 'mayli', 'ok', 'boladi', "bo'ladi", 'tanishib chiqaman', 'oqib chiqaman', "o'qib chiqaman"];
+    if (read.some(w => t.includes(w))) return { intent: 'read_offer', confidence: 0.9 };
+    if (okWait.some(w => t.includes(w))) return { intent: 'ok_wait', confidence: 0.85 };
   }
 
   if (stage === STAGE.ASKED_BIO_CONFIRM) {
-    if (noLike.some(w => t.includes(w))) return 'no';
-    if (
-      t === 'ha' || t === 'xa' || t.includes('ha yoz') || t.includes('yozing') ||
-      t.includes('maqola yoz') || t.includes('boshlayver') || t.includes('qilavering') ||
-      t.includes('roziman') || t.includes('mayli')
-    ) return 'agree_bio';
+    const agree = ['ha', 'xa', 'yozing', 'ha yozing', 'maqola yoz', 'boshlayver', 'qilavering', 'roziman', 'mayli', 'boladi', "bo'ladi"];
+    const no = ['yoq', "yo'q", 'kerakmas', 'kerak emas', 'keyin', 'o‘ylab ko‘raman', "o'ylab ko'raman"];
+    if (no.some(w => t.includes(w))) return { intent: 'reject', confidence: 0.86 };
+    if (agree.some(w => t.includes(w))) return { intent: 'agree_bio', confidence: 0.88 };
   }
 
-  return 'unclear';
+  return { intent: 'unclear', confidence: 0.35 };
 }
 
 async function aiIntent(text, stage) {
   const fallback = localIntent(text, stage);
-
   if (!openai) return fallback;
 
   try {
-    const prompt = `Sen Telegram savdo botidagi intent-classifier bo'lib ishlaysan.
+    const prompt = `Sen Telegram Business savdo botidagi intent-classifier bo'lib ishlaysan.
+
+Vazifa: foydalanuvchi javobining ma'nosini aniqlash. Javob yozma, faqat JSON qaytar.
 
 Qoidalar:
-- O'zbek, rus, ingliz, lotin/kirill aralash javoblarni tushun.
-- Faqat quyidagi intentlardan bittasini qaytar:
-greeting_positive, yes, has_info, no_info, ok_wait, read_offer, agree_bio, no, unclear
-- Hech qanday izoh, markdown yoki qo'shimcha matn yozma.
-- Stage juda muhim. "ha" stage'ga qarab boshqa ma'no beradi.
+- O'zbek lotin/kirill, ruscha aralash, xato yozilgan matnlarni tushun.
+- Stage juda muhim. "ha" har bosqichda boshqa ma'no beradi.
+- Botning maqsadi lidni biografik savollargacha olib kelish.
+- "instagramda qoldirdim", "do'stim aytdi", "yozgandim", "reklamadan ko'rdim" kabi javoblar asked_application bosqichida application_confirmed.
+- "narxi qancha", "pullikmi", "badal bormi" kabi javoblar price_question.
+- "keyinroq", "hozir bandman" kabi javoblar later.
+- "kerak emas", "qiziq emas", "bezovta qilmang" kabi javoblar reject.
+- Ishonching past bo'lsa unclear.
+
+Faqat mana shu JSON formatda qaytar:
+{"intent":"...","confidence":0.0}
+
+Ruxsat etilgan intentlar:
+greeting_positive, application_confirmed, application_denied, has_info, no_info, ok_wait, read_offer, agree_bio, reject, later, price_question, unclear
 
 Stage: ${stage}
 User message: ${text}`;
@@ -490,9 +538,16 @@ User message: ${text}`;
       temperature: 0
     });
 
-    const out = (response.output_text || '').trim().toLowerCase();
-    const allowed = new Set(['greeting_positive', 'yes', 'has_info', 'no_info', 'ok_wait', 'read_offer', 'agree_bio', 'no', 'unclear']);
-    return allowed.has(out) ? out : fallback;
+    const raw = (response.output_text || '').trim();
+    const parsed = JSON.parse(raw.replace(/^```json\s*/i, '').replace(/```$/i, '').trim());
+    const allowed = new Set(['greeting_positive', 'application_confirmed', 'application_denied', 'has_info', 'no_info', 'ok_wait', 'read_offer', 'agree_bio', 'reject', 'later', 'price_question', 'unclear']);
+    const intent = String(parsed.intent || '').toLowerCase().trim();
+    const confidence = Number(parsed.confidence || 0);
+
+    if (!allowed.has(intent)) return fallback;
+    // Local aniq taniydigan muhim signal bo'lsa, AI past baholasa ham localni saqlaymiz.
+    if (fallback.confidence >= 0.86 && confidence < 0.55) return fallback;
+    return { intent, confidence: Math.max(0, Math.min(1, confidence)) };
   } catch (err) {
     console.error('aiIntent fallback:', err.message);
     return fallback;
@@ -501,7 +556,7 @@ User message: ${text}`;
 
 // -------------------- Lead flow --------------------
 
-async function sendTemplateToLead({ lead, templateKey, nextStage, stop = false }) {
+async function sendTemplateToLead({ lead, templateKey, nextStage, stop = false, patch = {} }) {
   const body = await getTemplateBody(templateKey);
   if (!body) {
     await sendAdmin(`⚠️ Shablon topilmadi: <code>${htmlEscape(templateKey)}</code>`);
@@ -514,98 +569,85 @@ async function sendTemplateToLead({ lead, templateKey, nextStage, stop = false }
     text: body
   });
 
-  const patch = {
+  const update = {
     last_bot_message: body,
-    stage: nextStage || lead.stage
+    stage: nextStage || lead.stage,
+    ...patch
   };
   if (stop) {
-    patch.status = 'stopped';
-    patch.bot_enabled = false;
+    update.status = STATUS.STOPPED;
+    update.bot_enabled = false;
   }
 
-  const updated = await updateLead(lead.chat_id, patch);
+  const updated = await updateLead(lead.chat_id, update);
   await logEvent(lead.chat_id, `bot_sent_${templateKey}`, body);
   return updated;
 }
 
-async function handleBusinessMessage(message) {
-  const text = message?.text || message?.caption || '';
-  const chatId = message?.chat?.id;
-  const from = message?.from || {};
-  const businessConnectionId = message?.business_connection_id || message?.business_connection?.id || null;
+async function moveToNeedsAdmin(lead, text, intentResult) {
+  await updateLead(lead.chat_id, {
+    status: STATUS.NEEDS_ADMIN,
+    bot_enabled: false,
+    review_stage: lead.stage,
+    stage: STAGE.NEEDS_ADMIN,
+    ai_intent: intentResult.intent,
+    ai_confidence: intentResult.confidence
+  });
+  await logEvent(lead.chat_id, 'needs_admin', text);
+}
 
-  if (!chatId) return;
+async function pauseLead(lead, templateKey = 'later_reply') {
+  const updated = await sendTemplateToLead({
+    lead,
+    templateKey,
+    nextStage: STAGE.PAUSED,
+    patch: { status: STATUS.PAUSED, bot_enabled: false, review_stage: lead.stage }
+  });
+  await logEvent(lead.chat_id, 'lead_paused', lead.last_user_message || '');
+  return updated;
+}
 
-  // O'zimiz yuborgan yoki botdan kelgan xabarlarni qayta ishlamaymiz.
-  if (from?.is_bot) return;
-  if (OWNER_TELEGRAM_ID && str(from?.id) === OWNER_TELEGRAM_ID) return;
+async function stopLeadWithReject(lead) {
+  const updated = await sendTemplateToLead({
+    lead,
+    templateKey: 'reject_reply',
+    nextStage: STAGE.STOPPED,
+    stop: true
+  });
+  await logEvent(lead.chat_id, 'lead_rejected_or_stopped', lead.last_user_message || '');
+  return updated;
+}
 
-  if (!text.trim()) {
-    const lead = await findOrCreateLead({ chatId, businessConnectionId, from, text: '[non-text message]' });
-    if (lead && STOP_STAGES.has(lead.stage)) {
-      await sendAdmin(
-        `📩 To‘xtatilgan chatdan fayl/rasm keldi\n\nChat ID: <code>${htmlEscape(chatId)}</code>\nIsm: ${htmlEscape(lead.first_name || '')}`,
-        { reply_markup: leadActionKeyboard(chatId) }
-      );
-    }
+async function continueByIntent(lead, intentResult, userText = '') {
+  const { intent, confidence } = intentResult;
+
+  if (intent === 'unclear' || confidence < AI_CONFIDENCE_MIN) {
+    await moveToNeedsAdmin(lead, userText, intentResult);
     return;
   }
 
-  const existingLeadBeforeMessage = await getLead(chatId);
-  let lead = await findOrCreateLead({ chatId, businessConnectionId, from, text });
-  if (!lead) return;
-
-  // Eski Telegram yozishmalar muammosi uchun xavfsiz rejim:
-  // bot tarixni ko'ra olmaydi, shuning uchun DB'da yo'q chatni avtomatik boshlamaymiz.
-  // Admin "Oqimni boshlash" tugmasini bossagina mijozga birinchi shablon ketadi.
-  if (!existingLeadBeforeMessage && FIRST_CONTACT_MODE !== 'auto') {
-    lead = await updateLead(chatId, {
-      status: 'pending_approval',
-      bot_enabled: false,
-      stage: STAGE.NEW
-    }) || lead;
-
-    await logEvent(chatId, 'pending_first_contact_approval', text);
-    await sendAdmin(
-      `🆕 Yangi/aniqlanmagan chat yozdi. Bot hozircha javob bermadi.\n\nChat ID: <code>${htmlEscape(chatId)}</code>\nIsm: ${htmlEscape(from.first_name || '')}\nUsername: ${from.username ? '@' + htmlEscape(from.username) : '-'}\n\nXabar: ${htmlEscape(clip(text, 800))}\n\nAgar bu yangi lid bo‘lsa — <b>Oqimni boshlash</b> tugmasini bosing. Agar eski yozishma bo‘lsa — <b>Eski chat / botni o‘chirish</b> tugmasini bosing.`,
-      { reply_markup: firstContactApprovalKeyboard(chatId) }
-    );
+  if (intent === 'reject' || intent === 'application_denied') {
+    await stopLeadWithReject(lead);
     return;
   }
 
-  if (!lead.bot_enabled || FINAL_STATUSES.has(lead.status) || STOP_STAGES.has(lead.stage)) {
-    await logEvent(chatId, 'ignored_stopped_or_disabled', text);
-    await sendAdmin(
-      `📩 Bot jim turgan chatdan xabar keldi\n\nChat ID: <code>${htmlEscape(chatId)}</code>\nIsm: ${htmlEscape(lead.first_name || '')}\nUsername: ${lead.username ? '@' + htmlEscape(lead.username) : '-'}\nStage: <code>${htmlEscape(lead.stage)}</code>\n\nXabar: ${htmlEscape(clip(text, 800))}`,
-      { reply_markup: leadActionKeyboard(chatId) }
-    );
+  if (intent === 'later') {
+    await pauseLead(lead);
     return;
   }
 
-  const intent = await aiIntent(text, lead.stage);
-  await logEvent(chatId, `intent_${intent}`, text);
+  if (intent === 'price_question') {
+    await sendTemplateToLead({ lead, templateKey: 'price_reply', nextStage: lead.stage });
+    return;
+  }
 
   if (lead.stage === STAGE.NEW && intent === 'greeting_positive') {
-    const updated = await sendTemplateToLead({ lead, templateKey: 'ask_application', nextStage: STAGE.ASKED_APPLICATION });
-    await sendAdmin(
-      `🆕 Yangi lid oqimi boshlandi\n\nChat ID: <code>${htmlEscape(chatId)}</code>\nIsm: ${htmlEscape(from.first_name || '')}\nUsername: ${from.username ? '@' + htmlEscape(from.username) : '-'}\nIntent: <code>${intent}</code>`,
-      { reply_markup: leadActionKeyboard(chatId) }
-    );
-    lead = updated || lead;
+    await sendTemplateToLead({ lead, templateKey: 'ask_application', nextStage: STAGE.ASKED_APPLICATION });
     return;
   }
 
-  if (lead.stage === STAGE.ASKED_APPLICATION && intent === 'yes') {
+  if (lead.stage === STAGE.ASKED_APPLICATION && intent === 'application_confirmed') {
     await sendTemplateToLead({ lead, templateKey: 'ask_info', nextStage: STAGE.ASKED_INFO });
-    return;
-  }
-
-  if (lead.stage === STAGE.ASKED_APPLICATION && intent === 'no') {
-    await updateLead(chatId, { status: 'stopped', bot_enabled: false, stage: STAGE.STOPPED });
-    await sendAdmin(
-      `⛔ Lid arizani tasdiqlamadi. Bot to‘xtadi.\n\nChat ID: <code>${htmlEscape(chatId)}</code>\nXabar: ${htmlEscape(text)}`,
-      { reply_markup: leadActionKeyboard(chatId) }
-    );
     return;
   }
 
@@ -622,11 +664,7 @@ async function handleBusinessMessage(message) {
   }
 
   if (lead.stage === STAGE.WAITING_OFFER_READ && intent === 'ok_wait') {
-    await logEvent(chatId, 'ok_wait_no_reply', text);
-    await sendAdmin(
-      `⏳ Lid oferta bilan tanishmoqchi. Bot jim turdi.\n\nChat ID: <code>${htmlEscape(chatId)}</code>\nXabar: ${htmlEscape(text)}`,
-      { reply_markup: leadActionKeyboard(chatId) }
-    );
+    await logEvent(lead.chat_id, 'ok_wait_no_reply', userText);
     return;
   }
 
@@ -642,230 +680,250 @@ async function handleBusinessMessage(message) {
       nextStage: STAGE.BIO_QUESTIONS_SENT,
       stop: true
     });
-    await sendAdmin(
-      `✅ Lid biografik savollargacha yetib keldi\n\nChat ID: <code>${htmlEscape(chatId)}</code>\nIsm: ${htmlEscape(lead.first_name || '')}\nUsername: ${lead.username ? '@' + htmlEscape(lead.username) : '-'}\n\nEndi qolganini qo‘lda davom ettirasiz.`,
-      { reply_markup: leadActionKeyboard(chatId) }
-    );
+    await logEvent(lead.chat_id, 'bio_questions_reached', userText);
     return;
   }
 
-  if (lead.stage === STAGE.ASKED_BIO_CONFIRM && intent === 'no') {
-    await updateLead(chatId, { status: 'stopped', bot_enabled: false, stage: STAGE.STOPPED });
-    await sendAdmin(
-      `⛔ Lid biografik maqolaga rozi bo‘lmadi. Bot to‘xtadi.\n\nChat ID: <code>${htmlEscape(chatId)}</code>\nXabar: ${htmlEscape(text)}`,
-      { reply_markup: leadActionKeyboard(chatId) }
-    );
-    return;
-  }
-
-  await sendAdmin(
-    `❓ Bot aniqlay olmadi, javob bermadi\n\nChat ID: <code>${htmlEscape(chatId)}</code>\nStage: <code>${htmlEscape(lead.stage)}</code>\nIntent: <code>${htmlEscape(intent)}</code>\nXabar: ${htmlEscape(clip(text, 800))}`,
-    { reply_markup: leadActionKeyboard(chatId) }
-  );
+  await moveToNeedsAdmin(lead, userText, intentResult);
 }
 
-// -------------------- Reports / stalled / discount / installments --------------------
+async function handleBusinessMessage(message) {
+  const text = message?.text || message?.caption || '';
+  const chatId = message?.chat?.id;
+  const from = message?.from || {};
+  const messageId = message?.message_id;
+  const businessConnectionId = message?.business_connection_id || message?.business_connection?.id || null;
+
+  if (!chatId) return;
+
+  // Duplicate webhook protection.
+  const firstTime = await markProcessed(chatId, messageId);
+  if (!firstTime) return;
+
+  // O'zimiz yuborgan yoki botdan kelgan xabarlarni qayta ishlamaymiz.
+  if (from?.is_bot) return;
+  if (OWNER_TELEGRAM_ID && str(from?.id) === OWNER_TELEGRAM_ID) return;
+
+  const textForDb = text.trim() ? text : '[non-text message]';
+  const existingLeadBeforeMessage = await getLead(chatId);
+
+  // DB'da yo'q chat: default silent_queue. Bot ham, admin ham spam qilmaydi.
+  if (!existingLeadBeforeMessage && FIRST_CONTACT_MODE === 'silent_queue') {
+    await createLead({
+      chatId,
+      businessConnectionId,
+      from,
+      text: textForDb,
+      status: STATUS.PENDING,
+      botEnabled: false
+    });
+    await logEvent(chatId, 'silent_queue_first_contact', textForDb);
+    return;
+  }
+
+  let lead = await findOrCreateLead({
+    chatId,
+    businessConnectionId,
+    from,
+    text: textForDb,
+    status: FIRST_CONTACT_MODE === 'approval' ? STATUS.PENDING : STATUS.ACTIVE,
+    botEnabled: FIRST_CONTACT_MODE !== 'approval'
+  });
+  if (!lead) return;
+
+  if (!existingLeadBeforeMessage && FIRST_CONTACT_MODE === 'approval') {
+    await updateLead(chatId, { status: STATUS.PENDING, bot_enabled: false, stage: STAGE.NEW });
+    await logEvent(chatId, 'pending_first_contact_approval', textForDb);
+    await sendAdmin(
+      `🆕 Yangi/aniqlanmagan chat yozdi. Bot hozircha javob bermadi.\n\nChat ID: <code>${htmlEscape(chatId)}</code>\nIsm: ${htmlEscape(from.first_name || '')}\nUsername: ${from.username ? '@' + htmlEscape(from.username) : '-'}\n\nXabar: ${htmlEscape(clip(textForDb, 800))}`,
+      { reply_markup: leadCardKeyboard({ ...lead, chat_id: str(chatId), status: STATUS.PENDING, stage: STAGE.NEW }) }
+    );
+    return;
+  }
+
+  if (!text.trim()) {
+    await logEvent(chatId, 'non_text_ignored', textForDb);
+    return;
+  }
+
+  if (!lead.bot_enabled || FINAL_STATUSES.has(lead.status) || STOP_STAGES.has(lead.stage)) {
+    await logEvent(chatId, 'ignored_not_active', textForDb);
+    return;
+  }
+
+  const intentResult = await aiIntent(text, lead.stage);
+  await updateLead(chatId, {
+    ai_intent: intentResult.intent,
+    ai_confidence: intentResult.confidence
+  });
+  await logEvent(chatId, `intent_${intentResult.intent}_${intentResult.confidence}`, text);
+
+  lead = await getLead(chatId) || lead;
+  await continueByIntent(lead, intentResult, text);
+}
+
+// -------------------- Reports and lists --------------------
 
 async function buildReportText() {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  const [{ count: total }, { count: active }, { count: stopped }, { count: disabled }, { count: bio }, { count: todayNew }, { count: stalled }] = await Promise.all([
+  const queries = await Promise.all([
     supabase.from('business_leads').select('*', { count: 'exact', head: true }),
-    supabase.from('business_leads').select('*', { count: 'exact', head: true }).eq('status', 'active'),
-    supabase.from('business_leads').select('*', { count: 'exact', head: true }).eq('status', 'stopped'),
-    supabase.from('business_leads').select('*', { count: 'exact', head: true }).eq('status', 'disabled'),
+    supabase.from('business_leads').select('*', { count: 'exact', head: true }).eq('status', STATUS.PENDING),
+    supabase.from('business_leads').select('*', { count: 'exact', head: true }).eq('status', STATUS.ACTIVE),
+    supabase.from('business_leads').select('*', { count: 'exact', head: true }).eq('status', STATUS.PAUSED),
+    supabase.from('business_leads').select('*', { count: 'exact', head: true }).eq('status', STATUS.NEEDS_ADMIN),
     supabase.from('business_leads').select('*', { count: 'exact', head: true }).eq('stage', STAGE.BIO_QUESTIONS_SENT),
     supabase.from('business_leads').select('*', { count: 'exact', head: true }).gte('created_at', today.toISOString()),
-    supabase.from('business_leads').select('*', { count: 'exact', head: true })
-      .eq('status', 'active')
-      .eq('bot_enabled', true)
-      .in('stage', [STAGE.ASKED_APPLICATION, STAGE.ASKED_INFO, STAGE.WAITING_OFFER_READ, STAGE.ASKED_BIO_CONFIRM])
+    supabase.from('business_leads').select('*', { count: 'exact', head: true }).eq('status', STATUS.ACTIVE).eq('bot_enabled', true).in('stage', ACTIVE_STAGES)
   ]);
 
-  return `📊 OLYE Bot Hisobot\n\nJami lidlar: ${total || 0}\nBugungi yangi lidlar: ${todayNew || 0}\nActive: ${active || 0}\nStopped: ${stopped || 0}\nDisabled: ${disabled || 0}\nBio savollar yuborilgan: ${bio || 0}\nChala qolganlar: ${stalled || 0}`;
+  const counts = queries.map(q => q.count || 0);
+  return `📊 OLYE Bot Hisobot\n\nJami lidlar: ${counts[0]}\nBugungi yangi yozganlar: ${counts[6]}\nTasdiq kutayotganlar: ${counts[1]}\nFaol lidlar: ${counts[2]}\nKeyinroq/to‘xtatilgan: ${counts[3]}\nAI tushunmaganlar: ${counts[4]}\nSavollargacha yetganlar: ${counts[5]}\nChala jarayondagilar: ${counts[7]}`;
 }
 
-async function buildStalledText() {
-  const { data, error } = await supabase
+async function getLeadsByList(type) {
+  let query = supabase
     .from('business_leads')
-    .select('chat_id,first_name,username,stage,last_user_message,last_message_at,updated_at')
-    .eq('status', 'active')
-    .eq('bot_enabled', true)
-    .in('stage', [STAGE.ASKED_APPLICATION, STAGE.ASKED_INFO, STAGE.WAITING_OFFER_READ, STAGE.ASKED_BIO_CONFIRM])
-    .order('updated_at', { ascending: true })
-    .limit(20);
+    .select('chat_id,first_name,username,status,stage,last_user_message,last_message_at,updated_at')
+    .order('updated_at', { ascending: false })
+    .limit(15);
 
-  if (error) throw error;
-  if (!data?.length) return '🟡 Chala qolgan lidlar yo‘q.';
+  if (type === 'pending') query = query.eq('status', STATUS.PENDING);
+  else if (type === 'active') query = query.eq('status', STATUS.ACTIVE).eq('bot_enabled', true);
+  else if (type === 'stalled') query = query.eq('status', STATUS.ACTIVE).eq('bot_enabled', true).in('stage', ACTIVE_STAGES).order('updated_at', { ascending: true });
+  else if (type === 'needs_admin') query = query.eq('status', STATUS.NEEDS_ADMIN);
+  else if (type === 'reached') query = query.eq('stage', STAGE.BIO_QUESTIONS_SENT);
+  else query = query.eq('status', STATUS.ACTIVE);
 
-  const lines = data.map((l, i) => {
-    const name = l.first_name || '-';
-    const username = l.username ? `@${l.username}` : '-';
-    return `${i + 1}. ${name} ${username}\nChat ID: ${l.chat_id}\nStage: ${l.stage}\nOxirgi xabar: ${clip(l.last_user_message || '-', 120)}`;
-  });
-
-  return `🟡 Chala qolgan lidlar\n\n${lines.join('\n\n')}`;
-}
-
-async function getDiscountTargets() {
-  const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
-  const { data, error } = await supabase
-    .from('business_leads')
-    .select('chat_id,business_connection_id,first_name,username,stage,updated_at')
-    .eq('status', 'active')
-    .eq('bot_enabled', true)
-    .in('stage', [STAGE.WAITING_OFFER_READ, STAGE.ASKED_BIO_CONFIRM])
-    .lte('updated_at', tenDaysAgo)
-    .limit(50);
+  const { data, error } = await query;
   if (error) throw error;
   return data || [];
 }
 
-async function createDiscountPreview() {
-  const targets = await getDiscountTargets();
-  const template = await getTemplateBody('discount_message');
-  const { data, error } = await supabase.from('pending_actions').insert({
-    action_type: 'discount_broadcast',
-    status: 'pending',
-    payload: {
-      template_key: 'discount_message',
-      template_body: template,
-      target_chat_ids: targets.map(t => t.chat_id),
-      created_at: nowIso()
-    }
-  }).select().single();
-  if (error) throw error;
-
-  const preview = targets.slice(0, 15).map((t, i) => `${i + 1}. ${t.first_name || '-'} ${t.username ? '@' + t.username : ''}\nChat ID: ${t.chat_id}\nStage: ${t.stage}`).join('\n\n');
-
+function listTitle(type) {
   return {
-    action: data,
-    text: `🎁 Chegirma yuborish preview\n\nTopilgan lidlar: ${targets.length}\nPending action ID: ${data.id}\n\nYuboriladigan matn:\n${template || 'discount_message shabloni topilmadi'}\n\nKimlarga:\n${preview || 'Mos lid topilmadi'}\n\nTasdiqlash: /discount_confirm ${data.id}\nBekor qilish: /discount_cancel ${data.id}`
+    pending: '🆕 Tasdiq kutayotganlar',
+    active: '🟢 Faol lidlar',
+    stalled: '🟡 Chala qolgan lidlar',
+    needs_admin: '⚠️ AI tushunmaganlar',
+    reached: '✅ Savollargacha yetganlar'
+  }[type] || 'Lidlar';
+}
+
+async function showLeadList(chatId, type, edit = null) {
+  const leads = await getLeadsByList(type);
+  const title = listTitle(type);
+  const text = leads.length
+    ? `${title}\n\n${leads.map(leadShortLine).join('\n\n')}\n\nLid kartochkasini ochish uchun pastdagi tugmadan tanlang.`
+    : `${title}\n\nHozircha bu ro‘yxatda lid yo‘q.`;
+
+  const extra = { reply_markup: leadListKeyboard(leads, type) };
+  if (edit?.messageId) return editMessage(chatId, edit.messageId, text, extra);
+  return sendMessage(chatId, text, extra);
+}
+
+async function leadCardText(chatId) {
+  const lead = await getLead(chatId);
+  if (!lead) return { lead: null, text: `Chat ID ${chatId} bo‘yicha lid topilmadi.` };
+  return {
+    lead,
+    text: `👤 Lid kartochkasi\n\nIsm: ${lead.first_name || '-'}\nUsername: ${lead.username ? '@' + lead.username : '-'}\nChat ID: ${lead.chat_id}\nStatus: ${lead.status}\nStage: ${lead.stage}\nOldingi stage: ${lead.review_stage || '-'}\nBot: ${lead.bot_enabled ? 'yoqilgan' : 'o‘chirilgan'}\nAI intent: ${lead.ai_intent || '-'}\nAI ishonch: ${lead.ai_confidence ?? '-'}\n\nOxirgi xabar:\n${lead.last_user_message || '-'}\n\nOxirgi bot javobi:\n${clip(lead.last_bot_message || '-', 700)}`
   };
 }
 
-async function confirmDiscount(actionId) {
-  const { data: action, error } = await supabase
-    .from('pending_actions')
-    .select('*')
-    .eq('id', Number(actionId))
-    .eq('status', 'pending')
-    .maybeSingle();
-  if (error) throw error;
-  if (!action) return { sent: 0, text: 'Pending action topilmadi yoki allaqachon ishlatilgan.' };
-
-  const targetIds = action.payload?.target_chat_ids || [];
-  const templateBody = action.payload?.template_body || await getTemplateBody(action.payload?.template_key || 'discount_message');
-  if (!targetIds.length) return { sent: 0, text: 'Yuboriladigan lid yo‘q.' };
-  if (!templateBody) return { sent: 0, text: 'Chegirma shabloni topilmadi.' };
-
-  const { data: leads, error: leadsError } = await supabase
-    .from('business_leads')
-    .select('chat_id,business_connection_id')
-    .in('chat_id', targetIds);
-  if (leadsError) throw leadsError;
-
-  let sent = 0;
-  for (const lead of leads || []) {
-    try {
-      await sendBusinessMessage({
-        chatId: lead.chat_id,
-        businessConnectionId: lead.business_connection_id,
-        text: templateBody
-      });
-      sent += 1;
-      await logEvent(lead.chat_id, 'discount_sent', templateBody);
-    } catch (err) {
-      console.error('discount send error:', lead.chat_id, err.message);
-    }
-  }
-
-  await supabase.from('pending_actions').update({ status: 'confirmed', confirmed_at: nowIso() }).eq('id', Number(actionId));
-  return { sent, text: `✅ Chegirma yuborildi. Yuborilgan: ${sent}` };
-}
-
-async function cancelDiscount(actionId) {
-  const { error } = await supabase
-    .from('pending_actions')
-    .update({ status: 'canceled', canceled_at: nowIso() })
-    .eq('id', Number(actionId))
-    .eq('status', 'pending');
-  if (error) throw error;
-  return '✅ Chegirma yuborish bekor qilindi.';
-}
-
-async function createInstallment(chatId, amount) {
-  const start = new Date();
-  const d5 = new Date(start.getTime() + 5 * 24 * 60 * 60 * 1000);
-  const d10 = new Date(start.getTime() + 10 * 24 * 60 * 60 * 1000);
-  const d14 = new Date(start.getTime() + 14 * 24 * 60 * 60 * 1000);
-  const { error } = await supabase.from('installments').insert({
-    chat_id: str(chatId),
-    initial_amount: Number(amount || 0),
-    started_at: start.toISOString(),
-    day5_at: d5.toISOString(),
-    day10_at: d10.toISOString(),
-    day14_at: d14.toISOString(),
-    status: 'active'
-  });
-  if (error) throw error;
-  return `✅ Bo‘lib to‘lash qayd qilindi.\nChat ID: ${chatId}\nBoshlang‘ich to‘lov: ${amount}\n\nEslatma: avtomatik yuborilmaydi. /installments_due orqali ko‘rasiz.`;
-}
-
-async function installmentsDueText() {
-  const now = nowIso();
-  const { data, error } = await supabase
-    .from('installments')
-    .select('id,chat_id,initial_amount,status,day5_at,day10_at,day14_at')
-    .eq('status', 'active')
-    .or(`day5_at.lte.${now},day10_at.lte.${now},day14_at.lte.${now}`)
-    .limit(30);
-  if (error) throw error;
-  if (!data?.length) return '🧾 Hozircha eslatma muddati kelgan bo‘lib to‘lash yo‘q.';
-  return '🧾 Eslatma muddati kelgan bo‘lib to‘lashlar\n\n' + data.map((x, i) => `${i + 1}. ID: ${x.id}\nChat ID: ${x.chat_id}\nBoshlang‘ich: ${x.initial_amount}\n5-kun: ${x.day5_at}\n10-kun: ${x.day10_at}\n14-kun: ${x.day14_at}`).join('\n\n');
+async function showLeadCard(adminChatId, leadChatId, edit = null) {
+  const { lead, text } = await leadCardText(leadChatId);
+  const extra = { reply_markup: lead ? leadCardKeyboard(lead) : backMenuKeyboard() };
+  if (edit?.messageId) return editMessage(adminChatId, edit.messageId, text, extra);
+  return sendMessage(adminChatId, text, extra);
 }
 
 // -------------------- Admin handlers --------------------
 
 async function showMainMenu(chatId, edit = null) {
-  const text = 'OLYE Business AI Bot v5 Lite\n\nBot vazifasi: yangi lidlarni biografik savollargacha olib kelish.\n\nKerakli bo‘limni tanlang:';
-  if (edit?.messageId) {
-    return editMessage(chatId, edit.messageId, text, { reply_markup: adminMenuKeyboard() });
-  }
+  const text = `OLYE Business AI Bot v5 Lite\n\nBot vazifasi: lidni biografik savollargacha olib kelish.\n\nAdmin spam yo‘q: yangi chatlar va AI tushunmaganlar ro‘yxatda turadi. Kerakli bo‘limni tanlang:`;
+  if (edit?.messageId) return editMessage(chatId, edit.messageId, text, { reply_markup: adminMenuKeyboard() });
   return sendMessage(chatId, text, { reply_markup: adminMenuKeyboard() });
 }
 
 async function showHelp(chatId, edit = null) {
-  const text = `⚙️ Yordam\n\nBuyruqlar:\n/menu — tugmali menyu\n/report — hisobot\n/stalled — chala lidlar\n/templates — shablonlar\n/gettemplate key — shablonni ko‘rish\n/settemplate key matn — shablonni o‘zgartirish\n/leadson chat_id — chatda botni yoqish\n/leadsoff chat_id — chatda botni o‘chirish\n/status chat_id — lid holati\n/discount_preview — chegirma preview\n/discount_confirm ID — tasdiqlab yuborish\n/discount_cancel ID — bekor qilish\n/installment chat_id amount — bo‘lib to‘lashni qayd qilish\n/installments_due — eslatma muddati kelganlar\n\nMuhim: mijozga AI erkin yozmaydi. Faqat shablondan javob chiqadi.`;
-  if (edit?.messageId) {
-    return editMessage(chatId, edit.messageId, text, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Menyu', callback_data: 'menu:main' }]] } });
-  }
-  return sendMessage(chatId, text);
+  const text = `⚙️ Yordam\n\nAsosiy buyruqlar:\n/menu — tugmali menyu\n/report — hisobot\n/pending — tasdiq kutayotganlar\n/active — faol lidlar\n/stalled — chala lidlar\n/needsadmin — AI tushunmaganlar\n/reached — savollargacha yetganlar\n/templates — shablonlar\n/gettemplate key — shablonni ko‘rish\n/settemplate key matn — shablonni o‘zgartirish\n/status chat_id — lid kartochkasi\n/leadson chat_id — botni yoqish\n/leadsoff chat_id — botni o‘chirish\n/restart chat_id — oqimni boshidan boshlash\n\nMuhim: AI mijozga erkin javob yozmaydi. U faqat intent aniqlaydi. Javoblar faqat shablondan chiqadi.`;
+  if (edit?.messageId) return editMessage(chatId, edit.messageId, text, { reply_markup: backMenuKeyboard() });
+  return sendMessage(chatId, text, { reply_markup: backMenuKeyboard() });
 }
 
 async function showTemplates(chatId, edit = null) {
   const rows = await listTemplates().catch(() => []);
   const text = `✏️ Shablonlar\n\nKerakli shablonni tanlang.\n\nMavjud: ${rows.length || Object.keys(TEMPLATE_TITLES).length}`;
-  if (edit?.messageId) {
-    return editMessage(chatId, edit.messageId, text, { reply_markup: templateListKeyboard() });
-  }
+  if (edit?.messageId) return editMessage(chatId, edit.messageId, text, { reply_markup: templateListKeyboard() });
   return sendMessage(chatId, text, { reply_markup: templateListKeyboard() });
 }
 
 async function showTemplate(chatId, key, edit = null) {
   const tmpl = await getTemplate(key);
   const text = `✏️ ${TEMPLATE_TITLES[key] || key}\n\nKey: ${key}\n\n${tmpl?.body || 'Shablon topilmadi.'}`;
-  if (edit?.messageId) {
-    return editMessage(chatId, edit.messageId, text, { reply_markup: templateViewKeyboard(key) });
-  }
+  if (edit?.messageId) return editMessage(chatId, edit.messageId, text, { reply_markup: templateViewKeyboard(key) });
   return sendMessage(chatId, text, { reply_markup: templateViewKeyboard(key) });
 }
 
-async function leadStatusText(chatId) {
-  const lead = await getLead(chatId);
-  if (!lead) return `Chat ID ${chatId} bo‘yicha lid topilmadi.`;
-  return `📌 Lid status\n\nChat ID: ${lead.chat_id}\nIsm: ${lead.first_name || '-'}\nUsername: ${lead.username ? '@' + lead.username : '-'}\nStatus: ${lead.status}\nStage: ${lead.stage}\nBot enabled: ${lead.bot_enabled ? 'ha' : 'yo‘q'}\nOxirgi xabar: ${lead.last_user_message || '-'}`;
+async function adminStartFlow(leadChatId, restart = false) {
+  const lead = await getLead(leadChatId);
+  if (!lead) return `Lid topilmadi: ${leadChatId}`;
+  if (!lead.business_connection_id) return `Bu chatda business_connection_id yo‘q. Oqimni boshlay olmadim: ${leadChatId}`;
+
+  const activeLead = await updateLead(leadChatId, {
+    status: STATUS.ACTIVE,
+    bot_enabled: true,
+    stage: STAGE.NEW,
+    ai_intent: null,
+    ai_confidence: null
+  }) || lead;
+
+  await sendTemplateToLead({
+    lead: { ...activeLead, status: STATUS.ACTIVE, bot_enabled: true, stage: STAGE.NEW },
+    templateKey: 'ask_application',
+    nextStage: STAGE.ASKED_APPLICATION
+  });
+
+  await logEvent(leadChatId, restart ? 'admin_restarted_flow' : 'admin_started_flow', 'Admin started flow');
+  return restart ? `🔁 Oqim qayta boshlandi: ${leadChatId}` : `✅ Oqim boshlandi: ${leadChatId}`;
+}
+
+async function adminForceYes(leadChatId) {
+  let lead = await getLead(leadChatId);
+  if (!lead) return `Lid topilmadi: ${leadChatId}`;
+
+  // needs_admin holatida oldingi real stage yo'qolmasligi uchun lead_eventsdan oxirgi active stage topish qiyin.
+  // Shuning uchun last_bot_message va ai intentga qarab emas, statusni active qilib, so'nggi ma'lum stagega qaytarish kerak.
+  // Agar stage needs_admin bo'lsa, oldingi stage sifatida pendingda qolmasligi uchun default asked_application ishlatiladi.
+  let stage = lead.stage;
+  if (stage === STAGE.NEEDS_ADMIN) {
+    stage = lead.review_stage || STAGE.ASKED_APPLICATION;
+  }
+
+  lead = await updateLead(leadChatId, { status: STATUS.ACTIVE, bot_enabled: true, stage, review_stage: null }) || lead;
+
+  if (stage === STAGE.ASKED_APPLICATION) {
+    await sendTemplateToLead({ lead, templateKey: 'ask_info', nextStage: STAGE.ASKED_INFO });
+    return `✅ Ha deb davom ettirildi: ${leadChatId}`;
+  }
+  if (stage === STAGE.ASKED_INFO) {
+    const updated = await sendTemplateToLead({ lead, templateKey: 'short_intro', nextStage: STAGE.ASKED_INFO });
+    await sendTemplateToLead({ lead: updated || lead, templateKey: 'offer_end', nextStage: STAGE.WAITING_OFFER_READ });
+    return `✅ Qisqa tanishtiruv yuborildi: ${leadChatId}`;
+  }
+  if (stage === STAGE.WAITING_OFFER_READ) {
+    await sendTemplateToLead({ lead, templateKey: 'ask_bio_confirm', nextStage: STAGE.ASKED_BIO_CONFIRM });
+    return `✅ Maqola taklifi yuborildi: ${leadChatId}`;
+  }
+  if (stage === STAGE.ASKED_BIO_CONFIRM) {
+    await sendTemplateToLead({ lead, templateKey: 'bio_questions', nextStage: STAGE.BIO_QUESTIONS_SENT, stop: true });
+    return `✅ Bio savollar yuborildi: ${leadChatId}`;
+  }
+
+  return adminStartFlow(leadChatId, true);
 }
 
 async function handleAdminText(message) {
@@ -884,14 +942,18 @@ async function handleAdminText(message) {
     return sendMessage(chatId, `✅ Shablon yangilandi: ${TEMPLATE_TITLES[key]}\n\nKey: ${key}`, { reply_markup: templateViewKeyboard(key) });
   }
 
-  if (!text.startsWith('/')) {
-    return sendMessage(chatId, 'Buyruq yoki /menu yuboring.');
-  }
+  if (!text.startsWith('/')) return sendMessage(chatId, 'Buyruq yoki /menu yuboring.');
 
   const { cmd, args } = parseCommand(text);
 
   if (cmd === '/start' || cmd === '/menu') return showMainMenu(chatId);
   if (cmd === '/help') return showHelp(chatId);
+  if (cmd === '/report') return sendMessage(chatId, await buildReportText(), { reply_markup: backMenuKeyboard() });
+  if (cmd === '/pending') return showLeadList(chatId, 'pending');
+  if (cmd === '/active') return showLeadList(chatId, 'active');
+  if (cmd === '/stalled') return showLeadList(chatId, 'stalled');
+  if (cmd === '/needsadmin') return showLeadList(chatId, 'needs_admin');
+  if (cmd === '/reached') return showLeadList(chatId, 'reached');
   if (cmd === '/templates') return showTemplates(chatId);
 
   if (cmd === '/gettemplate') {
@@ -909,60 +971,32 @@ async function handleAdminText(message) {
     return sendMessage(chatId, `✅ Shablon yangilandi: ${key}`);
   }
 
-  if (cmd === '/report') {
-    return sendMessage(chatId, await buildReportText());
-  }
-
-  if (cmd === '/stalled') {
-    return sendMessage(chatId, await buildStalledText());
+  if (cmd === '/status') {
+    const id = args.trim();
+    if (!id) return sendMessage(chatId, 'Namuna: /status 123456789');
+    return showLeadCard(chatId, id);
   }
 
   if (cmd === '/leadson') {
     const id = args.trim();
     if (!id) return sendMessage(chatId, 'Namuna: /leadson 123456789');
-    await updateLead(id, { status: 'active', bot_enabled: true });
+    const lead = await getLead(id);
+    const stage = [STAGE.PAUSED, STAGE.NEEDS_ADMIN].includes(lead?.stage) ? (lead?.review_stage || STAGE.ASKED_APPLICATION) : lead?.stage;
+    await updateLead(id, { status: STATUS.ACTIVE, bot_enabled: true, stage, review_stage: null });
     return sendMessage(chatId, `✅ Bot yoqildi: ${id}`);
   }
 
   if (cmd === '/leadsoff') {
     const id = args.trim();
     if (!id) return sendMessage(chatId, 'Namuna: /leadsoff 123456789');
-    await updateLead(id, { status: 'disabled', bot_enabled: false, stage: STAGE.DISABLED });
+    await updateLead(id, { status: STATUS.DISABLED, bot_enabled: false, stage: STAGE.DISABLED, is_old_lead: true });
     return sendMessage(chatId, `🔕 Bot o‘chirildi: ${id}`);
   }
 
-  if (cmd === '/status') {
+  if (cmd === '/restart') {
     const id = args.trim();
-    if (!id) return sendMessage(chatId, 'Namuna: /status 123456789');
-    return sendMessage(chatId, await leadStatusText(id));
-  }
-
-  if (cmd === '/discount_preview') {
-    const preview = await createDiscountPreview();
-    return sendMessage(chatId, preview.text);
-  }
-
-  if (cmd === '/discount_confirm') {
-    const id = args.trim();
-    if (!id) return sendMessage(chatId, 'Namuna: /discount_confirm 1');
-    const result = await confirmDiscount(id);
-    return sendMessage(chatId, result.text);
-  }
-
-  if (cmd === '/discount_cancel') {
-    const id = args.trim();
-    if (!id) return sendMessage(chatId, 'Namuna: /discount_cancel 1');
-    return sendMessage(chatId, await cancelDiscount(id));
-  }
-
-  if (cmd === '/installment') {
-    const [leadChatId, amount] = args.split(/\s+/);
-    if (!leadChatId || !amount) return sendMessage(chatId, 'Namuna: /installment 123456789 50000');
-    return sendMessage(chatId, await createInstallment(leadChatId, amount));
-  }
-
-  if (cmd === '/installments_due') {
-    return sendMessage(chatId, await installmentsDueText());
+    if (!id) return sendMessage(chatId, 'Namuna: /restart 123456789');
+    return sendMessage(chatId, await adminStartFlow(id, true));
   }
 
   return sendMessage(chatId, 'Noma’lum buyruq. /menu bosing.');
@@ -983,8 +1017,12 @@ async function handleCallback(query) {
 
   if (data === 'menu:main') return showMainMenu(chatId, { messageId });
   if (data === 'menu:help') return showHelp(chatId, { messageId });
-  if (data === 'menu:report') return editMessage(chatId, messageId, await buildReportText(), { reply_markup: { inline_keyboard: [[{ text: '⬅️ Menyu', callback_data: 'menu:main' }]] } });
-  if (data === 'menu:stalled') return editMessage(chatId, messageId, await buildStalledText(), { reply_markup: { inline_keyboard: [[{ text: '⬅️ Menyu', callback_data: 'menu:main' }]] } });
+  if (data === 'menu:report') return editMessage(chatId, messageId, await buildReportText(), { reply_markup: backMenuKeyboard() });
+
+  if (data.startsWith('list:')) {
+    const type = data.split(':')[1];
+    return showLeadList(chatId, type, { messageId });
+  }
 
   if (data === 'tmpl:list') return showTemplates(chatId, { messageId });
   if (data.startsWith('tmpl:view:')) {
@@ -997,132 +1035,90 @@ async function handleCallback(query) {
     return editMessage(chatId, messageId, `✏️ ${TEMPLATE_TITLES[key] || key}\n\nYangi matnni oddiy xabar qilib yuboring.\nBekor qilish uchun /menu bosing.`);
   }
 
+  if (data.startsWith('lead:view:')) {
+    const leadChatId = data.split(':')[2];
+    return showLeadCard(chatId, leadChatId, { messageId });
+  }
+
   if (data.startsWith('lead:start:')) {
     const leadChatId = data.split(':')[2];
+    await adminStartFlow(leadChatId, false);
+    return showLeadCard(chatId, leadChatId, { messageId });
+  }
+
+  if (data.startsWith('lead:restart:')) {
+    const leadChatId = data.split(':')[2];
+    await adminStartFlow(leadChatId, true);
+    return showLeadCard(chatId, leadChatId, { messageId });
+  }
+
+  if (data.startsWith('lead:pause:')) {
+    const leadChatId = data.split(':')[2];
     const lead = await getLead(leadChatId);
-    if (!lead) return sendMessage(chatId, `Lid topilmadi: ${leadChatId}`);
-    if (!lead.business_connection_id) return sendMessage(chatId, `Bu chatda business_connection_id yo‘q. Oqimni boshlay olmadim: ${leadChatId}`);
-
-    const activeLead = await updateLead(leadChatId, {
-      status: 'active',
-      bot_enabled: true,
-      stage: STAGE.NEW
-    }) || lead;
-
-    await sendTemplateToLead({
-      lead: { ...activeLead, status: 'active', bot_enabled: true, stage: STAGE.NEW },
-      templateKey: 'ask_application',
-      nextStage: STAGE.ASKED_APPLICATION
-    });
-
-    await logEvent(leadChatId, 'admin_started_flow', 'Admin approved first contact');
-    return sendMessage(chatId, `✅ Oqim boshlandi: ${leadChatId}`);
+    await updateLead(leadChatId, { status: STATUS.PAUSED, bot_enabled: false, review_stage: lead?.stage || null, stage: STAGE.PAUSED });
+    return showLeadCard(chatId, leadChatId, { messageId });
   }
 
   if (data.startsWith('lead:off:')) {
     const leadChatId = data.split(':')[2];
-    await updateLead(leadChatId, { status: 'disabled', bot_enabled: false, stage: STAGE.DISABLED, is_old_lead: true });
-    return sendMessage(chatId, `🔕 Bot o‘chirildi: ${leadChatId}`);
+    await updateLead(leadChatId, { status: STATUS.DISABLED, bot_enabled: false, stage: STAGE.DISABLED, is_old_lead: true });
+    return showLeadCard(chatId, leadChatId, { messageId });
   }
 
   if (data.startsWith('lead:on:')) {
     const leadChatId = data.split(':')[2];
-    await updateLead(leadChatId, { status: 'active', bot_enabled: true });
-    return sendMessage(chatId, `🔔 Bot yoqildi: ${leadChatId}`);
+    const lead = await getLead(leadChatId);
+    const stage = [STAGE.PAUSED, STAGE.NEEDS_ADMIN].includes(lead?.stage) ? (lead?.review_stage || STAGE.ASKED_APPLICATION) : lead?.stage;
+    await updateLead(leadChatId, { status: STATUS.ACTIVE, bot_enabled: true, stage, review_stage: null });
+    return showLeadCard(chatId, leadChatId, { messageId });
   }
 
-  if (data.startsWith('lead:status:')) {
+  if (data.startsWith('lead:force_yes:')) {
     const leadChatId = data.split(':')[2];
-    return sendMessage(chatId, await leadStatusText(leadChatId));
+    await adminForceYes(leadChatId);
+    return showLeadCard(chatId, leadChatId, { messageId });
   }
 
-  if (data === 'discount:preview') {
-    const preview = await createDiscountPreview();
-    return editMessage(chatId, messageId, preview.text, {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '✅ Tasdiqlash', callback_data: `discount:confirm:${preview.action.id}` }],
-          [{ text: '❌ Bekor qilish', callback_data: `discount:cancel:${preview.action.id}` }],
-          [{ text: '⬅️ Menyu', callback_data: 'menu:main' }]
-        ]
-      }
-    });
-  }
-
-  if (data.startsWith('discount:confirm:')) {
-    const id = data.split(':')[2];
-    const result = await confirmDiscount(id);
-    return editMessage(chatId, messageId, result.text, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Menyu', callback_data: 'menu:main' }]] } });
-  }
-
-  if (data.startsWith('discount:cancel:')) {
-    const id = data.split(':')[2];
-    const text = await cancelDiscount(id);
-    return editMessage(chatId, messageId, text, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Menyu', callback_data: 'menu:main' }]] } });
-  }
-
-  if (data === 'installments:due') {
-    return editMessage(chatId, messageId, await installmentsDueText(), { reply_markup: { inline_keyboard: [[{ text: '⬅️ Menyu', callback_data: 'menu:main' }]] } });
+  if (data.startsWith('lead:force_no:')) {
+    const leadChatId = data.split(':')[2];
+    const lead = await getLead(leadChatId);
+    if (lead) await stopLeadWithReject({ ...lead, status: STATUS.ACTIVE, bot_enabled: true });
+    return showLeadCard(chatId, leadChatId, { messageId });
   }
 }
 
 // -------------------- Express routes --------------------
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, name: 'OLYE Business AI Bot v5 Lite', port: PORT });
+  res.json({ ok: true, name: 'OLYE Business AI Bot v5 Lite', mode: FIRST_CONTACT_MODE, port: PORT });
 });
 
 app.get('/health', (req, res) => {
   res.json({ ok: true, time: nowIso() });
 });
 
-// Browser orqali /webhook ochilganda "Cannot GET /webhook" chiqmasligi uchun.
-// Telegram webhook update'larni baribir POST orqali yuboradi.
 app.get('/webhook', (req, res) => {
-  res.json({
-    ok: true,
-    message: "Webhook endpoint ishlayapti. Telegram update'larni POST orqali yuboradi.",
-    method: 'POST /webhook'
-  });
+  res.json({ ok: true, message: "Webhook endpoint ishlayapti. Telegram update'larni POST orqali yuboradi.", method: 'POST /webhook' });
 });
 
-
-// Brauzer orqali webhook ulash uchun qulay route.
-// Render URL: https://SENING-SERVICE.onrender.com/set-webhook
 app.get('/set-webhook', async (req, res) => {
   try {
     const host = req.get('host');
     const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
     const webhookUrl = process.env.WEBHOOK_URL || `${proto}://${host}/webhook`;
-
     const payload = {
       url: webhookUrl,
       allowed_updates: ['message', 'callback_query', 'business_message']
     };
-
-    if (WEBHOOK_SECRET) {
-      payload.secret_token = WEBHOOK_SECRET;
-    }
-
+    if (WEBHOOK_SECRET) payload.secret_token = WEBHOOK_SECRET;
     const result = await tg('setWebhook', payload);
-
-    res.json({
-      ok: true,
-      message: 'Webhook ulandi.',
-      webhook_url: webhookUrl,
-      allowed_updates: payload.allowed_updates,
-      result
-    });
+    res.json({ ok: true, message: 'Webhook ulandi.', webhook_url: webhookUrl, allowed_updates: payload.allowed_updates, result });
   } catch (err) {
     console.error('set-webhook route error:', err);
-    res.status(500).json({
-      ok: false,
-      error: err.message
-    });
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// Webhook holatini brauzerda tekshirish uchun.
 app.get('/webhook-info', async (req, res) => {
   try {
     const result = await tg('getWebhookInfo', {});
@@ -1137,9 +1133,7 @@ app.post('/webhook', async (req, res) => {
   try {
     if (WEBHOOK_SECRET) {
       const got = req.headers['x-telegram-bot-api-secret-token'];
-      if (got !== WEBHOOK_SECRET) {
-        return res.status(401).json({ ok: false, error: 'bad secret' });
-      }
+      if (got !== WEBHOOK_SECRET) return res.status(401).json({ ok: false, error: 'bad secret' });
     }
 
     const update = req.body;
@@ -1151,9 +1145,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     if (update.message) {
-      if (isAdminMessage(update.message)) {
-        await handleAdminText(update.message);
-      }
+      if (isAdminMessage(update.message)) await handleAdminText(update.message);
       return;
     }
 

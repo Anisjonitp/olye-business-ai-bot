@@ -14,9 +14,28 @@ create table if not exists business_leads (
   last_user_message text,
   last_bot_message text,
   last_message_at timestamptz default now(),
+  review_stage text,
+  ai_intent text,
+  ai_confidence numeric,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
+
+alter table business_leads add column if not exists business_connection_id text;
+alter table business_leads add column if not exists first_name text;
+alter table business_leads add column if not exists username text;
+alter table business_leads add column if not exists status text default 'active';
+alter table business_leads add column if not exists stage text default 'new';
+alter table business_leads add column if not exists bot_enabled boolean default true;
+alter table business_leads add column if not exists is_old_lead boolean default false;
+alter table business_leads add column if not exists last_user_message text;
+alter table business_leads add column if not exists last_bot_message text;
+alter table business_leads add column if not exists last_message_at timestamptz default now();
+alter table business_leads add column if not exists review_stage text;
+alter table business_leads add column if not exists ai_intent text;
+alter table business_leads add column if not exists ai_confidence numeric;
+alter table business_leads add column if not exists created_at timestamptz default now();
+alter table business_leads add column if not exists updated_at timestamptz default now();
 
 create index if not exists idx_business_leads_stage on business_leads(stage);
 create index if not exists idx_business_leads_status on business_leads(status);
@@ -40,41 +59,26 @@ create table if not exists lead_events (
 create index if not exists idx_lead_events_chat_id on lead_events(chat_id);
 create index if not exists idx_lead_events_created_at on lead_events(created_at);
 
-create table if not exists pending_actions (
-  id bigserial primary key,
-  action_type text not null,
-  payload jsonb,
-  status text default 'pending',
+-- Webhook duplicate xabarlarni qayta ishlamaslik uchun.
+create table if not exists processed_messages (
+  chat_id text not null,
+  message_id text not null,
   created_at timestamptz default now(),
-  confirmed_at timestamptz,
-  canceled_at timestamptz
+  primary key (chat_id, message_id)
 );
 
-create table if not exists admin_sessions (
+-- Admin tugmali menyu sessiyalari.
+-- Eski noto'g'ri schema bo'lsa, xavfsiz qayta yaratiladi.
+drop table if exists admin_sessions;
+create table admin_sessions (
   chat_id text primary key,
   mode text not null,
   payload jsonb default '{}'::jsonb,
   updated_at timestamptz default now()
 );
 
-create table if not exists installments (
-  id bigserial primary key,
-  chat_id text not null,
-  initial_amount numeric default 0,
-  started_at timestamptz default now(),
-  day5_at timestamptz,
-  day10_at timestamptz,
-  day14_at timestamptz,
-  status text default 'active',
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
-);
-
-create index if not exists idx_installments_chat_id on installments(chat_id);
-create index if not exists idx_installments_status on installments(status);
-
 insert into reply_templates (key, title, body) values
-('ask_application', 'Ariza qoldirganini so‘rash', $$Siz “O‘zbekiston Lider Yoshlari Ensiklopediyasi”ga kirish uchun ariza qoldirgansiz. Shunaqami?$$),
+('ask_application', 'Ariza/qiziqishni tasdiqlash', $$Siz “O‘zbekiston Lider Yoshlari Ensiklopediyasi”ga kirish uchun ariza qoldirgansiz. Shunaqami?$$),
 
 ('ask_info', 'Ma’lumot bor-yo‘qligini so‘rash', $$Ajoyib. Siz ensiklopediyamizga kirishning foydali jihatlari haqida batafsil ma’lumotga egamisiz?$$),
 
@@ -113,9 +117,13 @@ Foydali jihatlari:
 
 Ma’lumotlarni yuborganingizdan so‘ng maqola tayyorlash jarayoni boshlanadi.$$),
 
-('discount_message', 'Chegirma xabari', $$Assalomu alaykum. Siz uchun ensiklopediyaga kirish bo‘yicha maxsus chegirma imkoniyati bor.
+('price_reply', 'Narx/badal savoliga javob', $$Loyihaga kiritish uchun yillik texnik badal mavjud. Bu badal biografik maqolani tayyorlash, saytga joylash, texnik yuritish va sertifikat bilan bog‘liq xarajatlarni qoplaydi.
 
-Agar bugun tasdiqlasangiz, maqola tayyorlash jarayonini boshlashimiz mumkin.$$)
+Aniq to‘lov tartibini xabar davomida tushuntirib beramiz.$$),
+
+('later_reply', 'Keyinroq javobi', $$Mayli, tushunarli. Keyinroq davom ettiramiz.$$),
+
+('reject_reply', 'Rad javobi', $$Tushunarli. Bezovta qilgan bo‘lsak uzr. Yaxshi kun tilaymiz.$$)
 
 on conflict (key) do update set
   title = excluded.title,
