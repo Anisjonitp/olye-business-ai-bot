@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import OpenAI from 'openai';
+import crypto from 'crypto';
 import { createClient } from '@supabase/supabase-js';
 
 const app = express();
@@ -37,6 +38,8 @@ const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 7000);
 const TURN_COOLDOWN_MS = Number(process.env.TURN_COOLDOWN_MS || 12000);
 const MAX_BATCH_MESSAGES = Number(process.env.MAX_BATCH_MESSAGES || 8);
 const MAX_BATCH_CHARS = Number(process.env.MAX_BATCH_CHARS || 3000);
+const CHAT_LOCK_MS = Number(process.env.CHAT_LOCK_MS || 30000);
+const PACKAGE_MESSAGE_DELAY_MS = Number(process.env.PACKAGE_MESSAGE_DELAY_MS || 500);
 
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL missing');
@@ -119,6 +122,22 @@ function clip(text = '', max = 3500) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+
+function stableHash(value) {
+  return crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 32);
+}
+
+function addMsIso(ms) {
+  return new Date(Date.now() + Number(ms || 0)).toISOString();
+}
+
+function safeBridgeText(text = '') {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 900);
 }
 
 function msSince(iso) {
@@ -496,6 +515,90 @@ async function clearAdminSession(chatId) {
   if (error) console.error('clearAdminSession:', error);
 }
 
+async function acquireChatLock(chatId, lockMs = CHAT_LOCK_MS) {
+  const id = str(chatId);
+  try {
+    // Avval muddati o'tgan lockni tozalaymiz.
+    await supabase
+      .from('chat_locks')
+      .delete()
+      .eq('chat_id', id)
+      .lt('locked_until', nowIso());
+
+    const { error } = await supabase.from('chat_locks').insert({
+      chat_id: id,
+      locked_until: addMsIso(lockMs),
+      updated_at: nowIso()
+    });
+
+    if (!error) return true;
+    if (error.code === '23505') return false;
+    console.error('acquireChatLock:', error);
+    // Jadval yo'q yoki boshqa mayda muammo bo'lsa, bot butunlay to'xtab qolmasin.
+    return true;
+  } catch (err) {
+    console.error('acquireChatLock:', err.message);
+    return true;
+  }
+}
+
+async function releaseChatLock(chatId) {
+  try {
+    await supabase.from('chat_locks').delete().eq('chat_id', str(chatId));
+  } catch (err) {
+    console.error('releaseChatLock:', err.message);
+  }
+}
+
+async function ensureResponsePackage(packageId, chatId, turnId, actionName) {
+  try {
+    const { error } = await supabase.from('response_packages').insert({
+      package_id: packageId,
+      chat_id: str(chatId),
+      turn_id: str(turnId),
+      action_name: actionName,
+      status: 'sending',
+      created_at: nowIso(),
+      updated_at: nowIso()
+    });
+    if (error && error.code !== '23505') console.error('ensureResponsePackage:', error);
+    return true;
+  } catch (err) {
+    console.error('ensureResponsePackage:', err.message);
+    return true;
+  }
+}
+
+async function markPackageComplete(packageId) {
+  try {
+    await supabase
+      .from('response_packages')
+      .update({ status: 'completed', completed_at: nowIso(), updated_at: nowIso() })
+      .eq('package_id', packageId);
+  } catch (err) {
+    console.error('markPackageComplete:', err.message);
+  }
+}
+
+async function reservePackageMessage(packageId, chatId, messageIndex, templateKey) {
+  try {
+    const { error } = await supabase.from('sent_bot_messages').insert({
+      package_id: packageId,
+      chat_id: str(chatId),
+      message_index: messageIndex,
+      template_key: templateKey || 'bridge_text',
+      created_at: nowIso()
+    });
+    if (!error) return true;
+    if (error.code === '23505') return false;
+    console.error('reservePackageMessage:', error);
+    return true;
+  } catch (err) {
+    console.error('reservePackageMessage:', err.message);
+    return true;
+  }
+}
+
 // -------------------- Intent classifier --------------------
 
 function isExactAny(t, words) {
@@ -519,7 +622,9 @@ function forceIntentByStage(text, stage, current = { intent: 'unclear', confiden
   const hardReject = [
     'kerak emas', 'kerakmas', 'qiziq emas', 'qiziqmas', 'xohlamayman', 'hohlamayman',
     'bezovta qilmang', 'yozmang', 'rad etaman', 'bekor qiling', 'menga kerak emas',
-    'endi yozmang', 'spam qilmang'
+    'endi yozmang', 'spam qilmang',
+    'tanimayman sizlarni', 'tanimiman sizlarni', 'tanimayman bilmayman', 'tanimiman bilmayman',
+    'bilmayman sizlarni', 'sizlarni tanimayman', 'sizlarni bilmayman'
   ];
   if (hasAny(t, hardReject)) return { intent: 'reject', confidence: 0.99, forced: true };
 
@@ -668,36 +773,191 @@ User message: ${text}`;
   }
 }
 
-// -------------------- Lead flow --------------------
 
-async function sendTemplateToLead({ lead, templateKey, nextStage, stop = false, patch = {} }) {
-  const body = await getTemplateBody(templateKey);
-  if (!body) {
-    await sendAdmin(`⚠️ Shablon topilmadi: <code>${htmlEscape(templateKey)}</code>`);
-    return null;
+// -------------------- Natural bridge replies --------------------
+
+function stageReturnQuestion(lead) {
+  const stage = lead?.stage;
+  if (stage === STAGE.NEW || stage === STAGE.ASKED_APPLICATION) {
+    return 'Aniqlashtirib olay: siz ensiklopediyaga kirish bo‘yicha ariza yoki qiziqish qoldirganmidingiz?';
+  }
+  if (stage === STAGE.ASKED_INFO) {
+    return 'Siz bu loyiha foydali jihatlari haqida avval tanishganmisiz yoki batafsil tushuntirib beraymi?';
+  }
+  if (stage === STAGE.WAITING_OFFER_READ) {
+    return 'Oferta va ma’lumot bilan tanishib chiqqach, “tanishdim” deb yozsangiz bo‘ladi.';
+  }
+  if (stage === STAGE.ASKED_BIO_CONFIRM) {
+    return 'Sizga ham biografik maqola tayyorlashimizni xohlaysizmi?';
+  }
+  return 'Aniqlashtirib olay: loyiha bo‘yicha davom etamizmi?';
+}
+
+function localBridgeReply(lead, userText = '', intent = 'unclear') {
+  const t = normalizeText(userText);
+
+  if (intent === 'application_denied') {
+    return `Tushunarli. Adashgan bo‘lsak, uzr. ${stageReturnQuestion(lead)}`;
   }
 
-  await sendBusinessMessage({
-    chatId: lead.chat_id,
-    businessConnectionId: lead.business_connection_id,
-    text: body
-  });
+  if (hasAny(t, ['kimsan', 'kim siz', 'kim bu', 'tanimadim', 'tanimadim sizni', 'qayerdan oldingiz'])) {
+    return `Tushunarli, avval aniqlik kiritib olay. Biz “O‘zbekiston Lider Yoshlari Ensiklopediyasi” loyihasi bo‘yicha murojaat qilgan edik. ${stageReturnQuestion(lead)}`;
+  }
 
+  if (hasAny(t, ['nima desam ekan', 'bilmadim nima deyishni', 'o‘ylab qoldim', 'oylab qoldim'])) {
+    return `Mayli, shoshilmang. Sizga qulay bo‘lishi uchun oddiy qilib so‘rayman: ${stageReturnQuestion(lead)}`;
+  }
+
+  if (hasAny(t, ['hazillashdim', 'hazil', 'topgandik', 'adashdim', 'nima desam'])) {
+    return `Tushunarli 😊 Unda aniqlashtirib olay: ${stageReturnQuestion(lead)}`;
+  }
+
+  if (lead?.stage === STAGE.WAITING_OFFER_READ) {
+    return `Tushunarli. ${stageReturnQuestion(lead)}`;
+  }
+
+  return `Tushunarli. ${stageReturnQuestion(lead)}`;
+}
+
+async function aiBridgeReply(lead, userText = '', intent = 'unclear') {
+  const fallback = localBridgeReply(lead, userText, intent);
+  if (!openai) return fallback;
+
+  try {
+    const prompt = `Sen Telegram Business savdo yordamchisisan.
+
+Vazifa: lidning noaniq yoki shablonga to'g'ri kelmagan gapiga TABIIY, MULОYIM, QISQA ko'prik javob yozish va suhbatni hozirgi savolga qaytarish.
+
+Qoidalar:
+- O'zbek lotinida yoz.
+- 1-2 gapdan oshirma.
+- Odamga o'xshab muloyim bo'l, robotcha yoki jinnicha javob yozma.
+- Narx, karta raqam, kafolat, sertifikat, to'lov summasi kabi faktlarni o'zingdan yozma.
+- Agar odam "kimsan/tanimadim" desa, qisqa tanishtir va aniqlashtir.
+- Agar odam "nima desam ekan" desa, shoshirmasdan oddiy qilib savolga qaytar.
+- Agar odam rad qilsa, lekin aniq "kerak emas/bezovta qilmang" demasa, yumshoq aniqlashtir.
+- Har doim mana shu asosiy savolga qaytar: ${stageReturnQuestion(lead)}
+
+Faqat JSON qaytar:
+{"message":"..."}
+
+Hozirgi stage: ${lead?.stage}
+Lid xabari: ${userText}`;
+
+    const response = await openai.responses.create({
+      model: OPENAI_MODEL,
+      input: prompt,
+      temperature: 0.35
+    });
+
+    const raw = (response.output_text || '').trim();
+    const parsed = JSON.parse(raw.replace(/^```json\s*/i, '').replace(/```$/i, '').trim());
+    const msg = safeBridgeText(parsed.message || '');
+    if (!msg || msg.length < 10) return fallback;
+    return msg;
+  } catch (err) {
+    console.error('aiBridgeReply fallback:', err.message);
+    return fallback;
+  }
+}
+
+async function sideQuestionReturnText(lead, sideType) {
+  // Side savollar asosiy stage'ni buzmaydi. Javobdan keyin suhbatni o'sha savolga qaytaramiz.
+  if (sideType === 'price') {
+    return stageReturnQuestion(lead);
+  }
+  if (sideType === 'card') {
+    if (lead?.stage === STAGE.WAITING_OFFER_READ) return 'To‘lovdan oldin oferta bilan tanishib chiqing. Tanishib chiqqach, “tanishdim” deb yozsangiz bo‘ladi.';
+    return stageReturnQuestion(lead);
+  }
+  if (sideType === 'expensive') {
+    return 'Xohlasangiz, avval loyiha sizga qanday foyda berishini sodda qilib tushuntirib beraman.';
+  }
+  return stageReturnQuestion(lead);
+}
+
+// -------------------- Lead flow --------------------
+
+
+async function resolvePackageItems(items = []) {
+  const resolved = [];
+  for (const item of items) {
+    if (item.text) {
+      resolved.push({ text: safeBridgeText(item.text), templateKey: item.templateKey || 'bridge_text' });
+    } else if (item.templateKey) {
+      const body = await getTemplateBody(item.templateKey);
+      if (!body) {
+        await sendAdmin(`⚠️ Shablon topilmadi: <code>${htmlEscape(item.templateKey)}</code>`);
+        continue;
+      }
+      resolved.push({ text: body, templateKey: item.templateKey });
+    }
+  }
+  return resolved.filter(x => x.text);
+}
+
+async function sendResponsePackage({ lead, turnId = 'manual', actionName, items = [], nextStage, stop = false, patch = {} }) {
+  const packageId = stableHash(`${lead.chat_id}|${turnId}|${actionName}`);
+  const resolved = await resolvePackageItems(items);
+  if (resolved.length === 0) return lead;
+
+  await ensureResponsePackage(packageId, lead.chat_id, turnId, actionName);
+
+  let lastText = '';
+  let lastTemplateKey = '';
+  for (let i = 0; i < resolved.length; i++) {
+    const item = resolved[i];
+    const shouldSend = await reservePackageMessage(packageId, lead.chat_id, i, item.templateKey);
+    if (!shouldSend) {
+      // Shu paketdagi shu xabar oldin yuborilgan. Duplicate yubormaymiz.
+      continue;
+    }
+
+    await sendBusinessMessage({
+      chatId: lead.chat_id,
+      businessConnectionId: lead.business_connection_id,
+      text: item.text
+    });
+
+    lastText = item.text;
+    lastTemplateKey = item.templateKey;
+    await logEvent(lead.chat_id, `bot_package_${actionName}_${item.templateKey}_${i}`, item.text);
+
+    if (i < resolved.length - 1 && PACKAGE_MESSAGE_DELAY_MS > 0) {
+      await sleep(PACKAGE_MESSAGE_DELAY_MS);
+    }
+  }
+
+  const combined = resolved.map(x => x.text).join('\n\n---\n\n');
   const update = {
-    last_bot_message: body,
+    last_bot_message: combined,
     last_bot_sent_at: nowIso(),
-    last_bot_template_key: templateKey,
+    last_bot_template_key: lastTemplateKey || resolved.at(-1)?.templateKey || actionName,
     stage: nextStage || lead.stage,
     ...patch
   };
+
   if (stop) {
     update.status = STATUS.STOPPED;
     update.bot_enabled = false;
   }
 
+  await markPackageComplete(packageId);
   const updated = await updateLead(lead.chat_id, update);
-  await logEvent(lead.chat_id, `bot_sent_${templateKey}`, body);
-  return updated;
+  return updated || { ...lead, ...update };
+}
+
+// Eski nom ayrim admin funksiyalarda ishlatilsa ham xavfsiz bo'lishi uchun qoldirildi.
+async function sendTemplateToLead({ lead, templateKey, nextStage, stop = false, patch = {}, turnId = 'manual' }) {
+  return sendResponsePackage({
+    lead,
+    turnId,
+    actionName: `template_${templateKey}`,
+    items: [{ templateKey }],
+    nextStage,
+    stop,
+    patch
+  });
 }
 
 async function moveToNeedsAdmin(lead, text, intentResult) {
@@ -712,10 +972,12 @@ async function moveToNeedsAdmin(lead, text, intentResult) {
   await logEvent(lead.chat_id, 'needs_admin', text);
 }
 
-async function pauseLead(lead, templateKey = 'later_reply') {
-  const updated = await sendTemplateToLead({
+async function pauseLead(lead, templateKey = 'later_reply', turnId = 'manual') {
+  const updated = await sendResponsePackage({
     lead,
-    templateKey,
+    turnId,
+    actionName: 'pause_later',
+    items: [{ templateKey }],
     nextStage: STAGE.PAUSED,
     patch: { status: STATUS.PAUSED, bot_enabled: false, review_stage: lead.stage }
   });
@@ -723,10 +985,12 @@ async function pauseLead(lead, templateKey = 'later_reply') {
   return updated;
 }
 
-async function stopLeadWithReject(lead) {
-  const updated = await sendTemplateToLead({
+async function stopLeadWithReject(lead, turnId = 'manual') {
+  const updated = await sendResponsePackage({
     lead,
-    templateKey: 'reject_reply',
+    turnId,
+    actionName: 'reject_stop',
+    items: [{ templateKey: 'reject_reply' }],
     nextStage: STAGE.STOPPED,
     stop: true
   });
@@ -734,115 +998,180 @@ async function stopLeadWithReject(lead) {
   return updated;
 }
 
-async function sendFullExplanationFlow(lead) {
-  let updated = await sendTemplateToLead({ lead, templateKey: 'explain_reply', nextStage: lead.stage });
-  updated = await sendTemplateToLead({ lead: updated || lead, templateKey: 'full_intro', nextStage: lead.stage });
-  await sendTemplateToLead({ lead: updated || lead, templateKey: 'offer_end', nextStage: STAGE.WAITING_OFFER_READ });
+async function sendFullExplanationFlow(lead, turnId = 'manual') {
+  return sendResponsePackage({
+    lead,
+    turnId,
+    actionName: 'full_explanation_flow',
+    items: [
+      { templateKey: 'explain_reply' },
+      { templateKey: 'full_intro' },
+      { templateKey: 'offer_end' }
+    ],
+    nextStage: STAGE.WAITING_OFFER_READ
+  });
 }
 
-async function sendBioQuestionsAndStop(lead) {
-  await sendTemplateToLead({
+async function sendShortIntroFlow(lead, turnId = 'manual') {
+  return sendResponsePackage({
     lead,
-    templateKey: 'bio_questions',
+    turnId,
+    actionName: 'short_intro_flow',
+    items: [
+      { templateKey: 'short_intro' },
+      { templateKey: 'offer_end' }
+    ],
+    nextStage: STAGE.WAITING_OFFER_READ
+  });
+}
+
+async function sendFullIntroFlow(lead, turnId = 'manual') {
+  return sendResponsePackage({
+    lead,
+    turnId,
+    actionName: 'full_intro_flow',
+    items: [
+      { templateKey: 'full_intro' },
+      { templateKey: 'offer_end' }
+    ],
+    nextStage: STAGE.WAITING_OFFER_READ
+  });
+}
+
+async function sendSideQuestionReply(lead, templateKey, sideType, turnId = 'manual') {
+  const returnText = await sideQuestionReturnText(lead, sideType);
+  return sendResponsePackage({
+    lead,
+    turnId,
+    actionName: `side_${sideType}`,
+    items: [
+      { templateKey },
+      { text: returnText, templateKey: `return_${lead.stage}` }
+    ],
+    nextStage: lead.stage
+  });
+}
+
+async function sendBridgeToStage(lead, userText = '', intent = 'unclear', turnId = 'manual') {
+  const bridge = await aiBridgeReply(lead, userText, intent);
+  return sendResponsePackage({
+    lead,
+    turnId,
+    actionName: `bridge_${intent}`,
+    items: [{ text: bridge, templateKey: 'bridge_reply' }],
+    nextStage: lead.stage
+  });
+}
+
+async function sendBioQuestionsAndStop(lead, turnId = 'manual') {
+  await sendResponsePackage({
+    lead,
+    turnId,
+    actionName: 'bio_questions_stop',
+    items: [{ templateKey: 'bio_questions' }],
     nextStage: STAGE.BIO_QUESTIONS_SENT,
     stop: true
   });
   await logEvent(lead.chat_id, 'bio_questions_reached', lead.last_user_message || '');
 }
 
-async function continueByIntent(lead, intentResult, userText = '') {
+async function continueByIntent(lead, intentResult, userText = '', turnId = 'manual') {
   // Yakuniy himoya: AI noto'g'ri tushunsa ham stage-specific qoida yutadi.
   const forced = forceIntentByStage(userText, lead.stage, intentResult);
   const { intent, confidence } = forced;
 
-  // Endi bot imkon qadar admin qo'liga tashlamaydi: tushunmasa ham stage bo'yicha eng xavfsiz shablonni davom ettiradi.
-  if (intent === 'unclear' || confidence < AI_CONFIDENCE_MIN) {
-    if ([STAGE.NEW, STAGE.ASKED_APPLICATION, STAGE.ASKED_INFO].includes(lead.stage)) {
-      await sendFullExplanationFlow(lead);
-      return;
-    }
-    if (lead.stage === STAGE.WAITING_OFFER_READ) {
-      await sendTemplateToLead({ lead, templateKey: 'next_steps_reply', nextStage: lead.stage });
-      return;
-    }
-    if (lead.stage === STAGE.ASKED_BIO_CONFIRM) {
-      await sendTemplateToLead({ lead, templateKey: 'ask_bio_confirm', nextStage: lead.stage });
-      return;
-    }
-    await moveToNeedsAdmin(lead, userText, intentResult);
+  // Aniq rad bo'lsa to'xtaydi. Oddiy "yo'q" yoki "tanimadim" kabi gaplar bridge orqali aniqlashtiriladi.
+  if (intent === 'reject') {
+    await stopLeadWithReject(lead, turnId);
     return;
   }
 
-  if (intent === 'reject' || intent === 'application_denied') {
-    await stopLeadWithReject(lead);
+  if (intent === 'application_denied') {
+    await sendBridgeToStage(lead, userText, intent, turnId);
     return;
   }
 
   if (intent === 'later') {
-    await pauseLead(lead);
+    await pauseLead(lead, 'later_reply', turnId);
     return;
   }
 
+  // Yon savollar: narx/karta/qimmat asosiy stage'ni buzmaydi, javobdan keyin o'sha savolga qaytaradi.
   if (intent === 'price_question') {
-    await sendTemplateToLead({ lead, templateKey: 'price_reply', nextStage: lead.stage });
+    await sendSideQuestionReply(lead, 'price_reply', 'price', turnId);
     return;
   }
 
   if (intent === 'card_question') {
-    await sendTemplateToLead({ lead, templateKey: 'card_reply', nextStage: lead.stage });
+    await sendSideQuestionReply(lead, 'card_reply', 'card', turnId);
     return;
   }
 
   if (intent === 'expensive_question') {
-    await sendTemplateToLead({ lead, templateKey: 'expensive_reply', nextStage: lead.stage });
+    await sendSideQuestionReply(lead, 'expensive_reply', 'expensive', turnId);
     return;
   }
 
   if (intent === 'explain_project') {
-    await sendFullExplanationFlow(lead);
+    await sendFullExplanationFlow(lead, turnId);
     return;
   }
 
   if (intent === 'next_steps') {
     if ([STAGE.NEW, STAGE.ASKED_APPLICATION, STAGE.ASKED_INFO].includes(lead.stage)) {
-      await sendFullExplanationFlow(lead);
+      await sendFullExplanationFlow(lead, turnId);
       return;
     }
     if (lead.stage === STAGE.WAITING_OFFER_READ) {
-      await sendTemplateToLead({ lead, templateKey: 'next_steps_reply', nextStage: lead.stage });
-      await sendTemplateToLead({ lead, templateKey: 'ask_bio_confirm', nextStage: STAGE.ASKED_BIO_CONFIRM });
+      await sendResponsePackage({
+        lead,
+        turnId,
+        actionName: 'next_steps_then_bio_confirm',
+        items: [{ templateKey: 'next_steps_reply' }, { templateKey: 'ask_bio_confirm' }],
+        nextStage: STAGE.ASKED_BIO_CONFIRM
+      });
       return;
     }
     if (lead.stage === STAGE.ASKED_BIO_CONFIRM) {
-      await sendBioQuestionsAndStop(lead);
+      await sendBioQuestionsAndStop(lead, turnId);
       return;
     }
   }
 
   if (intent === 'questions_request') {
-    await sendBioQuestionsAndStop(lead);
+    await sendBioQuestionsAndStop(lead, turnId);
     return;
   }
 
   if (lead.stage === STAGE.NEW && intent === 'greeting_positive') {
-    await sendTemplateToLead({ lead, templateKey: 'ask_application', nextStage: STAGE.ASKED_APPLICATION });
+    await sendResponsePackage({
+      lead,
+      turnId,
+      actionName: 'ask_application',
+      items: [{ templateKey: 'ask_application' }],
+      nextStage: STAGE.ASKED_APPLICATION
+    });
     return;
   }
 
   if (lead.stage === STAGE.ASKED_APPLICATION && intent === 'application_confirmed') {
-    await sendTemplateToLead({ lead, templateKey: 'ask_info', nextStage: STAGE.ASKED_INFO });
+    await sendResponsePackage({
+      lead,
+      turnId,
+      actionName: 'ask_info',
+      items: [{ templateKey: 'ask_info' }],
+      nextStage: STAGE.ASKED_INFO
+    });
     return;
   }
 
   if (lead.stage === STAGE.ASKED_INFO && intent === 'has_info') {
-    const updated = await sendTemplateToLead({ lead, templateKey: 'short_intro', nextStage: STAGE.ASKED_INFO });
-    await sendTemplateToLead({ lead: updated || lead, templateKey: 'offer_end', nextStage: STAGE.WAITING_OFFER_READ });
+    await sendShortIntroFlow(lead, turnId);
     return;
   }
 
   if (lead.stage === STAGE.ASKED_INFO && intent === 'no_info') {
-    const updated = await sendTemplateToLead({ lead, templateKey: 'full_intro', nextStage: STAGE.ASKED_INFO });
-    await sendTemplateToLead({ lead: updated || lead, templateKey: 'offer_end', nextStage: STAGE.WAITING_OFFER_READ });
+    await sendFullIntroFlow(lead, turnId);
     return;
   }
 
@@ -852,16 +1181,28 @@ async function continueByIntent(lead, intentResult, userText = '') {
   }
 
   if (lead.stage === STAGE.WAITING_OFFER_READ && intent === 'read_offer') {
-    await sendTemplateToLead({ lead, templateKey: 'ask_bio_confirm', nextStage: STAGE.ASKED_BIO_CONFIRM });
+    await sendResponsePackage({
+      lead,
+      turnId,
+      actionName: 'ask_bio_confirm',
+      items: [{ templateKey: 'ask_bio_confirm' }],
+      nextStage: STAGE.ASKED_BIO_CONFIRM
+    });
     return;
   }
 
   if (lead.stage === STAGE.ASKED_BIO_CONFIRM && intent === 'agree_bio') {
-    await sendBioQuestionsAndStop(lead);
+    await sendBioQuestionsAndStop(lead, turnId);
     return;
   }
 
-  await moveToNeedsAdmin(lead, userText, intentResult);
+  // AI tushunmasa yoki shablonga to'g'ri kelmasa: bitta tabiiy bridge yozadi, stage o'zgarmaydi.
+  if (intent === 'unclear' || confidence < AI_CONFIDENCE_MIN) {
+    await sendBridgeToStage(lead, userText, 'unclear', turnId);
+    return;
+  }
+
+  await sendBridgeToStage(lead, userText, intent || 'unmatched', turnId);
 }
 
 function compactBatchTexts(texts = []) {
@@ -908,13 +1249,15 @@ function isLikelyTrailingContinuation(text, lead) {
   return false;
 }
 
-function enqueueBusinessTurn({ chatId, businessConnectionId, from, text }) {
+
+function enqueueBusinessTurn({ chatId, businessConnectionId, from, text, messageId }) {
   const key = str(chatId);
   let entry = businessTurnBuffers.get(key);
 
   if (!entry) {
     entry = {
       texts: [],
+      messageIds: [],
       latest: null,
       timer: null,
       processing: false
@@ -923,8 +1266,10 @@ function enqueueBusinessTurn({ chatId, businessConnectionId, from, text }) {
   }
 
   entry.texts.push(text);
+  entry.messageIds.push(messageId ? str(messageId) : stableHash(`${Date.now()}|${text}`));
   if (entry.texts.length > MAX_BATCH_MESSAGES) {
     entry.texts = entry.texts.slice(-MAX_BATCH_MESSAGES);
+    entry.messageIds = entry.messageIds.slice(-MAX_BATCH_MESSAGES);
   }
 
   entry.latest = { chatId, businessConnectionId, from };
@@ -954,12 +1299,14 @@ async function drainBusinessTurnBuffer(chatId) {
   }
 
   const texts = entry.texts.splice(0, entry.texts.length);
+  const messageIds = entry.messageIds.splice(0, entry.messageIds.length);
   const latest = entry.latest;
   const batchText = compactBatchTexts(texts);
+  const turnId = `${chatId}:${messageIds.join('-') || stableHash(batchText)}`;
 
   try {
     if (latest && batchText && batchText !== '[empty]') {
-      await processBusinessTurn({ ...latest, text: batchText, messageCount: texts.length });
+      await processBusinessTurn({ ...latest, text: batchText, messageCount: texts.length, turnId });
     }
   } finally {
     entry.processing = false;
@@ -976,51 +1323,68 @@ async function drainBusinessTurnBuffer(chatId) {
   }
 }
 
-async function processBusinessTurn({ chatId, businessConnectionId, from, text, messageCount = 1 }) {
-  let lead = await findOrCreateLead({
-    chatId,
-    businessConnectionId,
-    from,
-    text,
-    status: STATUS.ACTIVE,
-    botEnabled: true
-  });
-  if (!lead) return;
+async function processBusinessTurn({ chatId, businessConnectionId, from, text, messageCount = 1, turnId = 'manual' }) {
+  // DB lock: Render yoki Telegram retry sabab bitta chat ikki marta parallel ishlanmasin.
+  let locked = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    locked = await acquireChatLock(chatId);
+    if (locked) break;
+    await sleep(Math.min(1500 + attempt * 1500, MESSAGE_BUFFER_MS));
+  }
 
-  if (!lead.bot_enabled || FINAL_STATUSES.has(lead.status) || STOP_STAGES.has(lead.stage)) {
-    await updateLead(chatId, {
-      last_user_message: text,
-      last_message_at: nowIso(),
-      business_connection_id: businessConnectionId || lead.business_connection_id
-    });
-    await logEvent(chatId, 'ignored_not_active_batch', text);
+  if (!locked) {
+    await logEvent(chatId, 'skipped_chat_locked', text);
     return;
   }
 
-  // Bot yangi savol yuborgandan keyingi juda qisqa "shunaqa/albatta" kabi davom-xabarlar
-  // keyingi bosqich javobi deb olinmaydi. Bu screenshotdagi sakrash xatosini to'xtatadi.
-  if (isLikelyTrailingContinuation(text, lead)) {
+  try {
+    let lead = await findOrCreateLead({
+      chatId,
+      businessConnectionId,
+      from,
+      text,
+      status: STATUS.ACTIVE,
+      botEnabled: true
+    });
+    if (!lead) return;
+
+    if (!lead.bot_enabled || FINAL_STATUSES.has(lead.status) || STOP_STAGES.has(lead.stage)) {
+      await updateLead(chatId, {
+        last_user_message: text,
+        last_message_at: nowIso(),
+        business_connection_id: businessConnectionId || lead.business_connection_id
+      });
+      await logEvent(chatId, 'ignored_not_active_batch', text);
+      return;
+    }
+
+    // Bot yangi savol yuborgandan keyingi juda qisqa "shunaqa/albatta" kabi davom-xabarlar
+    // keyingi bosqich javobi deb olinmaydi. Bu screenshotdagi sakrash xatosini to'xtatadi.
+    if (isLikelyTrailingContinuation(text, lead)) {
+      await updateLead(chatId, {
+        last_user_message: text,
+        last_message_at: nowIso(),
+        business_connection_id: businessConnectionId || lead.business_connection_id
+      });
+      await logEvent(chatId, 'ignored_trailing_continuation', text);
+      return;
+    }
+
+    const intentResult = await aiIntent(text, lead.stage);
     await updateLead(chatId, {
       last_user_message: text,
       last_message_at: nowIso(),
-      business_connection_id: businessConnectionId || lead.business_connection_id
+      business_connection_id: businessConnectionId || lead.business_connection_id,
+      ai_intent: intentResult.intent,
+      ai_confidence: intentResult.confidence
     });
-    await logEvent(chatId, 'ignored_trailing_continuation', text);
-    return;
+    await logEvent(chatId, `intent_${intentResult.intent}_${intentResult.confidence}_batch_${messageCount}`, text);
+
+    lead = await getLead(chatId) || lead;
+    await continueByIntent(lead, intentResult, text, turnId);
+  } finally {
+    await releaseChatLock(chatId);
   }
-
-  const intentResult = await aiIntent(text, lead.stage);
-  await updateLead(chatId, {
-    last_user_message: text,
-    last_message_at: nowIso(),
-    business_connection_id: businessConnectionId || lead.business_connection_id,
-    ai_intent: intentResult.intent,
-    ai_confidence: intentResult.confidence
-  });
-  await logEvent(chatId, `intent_${intentResult.intent}_${intentResult.confidence}_batch_${messageCount}`, text);
-
-  lead = await getLead(chatId) || lead;
-  await continueByIntent(lead, intentResult, text);
 }
 
 async function handleBusinessMessage(message) {
@@ -1095,7 +1459,7 @@ async function handleBusinessMessage(message) {
   }
 
   // Auto/active chatlar: darrov javob bermaymiz; avval per-chat turn queue'ga tushadi.
-  enqueueBusinessTurn({ chatId, businessConnectionId, from, text: textForDb });
+  enqueueBusinessTurn({ chatId, businessConnectionId, from, text: textForDb, messageId });
 }
 
 // -------------------- Reports and lists --------------------
@@ -1185,7 +1549,7 @@ async function showMainMenu(chatId, edit = null) {
 }
 
 async function showHelp(chatId, edit = null) {
-  const text = `⚙️ Yordam\n\nAsosiy buyruqlar:\n/menu — tugmali menyu\n/report — hisobot\n/pending — tasdiq kutayotganlar\n/active — faol lidlar\n/stalled — chala lidlar\n/needsadmin — AI tushunmaganlar\n/reached — savollargacha yetganlar\n/templates — shablonlar\n/gettemplate key — shablonni ko‘rish\n/settemplate key matn — shablonni o‘zgartirish\n/status chat_id — lid kartochkasi\n/leadson chat_id — botni yoqish\n/leadsoff chat_id — botni o‘chirish\n/restart chat_id — oqimni boshidan boshlash\n\nMuhim: AI mijozga erkin javob yozmaydi. U faqat intent aniqlaydi. Javoblar faqat shablondan chiqadi.`;
+  const text = `⚙️ Yordam\n\nAsosiy buyruqlar:\n/menu — tugmali menyu\n/report — hisobot\n/pending — tasdiq kutayotganlar\n/active — faol lidlar\n/stalled — chala lidlar\n/needsadmin — AI tushunmaganlar\n/reached — savollargacha yetganlar\n/templates — shablonlar\n/gettemplate key — shablonni ko‘rish\n/settemplate key matn — shablonni o‘zgartirish\n/status chat_id — lid kartochkasi\n/leadson chat_id — botni yoqish\n/leadsoff chat_id — botni o‘chirish\n/restart chat_id — oqimni boshidan boshlash\n\nMuhim: AI muhim joylarda shablondan chiqadi. Noaniq gaplarda esa faqat suhbatni shablonga qaytaradigan qisqa, muloyim ko‘prik javob yozadi.`;
   if (edit?.messageId) return editMessage(chatId, edit.messageId, text, { reply_markup: backMenuKeyboard() });
   return sendMessage(chatId, text, { reply_markup: backMenuKeyboard() });
 }

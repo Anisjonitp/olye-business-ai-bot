@@ -277,3 +277,27 @@ Shunaqa
 ```
 
 bot buni bitta batch qiladi va faqat `ask_info` bosqichiga o'tadi. `Shunaqa`ni darrov keyingi savolga javob deb olib, full info yuborib tashlamaydi.
+
+## v5 Lite yakuniy aqlli mantiq
+
+Ushbu versiyada bot oddiy shablon robot emas. U quyidagicha ishlaydi:
+
+- **Asosiy stage saqlanadi:** ariza/qiziqish → ma'lumot → oferta → bio maqola → bio savollar.
+- **Yon savollar stage'ni buzmaydi:** narx, karta, qimmat, “nima qilish kerak” kabi savollar alohida javoblanadi va bot yana hozirgi savolga qaytaradi.
+- **AI bridge javoblari:** lid “kimsan?”, “nima desam ekan?”, “tanimadim”, “do‘stim aytgandi, ikkilanib turibman” kabi noaniq gap yozsa, AI qisqa va muloyim ko‘prik javob yozadi. U narx, karta raqam yoki kafolatni o‘zidan o‘ylab topmaydi.
+- **1 turn = 1 bot action:** lid ketma-ket bir nechta xabar yozsa, bot ularni bitta javob sifatida tahlil qiladi va bir martada faqat bitta harakat qiladi.
+- **Intentional multi-message package:** `full_intro + offer_end` kabi 2 xabar kerak bo‘lsa, ular bitta paket sifatida yuboriladi. Paket qayta takrorlanmaydi.
+- **Duplicate himoya:** `processed_messages`, `chat_locks`, `response_packages`, `sent_bot_messages` jadvallari bitta xabar yoki bitta javob paketining ikki marta ketishiga qarshi ishlaydi.
+
+Muhim env qiymatlar:
+
+```env
+MESSAGE_BUFFER_MS=7000
+TURN_COOLDOWN_MS=12000
+CHAT_LOCK_MS=30000
+PACKAGE_MESSAGE_DELAY_MS=500
+MAX_BATCH_MESSAGES=8
+MAX_BATCH_CHARS=3000
+```
+
+Supabase SQL Editor'da `supabase.sql`ni qayta ishlating. U yangi lock/package jadvallarini qo‘shadi.

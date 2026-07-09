@@ -71,6 +71,39 @@ create table if not exists processed_messages (
   primary key (chat_id, message_id)
 );
 
+
+-- Bitta chat bir vaqtda ikki marta process bo'lib ketmasligi uchun DB lock.
+create table if not exists chat_locks (
+  chat_id text primary key,
+  locked_until timestamptz not null,
+  updated_at timestamptz default now()
+);
+
+-- Bitta user turn uchun bot javob paketi ikki marta yuborilmasligi uchun.
+create table if not exists response_packages (
+  package_id text primary key,
+  chat_id text not null,
+  turn_id text not null,
+  action_name text not null,
+  status text default 'sending',
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  completed_at timestamptz
+);
+create index if not exists idx_response_packages_chat_id on response_packages(chat_id);
+
+-- Paket ichidagi har bir xabar alohida belgilanadi: full_intro + offer_end kabi 2 xabar normal,
+-- lekin ayni paketdagi bitta xabar qayta yuborilmaydi.
+create table if not exists sent_bot_messages (
+  package_id text not null,
+  chat_id text not null,
+  message_index integer not null,
+  template_key text,
+  created_at timestamptz default now(),
+  primary key (package_id, message_index)
+);
+create index if not exists idx_sent_bot_messages_chat_id on sent_bot_messages(chat_id);
+
 -- Admin tugmali menyu sessiyalari.
 -- Eski noto'g'ri schema bo'lsa, xavfsiz qayta yaratiladi.
 drop table if exists admin_sessions;
