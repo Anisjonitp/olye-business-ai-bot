@@ -10,6 +10,13 @@ const PORT = process.env.PORT || 10000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? String(process.env.ADMIN_CHAT_ID) : '';
 const OWNER_TELEGRAM_ID = process.env.OWNER_TELEGRAM_ID ? String(process.env.OWNER_TELEGRAM_ID) : '';
+// Business profil egasining Telegram user ID'si. Bot o'zingiz yozgan xabarlarga javob bermasligi uchun MUHIM.
+const BUSINESS_OWNER_ID = process.env.BUSINESS_OWNER_ID ? String(process.env.BUSINESS_OWNER_ID) : OWNER_TELEGRAM_ID;
+const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || '')
+  .split(',')
+  .map(x => x.trim())
+  .filter(Boolean);
+const IGNORE_FROM_IDS = new Set([OWNER_TELEGRAM_ID, BUSINESS_OWNER_ID, ...ADMIN_USER_IDS].filter(Boolean));
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || process.env.SUPABASE_ANON_KEY;
@@ -62,10 +69,14 @@ const TEMPLATE_TITLES = {
   ask_info: 'Ma’lumot bor-yo‘qligini so‘rash',
   short_intro: 'Qisqa tanishtiruv',
   full_intro: 'To‘liq tanishtiruv',
+  explain_reply: 'Loyiha haqida tushuntirish boshlanishi',
   offer_end: 'Oferta oxiri',
   ask_bio_confirm: 'Biografik maqola taklifi',
   bio_questions: 'Biografik savollar',
   price_reply: 'Narx/badal savoliga javob',
+  card_reply: 'Karta/to‘lov rekvizitlari',
+  expensive_reply: 'Qimmat ekan javobi',
+  next_steps_reply: 'Nima qilish kerak javobi',
   later_reply: 'Keyinroq javobi',
   reject_reply: 'Rad javobi'
 };
@@ -115,8 +126,19 @@ function parseCommand(text = '') {
 function isAdminMessage(msg) {
   const chatId = str(msg?.chat?.id);
   const fromId = str(msg?.from?.id);
-  if (OWNER_TELEGRAM_ID && fromId === OWNER_TELEGRAM_ID) return true;
+  if (IGNORE_FROM_IDS.has(fromId)) return true;
   if (ADMIN_CHAT_ID && chatId === ADMIN_CHAT_ID) return true;
+  return false;
+}
+
+function isIgnoredBusinessSender(message) {
+  const fromId = str(message?.from?.id);
+  if (message?.from?.is_bot) return true;
+  if (IGNORE_FROM_IDS.has(fromId)) return true;
+  // Telegram Business'da ayrim avtomatik/outgoing xabarlarda shu flaglar kelishi mumkin.
+  // Bularni qayta ishlamasak, bot o'zi yoki admin yozgan xabarga javob qaytarmaydi.
+  if (message?.is_from_offline) return true;
+  if (message?.sender_business_bot) return true;
   return false;
 }
 
@@ -480,8 +502,23 @@ function forceIntentByStage(text, stage, current = { intent: 'unclear', confiden
   const laterWords = ['keyinroq', 'hozir bandman', 'vaqtim yoq', "vaqtim yo'q", 'ertaga', 'kechqurun', 'keyin yozing', 'keyin gaplashamiz', 'boshqa payt'];
   if (hasAny(t, laterWords)) return { intent: 'later', confidence: 0.96, forced: true };
 
+  const questionListWords = ['savollarni yuboring', 'savollar yuboring', 'savollarni tashlang', 'savol yuboring', 'savollar qani', 'anketa savollari', "ma\'lumotlarni yuboraymi", 'malumotlarni yuboraymi', 'biografik savollar'];
+  if (hasAny(t, questionListWords)) return { intent: 'questions_request', confidence: 0.97, forced: true };
+
+  const cardWords = ['karta', 'kartangiz', 'karta raqam', 'karta raqami', 'plastik', 'rekvizit', 'hisob raqam', 'kartaga', 'kartadan', "to\'lov qilinadimi", 'to‘lov qilinadimi', 'tolov qilinadimi', 'qayerga tolayman', 'qayerga to‘layman', "qayerga to\'layman"];
+  if (hasAny(t, cardWords)) return { intent: 'card_question', confidence: 0.97, forced: true };
+
+  const expensiveWords = ['qimmat', 'qimmat ekan', 'juda qimmat', 'arzonroq', 'chegirma', 'tushirib ber', 'pasaytirib', 'narxini tushiring'];
+  if (hasAny(t, expensiveWords)) return { intent: 'expensive_question', confidence: 0.94, forced: true };
+
   const priceWords = ['narx', 'qancha', 'pullikmi', 'pullik', 'tolov', "to'lov", 'to‘lov', 'badal', 'necha pul', 'sum', "so'm", 'so‘m', 'som'];
   if (hasAny(t, priceWords)) return { intent: 'price_question', confidence: 0.96, forced: true };
+
+  const nextStepWords = ['nima qilish kerak', 'nima qilaman', 'qanday qilamiz', 'qanday davom etamiz', 'keyin nima', 'qanday kiraman', 'jarayon qanday', 'boshlash uchun nima kerak', 'nimalar kerak'];
+  if (hasAny(t, nextStepWords)) return { intent: 'next_steps', confidence: 0.92, forced: true };
+
+  const explainWords = ['nima bu', "nima o\'zi", 'nima o‘zi', 'qanaqa loyiha', 'tushuntiring', 'batafsil tushuntiring', 'malumot bering', "ma\'lumot bering", 'ma’lumot bering', 'berolasizmi malumot', 'ikkilanib turibman', "do\'stim aytgandi", 'do‘stim aytgandi', 'dostim aytgandi', 'tanishim aytgandi'];
+  if (hasAny(t, explainWords)) return { intent: 'explain_project', confidence: 0.94, forced: true };
 
   if (stage === STAGE.NEW) {
     const greetings = ['assalomu alaykum', 'assalom', 'salom', 'va alaykum', 'valaykum', 'yaxshi', 'ha yaxshi', 'rahmat yaxshi', 'yaxshiman', 'alhamdulillah'];
@@ -497,7 +534,7 @@ function forceIntentByStage(text, stage, current = { intent: 'unclear', confiden
       'aytishgandi', 'ko\'rgandim', 'ko‘rgandim', 'qiziqib yozgandim', 'qiziqdim',
       'malumot olmoqchi', "ma'lumot olmoqchi", 'ma’lumot olmoqchi', 'bilmoqchi edim'
     ];
-    const applicationNo = ['qanaqa ariza', 'men yozmadim', 'ariza qoldirmadim', 'adashdingiz', 'adashdingiz shekilli'];
+    const applicationNo = ['men yozmadim', 'ariza qoldirmadim', 'adashdingiz', 'adashdingiz shekilli'];
 
     if (isExactAny(t, plainYes) || hasAny(t, applicationYes)) return { intent: 'application_confirmed', confidence: 0.98, forced: true };
     if (hasAny(t, applicationNo) || isExactAny(t, plainNo)) return { intent: 'application_denied', confidence: 0.92, forced: true };
@@ -556,6 +593,11 @@ Qoidalar:
 - Botning maqsadi lidni biografik savollargacha olib kelish.
 - "instagramda qoldirdim", "do'stim aytdi", "yozgandim", "reklamadan ko'rdim" kabi javoblar asked_application bosqichida application_confirmed.
 - "narxi qancha", "pullikmi", "badal bormi" kabi javoblar price_question.
+- "karta", "kartaga to'lov qilinadimi", "karta raqam" kabi javoblar card_question.
+- "qimmat ekan", "chegirma bormi" kabi javoblar expensive_question.
+- "nima bu o'zi", "do'stim aytgandi, ikkilanib turibman", "ma'lumot bering" kabi javoblar explain_project.
+- "nima qilish kerak", "jarayon qanday" kabi javoblar next_steps.
+- "savollarni yuboring", "anketa savollari" kabi javoblar questions_request.
 - "keyinroq", "hozir bandman" kabi javoblar later.
 - "kerak emas", "qiziq emas", "bezovta qilmang" kabi aniq rad javoblar reject.
 - Oddiy "yo'q"ni avtomatik reject qilma. Stage asked_info bo'lsa "yo'q" = no_info.
@@ -567,7 +609,7 @@ Faqat mana shu JSON formatda qaytar:
 {"intent":"...","confidence":0.0}
 
 Ruxsat etilgan intentlar:
-greeting_positive, application_confirmed, application_denied, has_info, no_info, ok_wait, read_offer, agree_bio, reject, later, price_question, unclear
+greeting_positive, application_confirmed, application_denied, has_info, no_info, ok_wait, read_offer, agree_bio, reject, later, price_question, card_question, expensive_question, explain_project, next_steps, questions_request, unclear
 
 Stage: ${stage}
 User message: ${text}`;
@@ -580,7 +622,7 @@ User message: ${text}`;
 
     const raw = (response.output_text || '').trim();
     const parsed = JSON.parse(raw.replace(/^```json\s*/i, '').replace(/```$/i, '').trim());
-    const allowed = new Set(['greeting_positive', 'application_confirmed', 'application_denied', 'has_info', 'no_info', 'ok_wait', 'read_offer', 'agree_bio', 'reject', 'later', 'price_question', 'unclear']);
+    const allowed = new Set(['greeting_positive', 'application_confirmed', 'application_denied', 'has_info', 'no_info', 'ok_wait', 'read_offer', 'agree_bio', 'reject', 'later', 'price_question', 'card_question', 'expensive_question', 'explain_project', 'next_steps', 'questions_request', 'unclear']);
     const intent = String(parsed.intent || '').toLowerCase().trim();
     const confidence = Number(parsed.confidence || 0);
 
@@ -666,12 +708,41 @@ async function stopLeadWithReject(lead) {
   return updated;
 }
 
+async function sendFullExplanationFlow(lead) {
+  let updated = await sendTemplateToLead({ lead, templateKey: 'explain_reply', nextStage: lead.stage });
+  updated = await sendTemplateToLead({ lead: updated || lead, templateKey: 'full_intro', nextStage: lead.stage });
+  await sendTemplateToLead({ lead: updated || lead, templateKey: 'offer_end', nextStage: STAGE.WAITING_OFFER_READ });
+}
+
+async function sendBioQuestionsAndStop(lead) {
+  await sendTemplateToLead({
+    lead,
+    templateKey: 'bio_questions',
+    nextStage: STAGE.BIO_QUESTIONS_SENT,
+    stop: true
+  });
+  await logEvent(lead.chat_id, 'bio_questions_reached', lead.last_user_message || '');
+}
+
 async function continueByIntent(lead, intentResult, userText = '') {
   // Yakuniy himoya: AI noto'g'ri tushunsa ham stage-specific qoida yutadi.
   const forced = forceIntentByStage(userText, lead.stage, intentResult);
   const { intent, confidence } = forced;
 
+  // Endi bot imkon qadar admin qo'liga tashlamaydi: tushunmasa ham stage bo'yicha eng xavfsiz shablonni davom ettiradi.
   if (intent === 'unclear' || confidence < AI_CONFIDENCE_MIN) {
+    if ([STAGE.NEW, STAGE.ASKED_APPLICATION, STAGE.ASKED_INFO].includes(lead.stage)) {
+      await sendFullExplanationFlow(lead);
+      return;
+    }
+    if (lead.stage === STAGE.WAITING_OFFER_READ) {
+      await sendTemplateToLead({ lead, templateKey: 'next_steps_reply', nextStage: lead.stage });
+      return;
+    }
+    if (lead.stage === STAGE.ASKED_BIO_CONFIRM) {
+      await sendTemplateToLead({ lead, templateKey: 'ask_bio_confirm', nextStage: lead.stage });
+      return;
+    }
     await moveToNeedsAdmin(lead, userText, intentResult);
     return;
   }
@@ -688,6 +759,42 @@ async function continueByIntent(lead, intentResult, userText = '') {
 
   if (intent === 'price_question') {
     await sendTemplateToLead({ lead, templateKey: 'price_reply', nextStage: lead.stage });
+    return;
+  }
+
+  if (intent === 'card_question') {
+    await sendTemplateToLead({ lead, templateKey: 'card_reply', nextStage: lead.stage });
+    return;
+  }
+
+  if (intent === 'expensive_question') {
+    await sendTemplateToLead({ lead, templateKey: 'expensive_reply', nextStage: lead.stage });
+    return;
+  }
+
+  if (intent === 'explain_project') {
+    await sendFullExplanationFlow(lead);
+    return;
+  }
+
+  if (intent === 'next_steps') {
+    if ([STAGE.NEW, STAGE.ASKED_APPLICATION, STAGE.ASKED_INFO].includes(lead.stage)) {
+      await sendFullExplanationFlow(lead);
+      return;
+    }
+    if (lead.stage === STAGE.WAITING_OFFER_READ) {
+      await sendTemplateToLead({ lead, templateKey: 'next_steps_reply', nextStage: lead.stage });
+      await sendTemplateToLead({ lead, templateKey: 'ask_bio_confirm', nextStage: STAGE.ASKED_BIO_CONFIRM });
+      return;
+    }
+    if (lead.stage === STAGE.ASKED_BIO_CONFIRM) {
+      await sendBioQuestionsAndStop(lead);
+      return;
+    }
+  }
+
+  if (intent === 'questions_request') {
+    await sendBioQuestionsAndStop(lead);
     return;
   }
 
@@ -724,13 +831,7 @@ async function continueByIntent(lead, intentResult, userText = '') {
   }
 
   if (lead.stage === STAGE.ASKED_BIO_CONFIRM && intent === 'agree_bio') {
-    await sendTemplateToLead({
-      lead,
-      templateKey: 'bio_questions',
-      nextStage: STAGE.BIO_QUESTIONS_SENT,
-      stop: true
-    });
-    await logEvent(lead.chat_id, 'bio_questions_reached', userText);
+    await sendBioQuestionsAndStop(lead);
     return;
   }
 
@@ -750,9 +851,13 @@ async function handleBusinessMessage(message) {
   const firstTime = await markProcessed(chatId, messageId);
   if (!firstTime) return;
 
-  // O'zimiz yuborgan yoki botdan kelgan xabarlarni qayta ishlamaymiz.
-  if (from?.is_bot) return;
-  if (OWNER_TELEGRAM_ID && str(from?.id) === OWNER_TELEGRAM_ID) return;
+  // O'zimiz/admin yuborgan yoki botdan kelgan xabarlarni qayta ishlamaymiz.
+  // MUHIM: Render env'da BUSINESS_OWNER_ID yoki OWNER_TELEGRAM_ID to'g'ri qo'yilmasa,
+  // Telegram Business'da o'zingiz yozgan xabarga bot javob berib yuborishi mumkin.
+  if (isIgnoredBusinessSender(message)) {
+    await logEvent(chatId, 'ignored_owner_or_bot_message', text || '[non-text]');
+    return;
+  }
 
   const textForDb = text.trim() ? text : '[non-text message]';
   const existingLeadBeforeMessage = await getLead(chatId);
@@ -995,6 +1100,15 @@ async function handleAdminText(message) {
   if (!text.startsWith('/')) return sendMessage(chatId, 'Buyruq yoki /menu yuboring.');
 
   const { cmd, args } = parseCommand(text);
+
+  if (cmd === '/whoami') {
+    return sendMessage(chatId, `Sizning Telegram user ID: ${message.from?.id}
+Admin chat ID: ${message.chat?.id}
+
+Render Environment'ga shuni qo'ying:
+BUSINESS_OWNER_ID=${message.from?.id}
+OWNER_TELEGRAM_ID=${message.from?.id}`);
+  }
 
   if (cmd === '/start' || cmd === '/menu') return showMainMenu(chatId);
   if (cmd === '/help') return showHelp(chatId);

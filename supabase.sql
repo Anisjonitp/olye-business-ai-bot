@@ -100,6 +100,8 @@ Foydali jihatlari:
 — kelajakda Wikipedia sahifasi uchun asos bo‘lishi mumkin;
 — maxsus sertifikat taqdim etiladi.$$),
 
+('explain_reply', 'Loyiha haqida tushuntirish boshlanishi', $$Bor, tushunarli. Keling, hozir batafsil tushuntirib beraman.$$),
+
 ('offer_end', 'Oferta oxiri', $$Oferta va xabar bilan tanishib chiqing va ayting!!!$$),
 
 ('ask_bio_confirm', 'Biografik maqola taklifi', $$Ajoyib, sizga ma’qulmi? Sizga ham biografik maqola yozamizmi unda ensiklopediyamizga kiritish uchun?$$),
@@ -119,7 +121,28 @@ Ma’lumotlarni yuborganingizdan so‘ng maqola tayyorlash jarayoni boshlanadi.$
 
 ('price_reply', 'Narx/badal savoliga javob', $$Loyihaga kiritish uchun yillik texnik badal mavjud. Bu badal biografik maqolani tayyorlash, saytga joylash, texnik yuritish va sertifikat bilan bog‘liq xarajatlarni qoplaydi.
 
-Aniq to‘lov tartibini xabar davomida tushuntirib beramiz.$$),
+To‘lov karta orqali qilinadi. Xohlasangiz karta ma’lumotlarini yuboraman.$$),
+
+('card_reply', 'Karta/to‘lov rekvizitlari', $$Ha, to‘lov karta orqali qilinadi.
+
+Karta raqam:
+0000 0000 0000 0000
+
+Karta egasi:
+ISM FAMILIYA
+
+To‘lov qilganingizdan so‘ng chek rasmini yuboring.$$),
+
+('expensive_reply', 'Qimmat ekan javobi', $$Tushunarli. Bu to‘lov biografik maqolani tayyorlash, saytga joylash, texnik yuritish va sertifikat bilan bog‘liq xarajatlarni qoplaydi.
+
+Agar xohlasangiz, 14 kunlik kelishuv asosida boshlang‘ich to‘lov bilan ham boshlash mumkin.$$),
+
+('next_steps_reply', 'Nima qilish kerak javobi', $$Jarayon oddiy:
+
+1. Siz loyiha ma’lumoti bilan tanishasiz.
+2. Ma’qul bo‘lsa, biografik maqola uchun savollarga javob yuborasiz.
+3. Ma’lumotlar asosida maqola tayyorlanadi.
+4. Maqola ensiklopediyaga joylanadi va sertifikat beriladi.$$),
 
 ('later_reply', 'Keyinroq javobi', $$Mayli, tushunarli. Keyinroq davom ettiramiz.$$),
 

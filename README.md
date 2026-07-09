@@ -209,3 +209,28 @@ Admin test buyrug‘i:
 /testintent asked_application instagramda qoldirdim
 /testintent asked_bio_confirm ha yozing
 ```
+
+
+## Muhim fix: bot o'zingiz yozgan xabarga javob bermasin
+
+Admin chatda botga `/whoami` yuboring. Bot sizga Telegram user ID beradi. Render Environment Variables'ga quyidagilarni qo'ying:
+
+```env
+OWNER_TELEGRAM_ID=shu_yerdagi_id
+BUSINESS_OWNER_ID=shu_yerdagi_id
+```
+
+Agar bu ID qo'yilmasa, Telegram Business chatda o'zingiz yozgan `Assalomu alaykum`, `pullikmi?` kabi xabarlarni bot mijoz xabari deb o'ylab, javob berib yuborishi mumkin.
+
+## Aqlli shablonli oqim
+
+Bot erkin matn yozmaydi, lekin odamning savolini ma'no bo'yicha intentga ajratadi va faqat shablondan javob beradi:
+
+- `pullikmi`, `narxi qancha` → `price_reply`
+- `karta`, `kartaga to'lov qilinadimi` → `card_reply`
+- `qimmat ekan` → `expensive_reply`
+- `do'stim aytgandi, nima bu o'zi`, `ma'lumot bering` → `explain_reply` + `full_intro` + `offer_end`
+- `nima qilish kerak` → bosqichga qarab keyingi shablon
+- `savollarni yuboring` → `bio_questions` va bot shu chatda to'xtaydi
+
+Karta raqam va narx matnlarini `/templates` orqali o'zingiz tahrirlang.
