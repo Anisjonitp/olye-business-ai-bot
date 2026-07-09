@@ -1,5 +1,6 @@
 -- OLYE Business AI Bot v5 Lite
--- Supabase SQL Editor'da to'liq ishlating.
+-- XAVFSIZ MIGRATSIYA: bu SQL eski lidlar va tahrirlangan shablonlarni o'chirmaydi.
+-- Muhim: reply_templates insertlari ON CONFLICT DO NOTHING. Ya'ni siz tahrirlagan eski shablonlar overwrite qilinmaydi.
 
 create table if not exists business_leads (
   id bigserial primary key,
@@ -19,6 +20,9 @@ create table if not exists business_leads (
   ai_confidence numeric,
   last_bot_sent_at timestamptz,
   last_bot_template_key text,
+  hot_lead boolean default false,
+  outreach_sent_at timestamptz,
+  outreach_session_id text,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
@@ -38,12 +42,17 @@ alter table business_leads add column if not exists ai_intent text;
 alter table business_leads add column if not exists ai_confidence numeric;
 alter table business_leads add column if not exists last_bot_sent_at timestamptz;
 alter table business_leads add column if not exists last_bot_template_key text;
+alter table business_leads add column if not exists hot_lead boolean default false;
+alter table business_leads add column if not exists outreach_sent_at timestamptz;
+alter table business_leads add column if not exists outreach_session_id text;
 alter table business_leads add column if not exists created_at timestamptz default now();
 alter table business_leads add column if not exists updated_at timestamptz default now();
 
 create index if not exists idx_business_leads_stage on business_leads(stage);
 create index if not exists idx_business_leads_status on business_leads(status);
 create index if not exists idx_business_leads_updated_at on business_leads(updated_at);
+create index if not exists idx_business_leads_hot_lead on business_leads(hot_lead);
+create index if not exists idx_business_leads_outreach_session on business_leads(outreach_session_id);
 
 create table if not exists reply_templates (
   key text primary key,
@@ -59,11 +68,9 @@ create table if not exists lead_events (
   message text,
   created_at timestamptz default now()
 );
-
 create index if not exists idx_lead_events_chat_id on lead_events(chat_id);
 create index if not exists idx_lead_events_created_at on lead_events(created_at);
 
--- Webhook duplicate xabarlarni qayta ishlamaslik uchun.
 create table if not exists processed_messages (
   chat_id text not null,
   message_id text not null,
@@ -71,15 +78,12 @@ create table if not exists processed_messages (
   primary key (chat_id, message_id)
 );
 
-
--- Bitta chat bir vaqtda ikki marta process bo'lib ketmasligi uchun DB lock.
 create table if not exists chat_locks (
   chat_id text primary key,
   locked_until timestamptz not null,
   updated_at timestamptz default now()
 );
 
--- Bitta user turn uchun bot javob paketi ikki marta yuborilmasligi uchun.
 create table if not exists response_packages (
   package_id text primary key,
   chat_id text not null,
@@ -92,8 +96,6 @@ create table if not exists response_packages (
 );
 create index if not exists idx_response_packages_chat_id on response_packages(chat_id);
 
--- Paket ichidagi har bir xabar alohida belgilanadi: full_intro + offer_end kabi 2 xabar normal,
--- lekin ayni paketdagi bitta xabar qayta yuborilmaydi.
 create table if not exists sent_bot_messages (
   package_id text not null,
   chat_id text not null,
@@ -104,18 +106,39 @@ create table if not exists sent_bot_messages (
 );
 create index if not exists idx_sent_bot_messages_chat_id on sent_bot_messages(chat_id);
 
--- Admin tugmali menyu sessiyalari.
--- Eski noto'g'ri schema bo'lsa, xavfsiz qayta yaratiladi.
-drop table if exists admin_sessions;
-create table admin_sessions (
+-- Admin sessiyalari. Endi bu jadval drop qilinmaydi.
+create table if not exists admin_sessions (
   chat_id text primary key,
   mode text not null,
   payload jsonb default '{}'::jsonb,
   updated_at timestamptz default now()
 );
+alter table admin_sessions add column if not exists mode text;
+alter table admin_sessions add column if not exists payload jsonb default '{}'::jsonb;
+alter table admin_sessions add column if not exists updated_at timestamptz default now();
 
+-- Bot sozlamalari: Outreach Auto, greeting patternlar va hokazo.
+create table if not exists bot_settings (
+  key text primary key,
+  value jsonb not null,
+  updated_at timestamptz default now()
+);
+
+insert into bot_settings (key, value) values
+('outreach_auto', '{"enabled":false}'::jsonb),
+('greeting_patterns', '["assalomu alaykum", "assalomu alaykum yaxshimisiz", "assalomu alaykum, yaxshimisiz", "assalomu alaykum * yaxshimisiz"]'::jsonb)
+on conflict (key) do nothing;
+
+-- DIQQAT: quyidagi template seed eski tahrirlangan body'larni O'ZGARTIRMAYDI.
+-- Faqat hali mavjud bo'lmagan yangi shablonlarni qo'shadi.
 insert into reply_templates (key, title, body) values
 ('ask_application', 'Ariza/qiziqishni tasdiqlash', $$Siz “O‘zbekiston Lider Yoshlari Ensiklopediyasi”ga kirish uchun ariza qoldirgansiz. Shunaqami?$$),
+
+('application_link_reply', 'Ariza havolasini yuborish', $$Tushunarli. Unda avval quyidagi havola orqali ariza qoldiring:
+
+{APPLICATION_LINK}
+
+Arizani yuborganingizdan so‘ng shu chatga “ariza qoldirdim” deb yozing, keyin davom ettiramiz.$$),
 
 ('ask_info', 'Ma’lumot bor-yo‘qligini so‘rash', $$Ajoyib. Siz ensiklopediyamizga kirishning foydali jihatlari haqida batafsil ma’lumotga egamisiz?$$),
 
@@ -137,7 +160,7 @@ Foydali jihatlari:
 — kelajakda Wikipedia sahifasi uchun asos bo‘lishi mumkin;
 — maxsus sertifikat taqdim etiladi.$$),
 
-('explain_reply', 'Loyiha haqida tushuntirish boshlanishi', $$Bor, tushunarli. Keling, hozir batafsil tushuntirib beraman.$$),
+('explain_reply', 'Loyiha haqida tushuntirish boshlanishi', $$Tushunarli. Keling, hozir batafsil tushuntirib beraman.$$),
 
 ('offer_end', 'Oferta oxiri', $$Oferta va xabar bilan tanishib chiqing va ayting!!!$$),
 
@@ -174,6 +197,12 @@ To‘lov qilganingizdan so‘ng chek rasmini yuboring.$$),
 
 Agar xohlasangiz, 14 kunlik kelishuv asosida boshlang‘ich to‘lov bilan ham boshlash mumkin.$$),
 
+('human_takeover_reply', 'Operatorga o‘tkazish javobi', $$Tushunarli. Bu xabarni mas’ul odam ko‘rib chiqadi va sizga javob beradi.$$),
+
+('voice_text_request', 'Ovozli xabar o‘rniga matn so‘rash', $$Ovozli xabaringizni qabul qildik. Iltimos, javobingizni qisqa matn ko‘rinishida yuborsangiz, davom ettirishimiz oson bo‘ladi.$$),
+
+('media_text_request', 'Media/fayl o‘rniga matn so‘rash', $$Fayl yoki rasmni qabul qildik. Hozirgi bosqichda javobingizni qisqa matn ko‘rinishida yuborsangiz, davom ettiramiz.$$),
+
 ('next_steps_reply', 'Nima qilish kerak javobi', $$Jarayon oddiy:
 
 1. Siz loyiha ma’lumoti bilan tanishasiz.
@@ -185,7 +214,4 @@ Agar xohlasangiz, 14 kunlik kelishuv asosida boshlang‘ich to‘lov bilan ham b
 
 ('reject_reply', 'Rad javobi', $$Tushunarli. Bezovta qilgan bo‘lsak uzr. Yaxshi kun tilaymiz.$$)
 
-on conflict (key) do update set
-  title = excluded.title,
-  body = excluded.body,
-  updated_at = now();
+on conflict (key) do nothing;

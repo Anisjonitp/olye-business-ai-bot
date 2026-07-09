@@ -41,6 +41,16 @@ const MAX_BATCH_CHARS = Number(process.env.MAX_BATCH_CHARS || 3000);
 const CHAT_LOCK_MS = Number(process.env.CHAT_LOCK_MS || 30000);
 const PACKAGE_MESSAGE_DELAY_MS = Number(process.env.PACKAGE_MESSAGE_DELAY_MS || 500);
 
+// Ariza havolasi va ish vaqti. Shablonlarda {APPLICATION_LINK} avtomatik shu qiymatga almashadi.
+const APPLICATION_LINK = process.env.APPLICATION_LINK || '';
+const QUIET_HOURS_ENABLED = String(process.env.QUIET_HOURS_ENABLED || 'false').toLowerCase() === 'true';
+const QUIET_HOURS_START = process.env.QUIET_HOURS_START || '07:00';
+const QUIET_HOURS_END = process.env.QUIET_HOURS_END || '23:00';
+
+// Outreach Auto: siz yuborgan salomlarni eslab, faqat o'sha chatlarga avto start qilish.
+const AUTO_START_REQUIRE_OUTREACH = String(process.env.AUTO_START_REQUIRE_OUTREACH || 'true').toLowerCase() !== 'false';
+const DEFAULT_OUTREACH_HOURS = Number(process.env.DEFAULT_OUTREACH_HOURS || 2);
+
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL missing');
 if (!SUPABASE_KEY) throw new Error('SUPABASE key missing');
@@ -58,31 +68,36 @@ const STAGE = Object.freeze({
   NEW: 'new',
   ASKED_APPLICATION: 'asked_application',
   ASKED_INFO: 'asked_info',
+  WAITING_APPLICATION_SUBMIT: 'waiting_application_submit',
   WAITING_OFFER_READ: 'waiting_offer_read',
   ASKED_BIO_CONFIRM: 'asked_bio_confirm',
   BIO_QUESTIONS_SENT: 'bio_questions_sent',
   PAUSED: 'paused',
   NEEDS_ADMIN: 'needs_admin',
+  HUMAN_NEEDED: 'human_needed',
   STOPPED: 'stopped',
   DISABLED: 'disabled'
 });
 
 const STATUS = Object.freeze({
   PENDING: 'pending_approval',
+  OUTREACH: 'outreach_sent',
   ACTIVE: 'active',
   PAUSED: 'paused',
   NEEDS_ADMIN: 'needs_admin',
+  HUMAN_NEEDED: 'human_needed',
   STOPPED: 'stopped',
   DISABLED: 'disabled'
 });
 
 const FINAL_STATUSES = new Set([STATUS.STOPPED, STATUS.DISABLED]);
-const STOP_STAGES = new Set([STAGE.BIO_QUESTIONS_SENT, STAGE.STOPPED, STAGE.DISABLED, STAGE.PAUSED, STAGE.NEEDS_ADMIN]);
-const ACTIVE_STAGES = [STAGE.ASKED_APPLICATION, STAGE.ASKED_INFO, STAGE.WAITING_OFFER_READ, STAGE.ASKED_BIO_CONFIRM];
+const STOP_STAGES = new Set([STAGE.BIO_QUESTIONS_SENT, STAGE.STOPPED, STAGE.DISABLED, STAGE.PAUSED, STAGE.NEEDS_ADMIN, STAGE.HUMAN_NEEDED]);
+const ACTIVE_STAGES = [STAGE.ASKED_APPLICATION, STAGE.WAITING_APPLICATION_SUBMIT, STAGE.ASKED_INFO, STAGE.WAITING_OFFER_READ, STAGE.ASKED_BIO_CONFIRM];
 
 const TEMPLATE_TITLES = {
   ask_application: 'Ariza/qiziqishni tasdiqlash',
   ask_info: 'Ma’lumot bor-yo‘qligini so‘rash',
+  application_link_reply: 'Ariza havolasini yuborish',
   short_intro: 'Qisqa tanishtiruv',
   full_intro: 'To‘liq tanishtiruv',
   explain_reply: 'Loyiha haqida tushuntirish boshlanishi',
@@ -92,6 +107,9 @@ const TEMPLATE_TITLES = {
   price_reply: 'Narx/badal savoliga javob',
   card_reply: 'Karta/to‘lov rekvizitlari',
   expensive_reply: 'Qimmat ekan javobi',
+  human_takeover_reply: 'Operatorga o‘tkazish javobi',
+  voice_text_request: 'Ovozli xabar o‘rniga matn so‘rash',
+  media_text_request: 'Media/fayl o‘rniga matn so‘rash',
   next_steps_reply: 'Nima qilish kerak javobi',
   later_reply: 'Keyinroq javobi',
   reject_reply: 'Rad javobi'
@@ -156,6 +174,39 @@ function normalizeText(text = '') {
     .replace(/[.,!?！？;:()\[\]{}]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function renderTemplate(body = '') {
+  return String(body || '')
+    .replaceAll('{APPLICATION_LINK}', APPLICATION_LINK || 'APPLICATION_LINK_KIRITILMAGAN')
+    .replaceAll('{TODAY}', new Date().toLocaleDateString('uz-UZ'));
+}
+
+function parseHm(value = '00:00') {
+  const [h, m] = String(value).split(':').map(n => Number(n));
+  return (Number.isFinite(h) ? h : 0) * 60 + (Number.isFinite(m) ? m : 0);
+}
+
+function isInsideQuietHours() {
+  if (!QUIET_HOURS_ENABLED) return false;
+  const now = new Date();
+  const current = now.getHours() * 60 + now.getMinutes();
+  const start = parseHm(QUIET_HOURS_START);
+  const end = parseHm(QUIET_HOURS_END);
+  if (start <= end) return current < start || current > end;
+  return current > end && current < start;
+}
+
+function isOwnerBusinessSender(message) {
+  const fromId = str(message?.from?.id);
+  if (!fromId) return false;
+  return fromId === BUSINESS_OWNER_ID || fromId === OWNER_TELEGRAM_ID || ADMIN_USER_IDS.includes(fromId);
+}
+
+function mediaTemplateKey(message) {
+  if (message?.voice || message?.audio || message?.video_note) return 'voice_text_request';
+  if (message?.photo || message?.sticker || message?.document || message?.video || message?.animation) return 'media_text_request';
+  return null;
 }
 
 function parseCommand(text = '') {
@@ -270,8 +321,12 @@ function adminMenuKeyboard() {
         { text: '🟡 Chala lidlar', callback_data: 'list:stalled' }
       ],
       [
-        { text: '⚠️ AI tushunmaganlar', callback_data: 'list:needs_admin' },
-        { text: '✅ Savollargacha yetganlar', callback_data: 'list:reached' }
+        { text: '⚠️ AI/Operator', callback_data: 'list:needs_admin' },
+        { text: '🔥 Issiq lidlar', callback_data: 'list:hot' }
+      ],
+      [
+        { text: '✅ Savollargacha yetganlar', callback_data: 'list:reached' },
+        { text: '📣 Outreach Auto', callback_data: 'menu:outreach' }
       ],
       [
         { text: '✏️ Shablonlar', callback_data: 'tmpl:list' },
@@ -308,6 +363,9 @@ function leadListKeyboard(leads, listType = 'active') {
     callback_data: `lead:view:${lead.chat_id}`
   }]);
   rows.push([{ text: '🔄 Yangilash', callback_data: `list:${listType}` }]);
+  if (['pending', 'stalled', 'needs_admin'].includes(listType) && (leads || []).length) {
+    rows.push([{ text: '🧹 Barchasini rad/disabled qilish', callback_data: `clear:confirm:${listType}` }]);
+  }
   rows.push([{ text: '⬅️ Menyu', callback_data: 'menu:main' }]);
   return { inline_keyboard: rows };
 }
@@ -326,6 +384,11 @@ function leadCardKeyboard(lead) {
       { text: '❌ Yo‘q/to‘xtatish', callback_data: `lead:force_no:${chatId}` }
     ]);
   }
+
+  rows.push([
+    { text: '🔗 Ariza havolasi', callback_data: `lead:send_app:${chatId}` },
+    { text: '📄 Ma’lumot berish', callback_data: `lead:send_info:${chatId}` }
+  ]);
 
   rows.push([
     { text: '⏸ To‘xtatish', callback_data: `lead:pause:${chatId}` },
@@ -515,6 +578,122 @@ async function clearAdminSession(chatId) {
   if (error) console.error('clearAdminSession:', error);
 }
 
+async function getSetting(key, fallback = null) {
+  try {
+    const { data, error } = await supabase.from('bot_settings').select('value').eq('key', key).maybeSingle();
+    if (error) return fallback;
+    return data?.value ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function setSetting(key, value) {
+  const { error } = await supabase.from('bot_settings').upsert({ key, value, updated_at: nowIso() });
+  if (error) throw error;
+}
+
+function defaultGreetingPatterns() {
+  return [
+    'assalomu alaykum',
+    'assalomu alaykum yaxshimisiz',
+    'assalomu alaykum, yaxshimisiz',
+    'assalomu alaykum * yaxshimisiz'
+  ];
+}
+
+async function getGreetingPatterns() {
+  const value = await getSetting('greeting_patterns', null);
+  if (Array.isArray(value) && value.length) return value.map(String);
+  return defaultGreetingPatterns();
+}
+
+function patternMatches(text, pattern) {
+  const t = normalizeText(text).replace(/,/g, '');
+  const p = normalizeText(pattern).replace(/,/g, '');
+  if (!p) return false;
+  if (!p.includes('*')) return t.includes(p);
+  const parts = p.split('*').map(x => x.trim()).filter(Boolean);
+  let pos = 0;
+  for (const part of parts) {
+    const idx = t.indexOf(part, pos);
+    if (idx < 0) return false;
+    pos = idx + part.length;
+  }
+  return true;
+}
+
+async function isOutreachGreeting(text) {
+  const patterns = await getGreetingPatterns();
+  return patterns.some(p => patternMatches(text, p));
+}
+
+function parseDurationToMs(arg = '') {
+  const a = String(arg || '').trim().toLowerCase();
+  if (!a || a === 'default') return DEFAULT_OUTREACH_HOURS * 60 * 60 * 1000;
+  if (a === 'today' || a === 'bugun') {
+    const end = new Date();
+    end.setHours(23, 59, 59, 999);
+    return Math.max(5 * 60 * 1000, end.getTime() - Date.now());
+  }
+  const m = a.match(/^(\d+(?:\.\d+)?)(h|soat|m|min|daq)?$/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  const unit = m[2] || 'h';
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (['m','min','daq'].includes(unit)) return n * 60 * 1000;
+  return n * 60 * 60 * 1000;
+}
+
+async function enableOutreachAuto(durationMs) {
+  const until = new Date(Date.now() + durationMs).toISOString();
+  const sessionId = `outreach_${new Date().toISOString().slice(0, 10)}_${stableHash(until).slice(0, 6)}`;
+  await setSetting('outreach_auto', { enabled: true, until, session_id: sessionId, started_at: nowIso() });
+  return { until, sessionId };
+}
+
+async function disableOutreachAuto() {
+  await setSetting('outreach_auto', { enabled: false, until: null, session_id: null, stopped_at: nowIso() });
+}
+
+async function getOutreachAutoState() {
+  const value = await getSetting('outreach_auto', { enabled: false });
+  const until = value?.until ? new Date(value.until).getTime() : 0;
+  const active = Boolean(value?.enabled && until && until > Date.now());
+  return { ...value, active };
+}
+
+async function maybeRecordOutgoingOutreach(message) {
+  const text = (message?.text || message?.caption || '').trim();
+  if (!text) return false;
+  const state = await getOutreachAutoState();
+  if (!state.active) return false;
+  if (!(await isOutreachGreeting(text))) return false;
+
+  const chatId = message?.chat?.id;
+  if (!chatId) return false;
+  const businessConnectionId = message?.business_connection_id || message?.business_connection?.id || null;
+
+  const existing = await getLead(chatId);
+  const patch = {
+    business_connection_id: businessConnectionId || existing?.business_connection_id || null,
+    status: STATUS.OUTREACH,
+    bot_enabled: false,
+    stage: existing?.stage && existing.stage !== STAGE.DISABLED ? existing.stage : STAGE.NEW,
+    outreach_sent_at: nowIso(),
+    outreach_session_id: state.session_id || null,
+    last_bot_message: text,
+    last_bot_sent_at: nowIso(),
+    last_bot_template_key: 'manual_outreach_greeting'
+  };
+
+  if (existing) await updateLead(chatId, patch);
+  else await createLead({ chatId, businessConnectionId, from: message.from || {}, text, status: STATUS.OUTREACH, botEnabled: false });
+  await updateLead(chatId, patch);
+  await logEvent(chatId, 'outreach_greeting_recorded', text);
+  return true;
+}
+
 async function acquireChatLock(chatId, lockMs = CHAT_LOCK_MS) {
   const id = str(chatId);
   try {
@@ -622,7 +801,7 @@ function forceIntentByStage(text, stage, current = { intent: 'unclear', confiden
   const hardReject = [
     'kerak emas', 'kerakmas', 'qiziq emas', 'qiziqmas', 'xohlamayman', 'hohlamayman',
     'bezovta qilmang', 'yozmang', 'rad etaman', 'bekor qiling', 'menga kerak emas',
-    'endi yozmang', 'spam qilmang',
+    'endi yozmang', 'spam qilmang', 'raqamimni qayerdan oldingiz', 'kim berdi raqamimni', 'shikoyat qilaman', 'bloklayman',
     'tanimayman sizlarni', 'tanimiman sizlarni', 'tanimayman bilmayman', 'tanimiman bilmayman',
     'bilmayman sizlarni', 'sizlarni tanimayman', 'sizlarni bilmayman'
   ];
@@ -633,6 +812,9 @@ function forceIntentByStage(text, stage, current = { intent: 'unclear', confiden
 
   const questionListWords = ['savollarni yuboring', 'savollar yuboring', 'savollarni tashlang', 'savol yuboring', 'savollar qani', 'anketa savollari', "ma\'lumotlarni yuboraymi", 'malumotlarni yuboraymi', 'biografik savollar'];
   if (hasAny(t, questionListWords)) return { intent: 'questions_request', confidence: 0.97, forced: true };
+
+  const humanWords = ['chek yubordim', 'chek tashladim', 'chekni yubordim', "to'lov qildim", 'to‘lov qildim', 'tolov qildim', "pul o'tkazdim", 'pul o‘tkazdim', 'odam bilan gaplashay', 'operator bilan', 'admin bilan', 'inson bilan gaplash'];
+  if (hasAny(t, humanWords)) return { intent: 'human_needed', confidence: 0.98, forced: true };
 
   const cardWords = ['karta', 'kartangiz', 'karta raqam', 'karta raqami', 'plastik', 'rekvizit', 'hisob raqam', 'kartaga', 'kartadan', "to\'lov qilinadimi", 'to‘lov qilinadimi', 'tolov qilinadimi', 'qayerga tolayman', 'qayerga to‘layman', "qayerga to\'layman"];
   if (hasAny(t, cardWords)) return { intent: 'card_question', confidence: 0.97, forced: true };
@@ -656,22 +838,38 @@ function forceIntentByStage(text, stage, current = { intent: 'unclear', confiden
 
   if (stage === STAGE.ASKED_APPLICATION) {
     const applicationYes = [
-      'qoldirdim', 'qoldirgandim', 'ariza', 'anketa', 'forma', 'google form',
+      'qoldirdim', 'qoldirgandim', 'ariza qoldirgandim', 'anketa to\'ldirgandim', 'anketa to‘ldirgandim', 'forma to\'ldirgandim', 'google form',
       'instagramda', 'instagram', 'instada', 'reklamadan', 'reklamada', 'ko\'rdim', 'ko‘rdim',
       'yozgandim', 'yozgan edim', 'yozganman', 'murojaat qilgandim',
       'dostim aytdi', "do'stim aytdi", 'do‘stim aytdi', 'tanishim aytdi', 'ustozim aytdi',
       'aytishgandi', 'ko\'rgandim', 'ko‘rgandim', 'qiziqib yozgandim', 'qiziqdim',
       'malumot olmoqchi', "ma'lumot olmoqchi", 'ma’lumot olmoqchi', 'bilmoqchi edim'
     ];
-    const applicationNo = ['men yozmadim', 'ariza qoldirmadim', 'adashdingiz', 'adashdingiz shekilli'];
+    const applicationNotSubmitted = [
+      'qoldirmaganman', 'ariza qoldirmaganman', 'yoq qoldirmaganman', "yo'q qoldirmaganman", 'yo‘q qoldirmaganman',
+      'hali qoldirmadim', 'qoldirmadim', 'qoldirmoqchiman', 'qanday qoldiraman', 'qanday ariza qoldiraman',
+      'ariza qoldirish uchun', 'ariza havolasi', 'link bering', 'havola bering', 'qayerdan qoldiraman'
+    ];
+    const applicationNo = ['men yozmadim', 'adashdingiz', 'adashdingiz shekilli'];
 
+    if (hasAny(t, applicationNotSubmitted)) return { intent: 'application_not_submitted', confidence: 0.98, forced: true };
     if (isExactAny(t, plainYes) || hasAny(t, applicationYes)) return { intent: 'application_confirmed', confidence: 0.98, forced: true };
-    if (hasAny(t, applicationNo) || isExactAny(t, plainNo)) return { intent: 'application_denied', confidence: 0.92, forced: true };
+    if (hasAny(t, applicationNo) || isExactAny(t, plainNo)) return { intent: 'application_denied', confidence: 0.88, forced: true };
+  }
+
+  if (stage === STAGE.WAITING_APPLICATION_SUBMIT) {
+    const submitted = ['ariza qoldirdim', 'qoldirdim', 'yubordim', 'jonatdim', 'jo‘natdim', "jo'natdim", 'toldirdim', 'to‘ldirdim', "to'ldirdim", 'anketa yubordim', 'forma yubordim'];
+    const needLink = ['link', 'havola', 'qanday', 'qayerdan', 'topolmadim', 'ochilmayapti', 'qayta yuboring'];
+    if (hasAny(t, submitted)) return { intent: 'application_submitted', confidence: 0.98, forced: true };
+    if (hasAny(t, needLink)) return { intent: 'application_not_submitted', confidence: 0.96, forced: true };
   }
 
   if (stage === STAGE.ASKED_INFO) {
     const hasInfo = ['egaman', 'bilaman', 'xabardorman', "ma'lumotim bor", 'ma’lumotim bor', 'malumotim bor', 'ha bor', 'bor', 'tushunaman'];
     const noInfo = ['bilmayman', "ma'lumotim yo", 'ma’lumotim yo', 'malumotim yo', 'xabardor emasman', 'tushuntiring', 'bilmadim', 'ma\'lumot bering', 'malumot bering', 'berolasizmi malumot'];
+
+    const partialInfo = ['biroz', 'ozgina', 'sal pal', 'sal-pal', 'kamroq bilaman', 'to‘liq emas', "to'liq emas", 'qisman'];
+    if (isExactAny(t, partialInfo) || hasAny(t, ['biroz ma', 'ozgina ma', 'qisman ma'])) return { intent: 'partial_info', confidence: 0.97, forced: true };
 
     // Shu savolga oddiy "yo'q" degani: "ma'lumotga ega emasman".
     // Bu RAD EMAS. Bot to'liq ma'lumot yuborishi shart.
@@ -727,6 +925,10 @@ Qoidalar:
 - "nima bu o'zi", "do'stim aytgandi, ikkilanib turibman", "ma'lumot bering" kabi javoblar explain_project.
 - "nima qilish kerak", "jarayon qanday" kabi javoblar next_steps.
 - "savollarni yuboring", "anketa savollari" kabi javoblar questions_request.
+- "yo'q qoldirmaganman", "qoldirmoqchiman", "ariza havolasi" kabi javoblar application_not_submitted.
+- "ariza qoldirdim", "yubordim", "to'ldirdim" waiting_application_submit bosqichida application_submitted.
+- "biroz", "ozgina", "qisman" asked_info bosqichida partial_info.
+- "chek yubordim", "to'lov qildim", "operator bilan gaplashay" kabi javoblar human_needed.
 - "keyinroq", "hozir bandman" kabi javoblar later.
 - "kerak emas", "qiziq emas", "bezovta qilmang" kabi aniq rad javoblar reject.
 - Oddiy "yo'q"ni avtomatik reject qilma. Stage asked_info bo'lsa "yo'q" = no_info.
@@ -738,7 +940,7 @@ Faqat mana shu JSON formatda qaytar:
 {"intent":"...","confidence":0.0}
 
 Ruxsat etilgan intentlar:
-greeting_positive, application_confirmed, application_denied, has_info, no_info, ok_wait, read_offer, agree_bio, reject, later, price_question, card_question, expensive_question, explain_project, next_steps, questions_request, unclear
+greeting_positive, application_confirmed, application_denied, application_not_submitted, application_submitted, has_info, no_info, partial_info, ok_wait, read_offer, agree_bio, reject, later, price_question, card_question, expensive_question, explain_project, next_steps, questions_request, human_needed, unclear
 
 Stage: ${stage}
 User message: ${text}`;
@@ -751,7 +953,7 @@ User message: ${text}`;
 
     const raw = (response.output_text || '').trim();
     const parsed = JSON.parse(raw.replace(/^```json\s*/i, '').replace(/```$/i, '').trim());
-    const allowed = new Set(['greeting_positive', 'application_confirmed', 'application_denied', 'has_info', 'no_info', 'ok_wait', 'read_offer', 'agree_bio', 'reject', 'later', 'price_question', 'card_question', 'expensive_question', 'explain_project', 'next_steps', 'questions_request', 'unclear']);
+    const allowed = new Set(['greeting_positive', 'application_confirmed', 'application_denied', 'application_not_submitted', 'application_submitted', 'has_info', 'no_info', 'partial_info', 'ok_wait', 'read_offer', 'agree_bio', 'reject', 'later', 'price_question', 'card_question', 'expensive_question', 'explain_project', 'next_steps', 'questions_request', 'human_needed', 'unclear']);
     const intent = String(parsed.intent || '').toLowerCase().trim();
     const confidence = Number(parsed.confidence || 0);
 
@@ -780,6 +982,9 @@ function stageReturnQuestion(lead) {
   const stage = lead?.stage;
   if (stage === STAGE.NEW || stage === STAGE.ASKED_APPLICATION) {
     return 'Aniqlashtirib olay: siz ensiklopediyaga kirish bo‘yicha ariza yoki qiziqish qoldirganmidingiz?';
+  }
+  if (stage === STAGE.WAITING_APPLICATION_SUBMIT) {
+    return 'Arizani yuborganingizdan so‘ng shu chatga “ariza qoldirdim” deb yozing, keyin davom ettiramiz.';
   }
   if (stage === STAGE.ASKED_INFO) {
     return 'Siz bu loyiha foydali jihatlari haqida avval tanishganmisiz yoki batafsil tushuntirib beraymi?';
@@ -890,7 +1095,7 @@ async function resolvePackageItems(items = []) {
         await sendAdmin(`⚠️ Shablon topilmadi: <code>${htmlEscape(item.templateKey)}</code>`);
         continue;
       }
-      resolved.push({ text: body, templateKey: item.templateKey });
+      resolved.push({ text: renderTemplate(body), templateKey: item.templateKey });
     }
   }
   return resolved.filter(x => x.text);
@@ -1086,6 +1291,44 @@ async function continueByIntent(lead, intentResult, userText = '', turnId = 'man
     return;
   }
 
+  if (intent === 'human_needed') {
+    await sendResponsePackage({
+      lead,
+      turnId,
+      actionName: 'human_takeover',
+      items: [{ templateKey: 'human_takeover_reply' }],
+      nextStage: STAGE.HUMAN_NEEDED,
+      patch: { status: STATUS.HUMAN_NEEDED, bot_enabled: false, review_stage: lead.stage, hot_lead: true }
+    });
+    await sendAdmin(`👤 Odam aralashishi kerak
+
+Chat ID: <code>${htmlEscape(lead.chat_id)}</code>
+Xabar: ${htmlEscape(clip(userText, 700))}`);
+    return;
+  }
+
+  if (intent === 'application_not_submitted') {
+    await sendResponsePackage({
+      lead,
+      turnId,
+      actionName: 'application_link',
+      items: [{ templateKey: 'application_link_reply' }],
+      nextStage: STAGE.WAITING_APPLICATION_SUBMIT
+    });
+    return;
+  }
+
+  if (intent === 'application_submitted') {
+    await sendResponsePackage({
+      lead,
+      turnId,
+      actionName: 'ask_info_after_application_submit',
+      items: [{ templateKey: 'ask_info' }],
+      nextStage: STAGE.ASKED_INFO
+    });
+    return;
+  }
+
   if (intent === 'application_denied') {
     await sendBridgeToStage(lead, userText, intent, turnId);
     return;
@@ -1103,6 +1346,7 @@ async function continueByIntent(lead, intentResult, userText = '', turnId = 'man
   }
 
   if (intent === 'card_question') {
+    await updateLead(lead.chat_id, { hot_lead: true });
     await sendSideQuestionReply(lead, 'card_reply', 'card', turnId);
     return;
   }
@@ -1139,6 +1383,7 @@ async function continueByIntent(lead, intentResult, userText = '', turnId = 'man
   }
 
   if (intent === 'questions_request') {
+    await updateLead(lead.chat_id, { hot_lead: true });
     await sendBioQuestionsAndStop(lead, turnId);
     return;
   }
@@ -1165,7 +1410,7 @@ async function continueByIntent(lead, intentResult, userText = '', turnId = 'man
     return;
   }
 
-  if (lead.stage === STAGE.ASKED_INFO && intent === 'has_info') {
+  if (lead.stage === STAGE.ASKED_INFO && (intent === 'has_info' || intent === 'partial_info')) {
     await sendShortIntroFlow(lead, turnId);
     return;
   }
@@ -1192,6 +1437,7 @@ async function continueByIntent(lead, intentResult, userText = '', turnId = 'man
   }
 
   if (lead.stage === STAGE.ASKED_BIO_CONFIRM && intent === 'agree_bio') {
+    await updateLead(lead.chat_id, { hot_lead: true });
     await sendBioQuestionsAndStop(lead, turnId);
     return;
   }
@@ -1225,7 +1471,7 @@ function isLikelyTrailingContinuation(text, lead) {
   const explicitSignals = [
     'yoq', "yo'q", 'yo‘q', 'bor', 'bilmayman', 'egaman', 'malumotim', "ma'lumotim", 'ma’lumotim',
     'pullik', 'narx', 'qancha', 'karta', 'qimmat', 'tanishdim', 'oqib chiqdim', "o'qib chiqdim", 'o‘qib chiqdim',
-    'savollarni yuboring', 'savol yuboring', 'nima qilish kerak', 'nima bu', 'tushuntiring'
+    'savollarni yuboring', 'savol yuboring', 'nima qilish kerak', 'nima bu', 'tushuntiring', 'ariza qoldirdim', 'qoldirdim', 'qoldirmaganman'
   ];
   if (hasAny(t, explicitSignals)) return false;
 
@@ -1401,7 +1647,9 @@ async function handleBusinessMessage(message) {
   if (!firstTime) return;
 
   // O'zimiz/admin yuborgan yoki botdan kelgan xabarlarni qayta ishlamaymiz.
+  // Lekin Outreach Auto yoqilgan bo'lsa, admin yuborgan salomni eslab qolamiz.
   if (isIgnoredBusinessSender(message)) {
+    if (isOwnerBusinessSender(message)) await maybeRecordOutgoingOutreach(message);
     await logEvent(chatId, 'ignored_owner_or_bot_message', text || '[non-text]');
     return;
   }
@@ -1409,8 +1657,23 @@ async function handleBusinessMessage(message) {
   const textForDb = text.trim() ? text.trim() : '[non-text message]';
   const existingLeadBeforeMessage = await getLead(chatId);
 
-  // DB'da yo'q chat: default silent_queue. Bot ham, admin ham spam qilmaydi.
-  if (!existingLeadBeforeMessage && FIRST_CONTACT_MODE === 'silent_queue') {
+  // Outreach Auto faol bo'lsa, faqat bugun admin salom yuborgan chatlarni avto boshlaymiz.
+  const outreachState = await getOutreachAutoState();
+  if (existingLeadBeforeMessage?.status === STATUS.OUTREACH && outreachState.active) {
+    await updateLead(chatId, {
+      status: STATUS.ACTIVE,
+      bot_enabled: true,
+      stage: existingLeadBeforeMessage.stage === STAGE.DISABLED ? STAGE.NEW : (existingLeadBeforeMessage.stage || STAGE.NEW),
+      last_user_message: textForDb,
+      last_message_at: nowIso(),
+      business_connection_id: businessConnectionId || existingLeadBeforeMessage.business_connection_id
+    });
+    await logEvent(chatId, 'outreach_auto_started_from_reply', textForDb);
+  }
+
+  if (!existingLeadBeforeMessage && outreachState.active && !AUTO_START_REQUIRE_OUTREACH) {
+    // Zaxira rejim: outgoing ko'rinmasa ham vaqtli auto start. Xavfsizlik uchun default o'chirilgan.
+  } else if (!existingLeadBeforeMessage && FIRST_CONTACT_MODE === 'silent_queue') {
     await createLead({
       chatId,
       businessConnectionId,
@@ -1441,12 +1704,28 @@ async function handleBusinessMessage(message) {
   }
 
   if (!text.trim()) {
-    await logEvent(chatId, 'non_text_ignored', textForDb);
+    const mediaKey = mediaTemplateKey(message);
+    if (existingLeadBeforeMessage && existingLeadBeforeMessage.bot_enabled && !FINAL_STATUSES.has(existingLeadBeforeMessage.status) && !STOP_STAGES.has(existingLeadBeforeMessage.stage) && mediaKey) {
+      await sendResponsePackage({
+        lead: existingLeadBeforeMessage,
+        turnId: `media:${chatId}:${messageId || Date.now()}`,
+        actionName: `media_${mediaKey}`,
+        items: [{ templateKey: mediaKey }, { text: stageReturnQuestion(existingLeadBeforeMessage), templateKey: `return_${existingLeadBeforeMessage.stage}` }],
+        nextStage: existingLeadBeforeMessage.stage
+      });
+    }
+    await logEvent(chatId, 'non_text_handled_or_ignored', textForDb);
+    return;
+  }
+
+  if (isInsideQuietHours() && existingLeadBeforeMessage && existingLeadBeforeMessage.bot_enabled) {
+    await updateLead(chatId, { status: STATUS.PAUSED, bot_enabled: false, review_stage: existingLeadBeforeMessage.stage, last_user_message: textForDb, last_message_at: nowIso() });
+    await logEvent(chatId, 'quiet_hours_paused', textForDb);
     return;
   }
 
   // Pending/disabled/stopped chatlarda bot javob bermaydi, faqat oxirgi xabarni yangilab qo'yadi.
-  if (existingLeadBeforeMessage && (!existingLeadBeforeMessage.bot_enabled || FINAL_STATUSES.has(existingLeadBeforeMessage.status) || STOP_STAGES.has(existingLeadBeforeMessage.stage))) {
+  if (existingLeadBeforeMessage && !(existingLeadBeforeMessage.status === STATUS.OUTREACH && outreachState.active) && (!existingLeadBeforeMessage.bot_enabled || FINAL_STATUSES.has(existingLeadBeforeMessage.status) || STOP_STAGES.has(existingLeadBeforeMessage.stage))) {
     await updateLead(chatId, {
       business_connection_id: businessConnectionId || existingLeadBeforeMessage.business_connection_id,
       first_name: from?.first_name || existingLeadBeforeMessage.first_name,
@@ -1490,10 +1769,11 @@ async function getLeadsByList(type) {
     .order('updated_at', { ascending: false })
     .limit(15);
 
-  if (type === 'pending') query = query.eq('status', STATUS.PENDING);
+  if (type === 'pending') query = query.in('status', [STATUS.PENDING, STATUS.OUTREACH]);
   else if (type === 'active') query = query.eq('status', STATUS.ACTIVE).eq('bot_enabled', true);
   else if (type === 'stalled') query = query.eq('status', STATUS.ACTIVE).eq('bot_enabled', true).in('stage', ACTIVE_STAGES).order('updated_at', { ascending: true });
-  else if (type === 'needs_admin') query = query.eq('status', STATUS.NEEDS_ADMIN);
+  else if (type === 'needs_admin') query = query.in('status', [STATUS.NEEDS_ADMIN, STATUS.HUMAN_NEEDED]);
+  else if (type === 'hot') query = query.eq('hot_lead', true);
   else if (type === 'reached') query = query.eq('stage', STAGE.BIO_QUESTIONS_SENT);
   else query = query.eq('status', STATUS.ACTIVE);
 
@@ -1507,7 +1787,8 @@ function listTitle(type) {
     pending: '🆕 Tasdiq kutayotganlar',
     active: '🟢 Faol lidlar',
     stalled: '🟡 Chala qolgan lidlar',
-    needs_admin: '⚠️ AI tushunmaganlar',
+    needs_admin: '⚠️ AI/odam aralashishi kerak',
+    hot: '🔥 Issiq lidlar',
     reached: '✅ Savollargacha yetganlar'
   }[type] || 'Lidlar';
 }
@@ -1538,6 +1819,40 @@ async function showLeadCard(adminChatId, leadChatId, edit = null) {
   const extra = { reply_markup: lead ? leadCardKeyboard(lead) : backMenuKeyboard() };
   if (edit?.messageId) return editMessage(adminChatId, edit.messageId, text, extra);
   return sendMessage(adminChatId, text, extra);
+}
+
+
+async function templateHealthText() {
+  const required = Object.keys(TEMPLATE_TITLES);
+  const rows = await listTemplates().catch(() => []);
+  const have = new Set(rows.map(r => r.key));
+  const missing = required.filter(k => !have.has(k));
+  if (!missing.length) return `✅ Shablonlar joyida.\n\nJami kerakli: ${required.length}\nMavjud: ${rows.length}\n\nEslatma: supabase.sql endi eski tahrirlangan shablonlarni overwrite qilmaydi, faqat yetishmayotgan yangi shablonlarni qo‘shadi.`;
+  return `⚠️ Yetishmayotgan shablonlar:\n\n${missing.map(k => `— ${k} (${TEMPLATE_TITLES[k]})`).join('\n')}\n\nSupabase SQL'ni qayta ishlating. Eski tahrirlangan shablonlar o‘zgarmaydi.`;
+}
+
+async function showOutreachMenu(chatId, edit = null) {
+  const state = await getOutreachAutoState();
+  const text = `📣 Outreach Auto\n\nHolat: ${state.active ? 'yoqilgan' : 'o‘chirilgan'}\nTugash vaqti: ${state.until || '-'}\nSession: ${state.session_id || '-'}\n\nQanday ishlaydi: siz Auto rejimni yoqasiz, keyin o‘zingiz yuborgan “Assalomu alaykum...” xabarlarini bot outreach deb eslab qoladi. Faqat shu chatlardan javob kelsa, avtomatik oqim boshlanadi.`;
+  const kb = { inline_keyboard: [
+    [{ text: '✅ 1 soat', callback_data: 'auto:on:1h' }, { text: '✅ 2 soat', callback_data: 'auto:on:2h' }],
+    [{ text: '✅ 3 soat', callback_data: 'auto:on:3h' }, { text: '✅ Bugun oxirigacha', callback_data: 'auto:on:today' }],
+    [{ text: '⛔ O‘chirish', callback_data: 'auto:off' }, { text: '📌 Holat', callback_data: 'menu:outreach' }],
+    [{ text: '⬅️ Menyu', callback_data: 'menu:main' }]
+  ] };
+  if (edit?.messageId) return editMessage(chatId, edit.messageId, text, { reply_markup: kb });
+  return sendMessage(chatId, text, { reply_markup: kb });
+}
+
+async function clearListByType(type) {
+  let query = supabase.from('business_leads').update({ status: STATUS.DISABLED, stage: STAGE.DISABLED, bot_enabled: false, is_old_lead: true, updated_at: nowIso() });
+  if (type === 'pending') query = query.in('status', [STATUS.PENDING, STATUS.OUTREACH]);
+  else if (type === 'needs_admin') query = query.in('status', [STATUS.NEEDS_ADMIN, STATUS.HUMAN_NEEDED]);
+  else if (type === 'stalled') query = query.eq('status', STATUS.ACTIVE).eq('bot_enabled', true).in('stage', ACTIVE_STAGES);
+  else return 0;
+  const { data, error } = await query.select('chat_id');
+  if (error) throw error;
+  return (data || []).length;
 }
 
 // -------------------- Admin handlers --------------------
@@ -1658,6 +1973,15 @@ OWNER_TELEGRAM_ID=${message.from?.id}`);
   if (cmd === '/start' || cmd === '/menu') return showMainMenu(chatId);
   if (cmd === '/help') return showHelp(chatId);
   if (cmd === '/report') return sendMessage(chatId, await buildReportText(), { reply_markup: backMenuKeyboard() });
+  if (cmd === '/healthtemplates') return sendMessage(chatId, await templateHealthText(), { reply_markup: backMenuKeyboard() });
+  if (cmd === '/autostatus') return showOutreachMenu(chatId);
+  if (cmd === '/autooff') { await disableOutreachAuto(); return sendMessage(chatId, '⛔ Outreach Auto o‘chirildi.'); }
+  if (cmd === '/auto') {
+    const ms = parseDurationToMs(args || 'default');
+    if (!ms) return sendMessage(chatId, 'Namuna: /auto 2h yoki /auto today');
+    const r = await enableOutreachAuto(ms);
+    return sendMessage(chatId, `✅ Outreach Auto yoqildi.\nTugash vaqti: ${r.until}\nSession: ${r.sessionId}`);
+  }
   if (cmd === '/pending') return showLeadList(chatId, 'pending');
   if (cmd === '/active') return showLeadList(chatId, 'active');
   if (cmd === '/stalled') return showLeadList(chatId, 'stalled');
@@ -1738,7 +2062,36 @@ async function handleCallback(query) {
 
   if (data === 'menu:main') return showMainMenu(chatId, { messageId });
   if (data === 'menu:help') return showHelp(chatId, { messageId });
+  if (data === 'menu:outreach') return showOutreachMenu(chatId, { messageId });
   if (data === 'menu:report') return editMessage(chatId, messageId, await buildReportText(), { reply_markup: backMenuKeyboard() });
+
+  if (data.startsWith('auto:on:')) {
+    const arg = data.split(':')[2];
+    const ms = parseDurationToMs(arg);
+    const r = await enableOutreachAuto(ms || DEFAULT_OUTREACH_HOURS * 60 * 60 * 1000);
+    await answerCallbackQuery(query.id, 'Outreach Auto yoqildi');
+    return showOutreachMenu(chatId, { messageId });
+  }
+  if (data === 'auto:off') {
+    await disableOutreachAuto();
+    await answerCallbackQuery(query.id, 'O‘chirildi');
+    return showOutreachMenu(chatId, { messageId });
+  }
+
+  if (data.startsWith('clear:confirm:')) {
+    const type = data.split(':')[2];
+    const leads = await getLeadsByList(type);
+    const kb = { inline_keyboard: [
+      [{ text: `✅ Ha, ${leads.length} tasini disabled qilish`, callback_data: `clear:do:${type}` }],
+      [{ text: '❌ Bekor qilish', callback_data: `list:${type}` }]
+    ] };
+    return editMessage(chatId, messageId, `🧹 ${listTitle(type)} tozalanadi.\n\n${leads.length} ta lid disabled qilinadi. Tasdiqlaysizmi?`, { reply_markup: kb });
+  }
+  if (data.startsWith('clear:do:')) {
+    const type = data.split(':')[2];
+    const count = await clearListByType(type);
+    return editMessage(chatId, messageId, `✅ Tozalandi: ${count} ta lid disabled qilindi.`, { reply_markup: backMenuKeyboard() });
+  }
 
   if (data.startsWith('list:')) {
     const type = data.split(':')[1];
@@ -1770,6 +2123,20 @@ async function handleCallback(query) {
   if (data.startsWith('lead:restart:')) {
     const leadChatId = data.split(':')[2];
     await adminStartFlow(leadChatId, true);
+    return showLeadCard(chatId, leadChatId, { messageId });
+  }
+
+  if (data.startsWith('lead:send_app:')) {
+    const leadChatId = data.split(':')[2];
+    const lead = await getLead(leadChatId);
+    if (lead) await sendResponsePackage({ lead: { ...lead, bot_enabled: true }, turnId: 'admin_send_app', actionName: 'admin_application_link', items: [{ templateKey: 'application_link_reply' }], nextStage: STAGE.WAITING_APPLICATION_SUBMIT, patch: { status: STATUS.ACTIVE, bot_enabled: true } });
+    return showLeadCard(chatId, leadChatId, { messageId });
+  }
+
+  if (data.startsWith('lead:send_info:')) {
+    const leadChatId = data.split(':')[2];
+    const lead = await getLead(leadChatId);
+    if (lead) await sendFullExplanationFlow({ ...lead, status: STATUS.ACTIVE, bot_enabled: true }, 'admin_send_info');
     return showLeadCard(chatId, leadChatId, { messageId });
   }
 

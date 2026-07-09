@@ -1,40 +1,28 @@
 # OLYE Business AI Bot v5 Lite
 
-Telegram Business profilingiz nomidan yangi lidlarni **biografik savollargacha** olib keladigan sodda bot.
+Telegram Business profilingiz nomidan yangi lidlarni biografik savollargacha olib boradigan nazoratli AI bot.
 
-Bot CRM emas. Vazifasi bitta: lidni tartibli savdo oqimidan olib o‘tib, bio savollarni yuborish. Bio savollardan keyin bot o‘sha chatda to‘xtaydi, qolganini o‘zingiz qo‘lda davom ettirasiz.
+## Eng muhim yangiliklar
 
-## Asosiy mantiq
-
-1. Siz Telegramda odamga birinchi yozasiz: `Assalomu alaykum, yaxshimisiz?`
-2. Agar chat DB’da yo‘q bo‘lsa, default rejimda bot mijozga ham, admin chatga ham javob yubormaydi.
-3. Chat `/menu → 🆕 Tasdiq kutayotganlar` ichiga tushadi.
-4. Yangi lid bo‘lsa `▶️ Oqimni boshlash` bosasiz.
-5. Eski chat bo‘lsa `🔕 O‘chirish` bosasiz.
-6. Bot ariza/qiziqish, ma’lumot, oferta, maqola taklifi va bio savollarni bosqichma-bosqich yuboradi.
-7. Bio savollar yuborilgach bot to‘xtaydi.
-
-## Muhim imkoniyatlar
-
-- `silent_queue`: yangi/aniqlanmagan chatlar adminni spam qilmaydi.
-- AI intent: “instagramda qoldirdim”, “do‘stim aytdi”, “yozgandim” kabi g‘alati javoblarni tushunadi.
-- Stage sistemi: “ha” har bosqichda to‘g‘ri talqin qilinadi.
-- AI tushunmasa: dastlabki bosqichlarda eng xavfsiz yo‘l bilan shablon bo‘yicha batafsil tushuntiradi; juda noaniq holatda admin ro‘yxatiga tushadi.
-- Rad javob: “kerak emas”, “qiziq emas” desa bot yumshoq yakunlaydi va to‘xtaydi.
-- Keyinroq: “hozir bandman”, “keyinroq” desa bot keyinroqqa qo‘yadi.
-- Narx savoli: “narxi qancha?”, “pullikmi?” desa tayyor shablondan javob beradi.
-- Duplicate protection: bir xil Telegram message qayta kelsa, bot ikki marta javob bermaydi.
-- Aqlli turn queue: lid ketma-ket xabar yozsa, bot ularni bitta javob deb ko‘radi va bir vaqtda bir nechta javob yuborib tashlamaydi.
-- Admin tugmali panel: ro‘yxatlar, lid kartochkasi, shablon tahrirlash.
+- AI noaniq/g‘alati gaplarga tabiiy, muloyim ko‘prik javob yozadi va yana shablonga qaytaradi.
+- Narx/karta/qimmat kabi yon savollar asosiy ketma-ketlikni buzmaydi.
+- `full_intro + offer_end` kabi 2 xabarli javoblar bitta paket sifatida yuboriladi va takrorlanmaydi.
+- `message_id`, `chat_lock`, `response_package`, `sent_bot_messages` orqali duplicate himoya bor.
+- `biroz` = qisman ma’lumot bor deb tushuniladi, `birozdan keyin` = keyinroq.
+- Ovozli/rasm/sticker/fayl kelsa, bot matn ko‘rinishida javob so‘raydi.
+- “Yo‘q, qoldirmaganman” yoki “qoldirmoqchiman, bilmayman” desa, ariza havolasini yuboradi.
+- Outreach Auto rejimi: siz yuborgan “Assalomu alaykum...” salomlarni eslab, faqat o‘sha chatlardan kelgan javoblarni avto start qiladi.
+- Admin panelda bulk clear: tasdiq kutayotganlarni bitta tugma bilan disabled qilish mumkin.
+- SQL endi eski tahrirlangan shablonlarni overwrite qilmaydi.
 
 ## Fayllar
 
 ```text
-index.js          Asosiy bot kodi
-package.json      Render uchun Node sozlamalari
-.env.example      Environment variables namunasi
-supabase.sql      Supabase jadvallar va boshlang‘ich shablonlar
-.gitignore
+index.js
+package.json
+.env.example
+supabase.sql
+README.md
 ```
 
 ## Render sozlamalari
@@ -53,94 +41,158 @@ node index.js
 
 ## Environment Variables
 
-Render → Environment bo‘limiga quyidagilarni qo‘shing:
+`.env.example` ichidagi qiymatlarni Render → Environment Variables bo‘limiga kiriting.
 
-```text
+Eng muhimlari:
+
+```env
 BOT_TOKEN=
 ADMIN_CHAT_ID=
 OWNER_TELEGRAM_ID=
-WEBHOOK_SECRET=
+BUSINESS_OWNER_ID=
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4.1-mini
-AI_CONFIDENCE_MIN=0.65
+WEBHOOK_SECRET=
 FIRST_CONTACT_MODE=silent_queue
+APPLICATION_LINK=https://...
 MESSAGE_BUFFER_MS=7000
 TURN_COOLDOWN_MS=12000
-MAX_BATCH_MESSAGES=8
-MAX_BATCH_CHARS=3000
-WEBHOOK_URL=https://your-render-service.onrender.com/webhook
+CHAT_LOCK_MS=30000
+AUTO_START_REQUIRE_OUTREACH=true
 ```
 
-`FIRST_CONTACT_MODE=silent_queue` tavsiya qilinadi. Bu eski chatlarni adashtirib yubormaslik va adminni spam qilmaslik uchun eng xavfsiz rejim.
+`BUSINESS_OWNER_ID`ni olish uchun botga admin chatdan yozing:
 
-## Supabase
+```text
+/whoami
+```
 
-Supabase → SQL Editor’da `supabase.sql` faylini to‘liq ishlating.
+## Supabase yangilash
 
-Agar oldin `admin_sessions` schema xatosi chiqqan bo‘lsa, bu SQL uni tuzatadi, chunki `admin_sessions` jadvali qayta yaratiladi.
+Supabase SQL Editor’da `supabase.sql`ni ishlating.
 
-## Webhook ulash
+Muhim: bu SQL eski lidlar va tahrirlangan shablonlarni o‘chirmaydi. Template insertlari:
+
+```sql
+on conflict (key) do nothing
+```
+
+shuning uchun siz avval `/settemplate` orqali tahrirlagan matnlar saqlanadi. Faqat yangi yetishmayotgan shablonlar qo‘shiladi.
+
+Agar qaysi shablon yetishmayotganini ko‘rmoqchi bo‘lsangiz:
+
+```text
+/healthtemplates
+```
+
+## Webhook
 
 Render deploy bo‘lgandan keyin brauzerda oching:
 
 ```text
-https://SENING-RENDER-URL.onrender.com/set-webhook
+https://YOUR-RENDER-URL.onrender.com/set-webhook
 ```
 
 Tekshirish:
 
 ```text
-https://SENING-RENDER-URL.onrender.com/webhook-info
-```
-
-Sog‘lik tekshiruvi:
-
-```text
-https://SENING-RENDER-URL.onrender.com/health
+https://YOUR-RENDER-URL.onrender.com/webhook-info
 ```
 
 ## Admin menyu
-
-Telegramda admin chatdan botga yuboring:
 
 ```text
 /menu
 ```
 
-Menyu bo‘limlari:
+Menyuda shular bor:
+
+- 📊 Hisobot
+- 🆕 Tasdiq kutayotganlar
+- 🟢 Faol lidlar
+- 🟡 Chala lidlar
+- ⚠️ AI/Operator
+- 🔥 Issiq lidlar
+- ✅ Savollargacha yetganlar
+- 📣 Outreach Auto
+- ✏️ Shablonlar
+
+## Outreach Auto
+
+Ertalab lidlarga o‘zingiz yozasiz:
 
 ```text
-📊 Hisobot
-🆕 Tasdiq kutayotganlar
-🟢 Faol lidlar
-🟡 Chala lidlar
-⚠️ AI tushunmaganlar
-✅ Savollargacha yetganlar
-✏️ Shablonlar
-⚙️ Yordam
+Assalomu alaykum Anisjon yaxshimisiz?
 ```
 
-Har bir lid kartochkasida:
+Keyin botda:
 
 ```text
-▶️ Oqimni boshlash
-⏸ To‘xtatish
-🔁 Qayta boshlash
-🔔 Yoqish
-🔕 O‘chirish
-📌 Yangilash
+/auto 2h
 ```
 
-AI tushunmagan lidda qo‘shimcha:
+yoki menyudan `📣 Outreach Auto → 2 soat` bosasiz.
+
+Bot Telegram Business outgoing xabarlarni ko‘rsa, siz yuborgan salomlarni `outreach_sent` deb belgilaydi. Keyin faqat shu chatlardan javob kelsa, bot avtomatik oqimni boshlaydi.
+
+Agar Telegram outgoing xabarlarni bermasa va vaqtli auto start xohlasangiz, Render’da:
+
+```env
+AUTO_START_REQUIRE_OUTREACH=false
+```
+
+qilsa bo‘ladi. Lekin xavfsizlik uchun default `true`.
+
+Buyruqlar:
 
 ```text
-✅ Ha deb davom ettirish
-❌ Yo‘q/to‘xtatish
+/auto 1h
+/auto 2h
+/auto 3h
+/auto today
+/autooff
+/autostatus
 ```
 
-## Asosiy buyruqlar
+## Ariza qoldirmagan holati
+
+Agar bot so‘rasa:
+
+```text
+Siz ariza qoldirgansiz. Shunaqami?
+```
+
+Lid:
+
+```text
+Yo‘q, qoldirmaganman
+Qoldirmoqchiman, lekin qanday qilishni bilmayman
+```
+
+desa, bot `application_link_reply` shablonini yuboradi va `waiting_application_submit` stage’ga o‘tadi.
+
+Lid keyin:
+
+```text
+ariza qoldirdim
+qoldirdim
+yubordim
+```
+
+desa, bot keyingi savolga o‘tadi.
+
+## Shablonlar overwrite bo‘lmasligi
+
+Avvalgi versiyada `supabase.sql` template body’larni qayta yozib yuborishi mumkin edi. Hozir tuzatildi.
+
+Endi:
+
+- yangi shablon bo‘lsa qo‘shiladi;
+- eski shablon bo‘lsa o‘zgarmaydi;
+- tahrirlash faqat `/settemplate` yoki admin tugma orqali bo‘ladi.
+
+## Kerakli buyruqlar
 
 ```text
 /menu
@@ -152,152 +204,14 @@ AI tushunmagan lidda qo‘shimcha:
 /reached
 /templates
 /gettemplate key
-/settemplate key yangi matn
+/settemplate key matn
 /status chat_id
 /leadson chat_id
 /leadsoff chat_id
 /restart chat_id
+/healthtemplates
 ```
 
-## Shablon keylari
+## Eslatma
 
-```text
-ask_application
-ask_info
-short_intro
-full_intro
-offer_end
-ask_bio_confirm
-bio_questions
-price_reply
-card_reply
-expensive_reply
-next_steps_reply
-later_reply
-reject_reply
-```
-
-## AI nima qiladi?
-
-AI mijozga erkin matn yozmaydi. Faqat quyidagi intentlardan birini aniqlaydi:
-
-```text
-greeting_positive
-application_confirmed
-application_denied
-has_info
-no_info
-ok_wait
-read_offer
-agree_bio
-reject
-later
-price_question
-card_question
-expensive_question
-explain_project
-next_steps
-questions_request
-unclear
-```
-
-Javoblar faqat Supabase’dagi `reply_templates` jadvalidan chiqadi.
-
-## v5 Lite smart-intent fix
-
-Bu versiyada oddiy `yo‘q` endi hamma joyda rad javob deb olinmaydi. Bot `stage` bo‘yicha talqin qiladi:
-
-```text
-asked_info + "yo‘q"       => no_info => full_intro yuboriladi
-asked_application + "yo‘q" => application_denied => yumshoq to‘xtaydi
-asked_bio_confirm + "yo‘q" => reject => yumshoq to‘xtaydi
-```
-
-Ya’ni `Siz ma’lumotga egamisiz?` savolidan keyin odam `yo‘q` desa, bot savdoni yopmaydi, aksincha to‘liq ma’lumot yuboradi.
-
-Admin test buyrug‘i:
-
-```text
-/testintent asked_info yo‘q
-/testintent asked_application instagramda qoldirdim
-/testintent asked_bio_confirm ha yozing
-```
-
-
-## Muhim fix: bot o'zingiz yozgan xabarga javob bermasin
-
-Admin chatda botga `/whoami` yuboring. Bot sizga Telegram user ID beradi. Render Environment Variables'ga quyidagilarni qo'ying:
-
-```env
-OWNER_TELEGRAM_ID=shu_yerdagi_id
-BUSINESS_OWNER_ID=shu_yerdagi_id
-```
-
-Agar bu ID qo'yilmasa, Telegram Business chatda o'zingiz yozgan `Assalomu alaykum`, `pullikmi?` kabi xabarlarni bot mijoz xabari deb o'ylab, javob berib yuborishi mumkin.
-
-## Aqlli shablonli oqim
-
-Bot erkin matn yozmaydi, lekin odamning savolini ma'no bo'yicha intentga ajratadi va faqat shablondan javob beradi:
-
-- `pullikmi`, `narxi qancha` → `price_reply`
-- `karta`, `kartaga to'lov qilinadimi` → `card_reply`
-- `qimmat ekan` → `expensive_reply`
-- `do'stim aytgandi, nima bu o'zi`, `ma'lumot bering` → `explain_reply` + `full_intro` + `offer_end`
-- `nima qilish kerak` → bosqichga qarab keyingi shablon
-- `savollarni yuboring` → `bio_questions` va bot shu chatda to'xtaydi
-
-Karta raqam va narx matnlarini `/templates` orqali o'zingiz tahrirlang.
-
-
-## Aqlli turn queue: bir lid bir vaqtda ko'p xabar yozsa
-
-Bu versiyada bot `har xabar = yangi javob` deb ishlamaydi. Har bir chat uchun kichik navbat bor:
-
-```text
-1. Lid ketma-ket xabar yozsa, bot MESSAGE_BUFFER_MS davomida kutadi.
-2. Shu vaqt ichidagi xabarlarni bitta batch qiladi.
-3. Bitta chatda bir vaqtda faqat bitta process ishlaydi.
-4. Bot savol yuborgandan keyin `shunaqa/albatta` kabi qisqa davom-xabarlar TURN_COOLDOWN_MS ichida kelsa, ularni keyingi savolga javob deb olmaydi.
-```
-
-Tavsiya qilingan sozlama:
-
-```env
-MESSAGE_BUFFER_MS=7000
-TURN_COOLDOWN_MS=12000
-MAX_BATCH_MESSAGES=8
-MAX_BATCH_CHARS=3000
-```
-
-Masalan lid shunday yozsa:
-
-```text
-Albatta
-Shunaqa
-```
-
-bot buni bitta batch qiladi va faqat `ask_info` bosqichiga o'tadi. `Shunaqa`ni darrov keyingi savolga javob deb olib, full info yuborib tashlamaydi.
-
-## v5 Lite yakuniy aqlli mantiq
-
-Ushbu versiyada bot oddiy shablon robot emas. U quyidagicha ishlaydi:
-
-- **Asosiy stage saqlanadi:** ariza/qiziqish → ma'lumot → oferta → bio maqola → bio savollar.
-- **Yon savollar stage'ni buzmaydi:** narx, karta, qimmat, “nima qilish kerak” kabi savollar alohida javoblanadi va bot yana hozirgi savolga qaytaradi.
-- **AI bridge javoblari:** lid “kimsan?”, “nima desam ekan?”, “tanimadim”, “do‘stim aytgandi, ikkilanib turibman” kabi noaniq gap yozsa, AI qisqa va muloyim ko‘prik javob yozadi. U narx, karta raqam yoki kafolatni o‘zidan o‘ylab topmaydi.
-- **1 turn = 1 bot action:** lid ketma-ket bir nechta xabar yozsa, bot ularni bitta javob sifatida tahlil qiladi va bir martada faqat bitta harakat qiladi.
-- **Intentional multi-message package:** `full_intro + offer_end` kabi 2 xabar kerak bo‘lsa, ular bitta paket sifatida yuboriladi. Paket qayta takrorlanmaydi.
-- **Duplicate himoya:** `processed_messages`, `chat_locks`, `response_packages`, `sent_bot_messages` jadvallari bitta xabar yoki bitta javob paketining ikki marta ketishiga qarshi ishlaydi.
-
-Muhim env qiymatlar:
-
-```env
-MESSAGE_BUFFER_MS=7000
-TURN_COOLDOWN_MS=12000
-CHAT_LOCK_MS=30000
-PACKAGE_MESSAGE_DELAY_MS=500
-MAX_BATCH_MESSAGES=8
-MAX_BATCH_CHARS=3000
-```
-
-Supabase SQL Editor'da `supabase.sql`ni qayta ishlating. U yangi lock/package jadvallarini qo‘shadi.
+AI muhim faktlarni o‘zidan yozmaydi: narx, karta, oferta, ariza havolasi va bio savollar shablondan olinadi. Noaniq gaplarda esa faqat qisqa ko‘prik javob yozadi va suhbatni asosiy oqimga qaytaradi.
