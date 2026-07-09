@@ -61,6 +61,8 @@ const DEFAULT_OUTREACH_HOURS = Number(process.env.DEFAULT_OUTREACH_HOURS || 2);
 const AUTO_TOPIC_FROM_OUTGOING = String(process.env.AUTO_TOPIC_FROM_OUTGOING || 'true').toLowerCase() !== 'false';
 // Admin qo'lda xabar yuborganda bot o'sha chatga darrov aralashib ketmasligi uchun.
 const ADMIN_TAKEOVER_PAUSE_MS = Number(process.env.ADMIN_TAKEOVER_PAUSE_MS || 60000);
+// Admin qo'lda narx/ma'lumot/karta kabi mavzuni yuborgan bo'lsa, bot shu mavzuni qayta yubormasligi uchun uzunroq cooldown.
+const MANUAL_TOPIC_COOLDOWN_MS = Number(process.env.MANUAL_TOPIC_COOLDOWN_MS || 10 * 60 * 1000);
 
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL missing');
@@ -727,6 +729,23 @@ function detectOutgoingTopicFromText(text = '') {
     return { stage: STAGE.WAITING_APPLICATION_SUBMIT, templateKey: 'application_link_reply', topic: 'application_link', status: STATUS.ACTIVE, botEnabled: true };
   }
 
+  // Admin qo'lda narx/to'lov/karta bo'yicha javob yuborsa, bot shu mavzuni qayta yubormasligi kerak.
+  // Bunda asosiy stage saqlanadi: narx/karta side-question hisoblanadi, oqimni bio taklifga sakratmaydi.
+  const manualCardSignals = ['karta raqam', 'karta raqami', 'karta egasi', 'plastik', 'rekvizit', 'hisob raqam', 'chek rasmini yuboring'];
+  if (hasAny(t, manualCardSignals)) {
+    return { keepStage: true, templateKey: 'card_reply', topic: 'manual_card', status: STATUS.ACTIVE, botEnabled: true };
+  }
+
+  const manualExpensiveSignals = ['qimmat', '14 kunda', "14 kunda bo'lib", '14 kunda bo‘lib', 'boshlangich tolov', 'boshlang‘ich to‘lov', 'chegirma'];
+  if (hasAny(t, manualExpensiveSignals) && hasAny(t, ['to‘lov', "to'lov", 'tolov', 'badal', 'pul', 'so‘m', "so'm", 'som'])) {
+    return { keepStage: true, templateKey: 'expensive_reply', topic: 'manual_expensive', status: STATUS.ACTIVE, botEnabled: true };
+  }
+
+  const manualPriceSignals = ['badal', '100 000', '100000', 'yillik badal', 'pulni', 'pullar', 'to‘lov', "to'lov", 'tolov', 'so‘m', "so'm", 'som', 'necha pul'];
+  if (hasAny(t, manualPriceSignals) && hasAny(t, ['maqola', 'sayt', 'ensiklopediya', 'badal', 'to‘lov', "to'lov", 'tolov'])) {
+    return { keepStage: true, templateKey: 'price_reply', topic: 'manual_price', status: STATUS.ACTIVE, botEnabled: true };
+  }
+
   if (hasAny(t, ['foydali jihatlari haqida', 'batafsil ma’lumotga egamisiz', "batafsil ma'lumotga egamisiz", 'malumotga egamisiz'])) {
     return { stage: STAGE.ASKED_INFO, templateKey: 'ask_info', topic: 'ask_info', status: STATUS.ACTIVE, botEnabled: true };
   }
@@ -775,11 +794,12 @@ async function maybeRecordOutgoingTopic(message) {
   const businessConnectionId = message?.business_connection_id || message?.business_connection?.id || null;
   const existing = await getLead(chatId);
 
+  const resolvedStage = topic.keepStage ? (existing?.stage || STAGE.NEW) : topic.stage;
   const patch = {
     business_connection_id: businessConnectionId || existing?.business_connection_id || null,
-    status: topic.status || STATUS.ACTIVE,
+    status: topic.status || existing?.status || STATUS.ACTIVE,
     bot_enabled: Boolean(topic.botEnabled),
-    stage: topic.stage,
+    stage: resolvedStage,
     last_bot_message: text,
     last_bot_sent_at: nowIso(),
     last_bot_template_key: topic.templateKey,
@@ -1210,10 +1230,18 @@ async function resolvePackageItems(items = []) {
 
 
 function shouldSuppressRepeatedSingleAction(lead, resolved = [], actionName = '') {
-  if (!lead || resolved.length !== 1) return false;
+  if (!lead || !resolved.length) return false;
   if (!SAME_ACTION_COOLDOWN_MS || msSince(lead.last_bot_sent_at) > SAME_ACTION_COOLDOWN_MS) return false;
 
-  const key = resolved[0]?.templateKey || '';
+  const action = String(actionName || '');
+  const firstKey = resolved[0]?.templateKey || '';
+  // Narx/karta/qimmat kabi side-question paketlari 2 ta xabardan iborat bo'lishi mumkin.
+  // Lekin shu mavzu yaqinda yuborilgan bo'lsa, bir xil paket qayta ketmasin.
+  if (action.startsWith('side_') && lead.last_bot_template_key === firstKey) return true;
+
+  if (resolved.length !== 1) return false;
+
+  const key = firstKey;
   const repeatKeys = new Set([
     'return_waiting_offer_read',
     'return_asked_application',
@@ -1396,7 +1424,8 @@ async function sendSideQuestionReply(lead, templateKey, sideType, turnId = 'manu
       { templateKey },
       { text: returnText, templateKey: `return_${lead.stage}` }
     ],
-    nextStage: lead.stage
+    nextStage: lead.stage,
+    patch: { last_bot_template_key: templateKey, ai_intent: `side_${sideType}_sent` }
   });
 }
 
@@ -1731,27 +1760,42 @@ function userMessageAfterLastBot(lead) {
 
 function isRecentManualSync(lead) {
   if (!lead?.last_bot_sent_at) return false;
-  if (msSince(lead.last_bot_sent_at) > ADMIN_TAKEOVER_PAUSE_MS) return false;
   const ai = String(lead.ai_intent || '');
   if (!ai.startsWith('outgoing_topic_')) return false;
   const key = String(lead.last_bot_template_key || '');
   // Admin savol bergan bo'lsa (ask_application/ask_info), lid javobini bot davom ettirishi mumkin.
   // Admin ma'lumot, oferta, karta, ariza link yoki bio savol yuborgan bo'lsa, bot takrorlamasligi uchun ehtiyot pauza ishlaydi.
-  return [
+  const manualKeys = [
     'full_intro', 'short_intro', 'explain_reply', 'offer_end', 'application_link_reply',
     'price_reply', 'card_reply', 'expensive_reply', 'bio_questions', 'manual_intro'
-  ].includes(key);
+  ];
+  if (!manualKeys.includes(key)) return false;
+  const cooldown = ['price_reply', 'card_reply', 'expensive_reply', 'full_intro', 'short_intro', 'manual_intro'].includes(key)
+    ? MANUAL_TOPIC_COOLDOWN_MS
+    : ADMIN_TAKEOVER_PAUSE_MS;
+  return msSince(lead.last_bot_sent_at) <= cooldown;
 }
 
 function shouldSkipForRecentManualSync(lead, text) {
   if (!isRecentManualSync(lead)) return false;
+  const key = String(lead.last_bot_template_key || '');
   const check = forceIntentByStage(text, lead.stage, { intent: 'unclear', confidence: 0.35 });
-  // Kuchli yangi signal bo'lsa bot ishlashi mumkin: masalan “tanishdim”, “savollarni yuboring”, “to'lov qildim”.
-  const allowed = new Set([
-    'read_offer', 'questions_request', 'agree_bio', 'human_needed', 'reject',
-    'price_question', 'card_question', 'application_submitted'
-  ]);
-  return !allowed.has(check.intent);
+
+  // Manual price/card yuborilgan bo'lsa, aynan shu mavzu qayta so'ralsa ham bot takrorlamaydi.
+  if (key === 'price_reply' && ['price_question', 'unclear', 'next_steps'].includes(check.intent)) return true;
+  if (key === 'card_reply' && ['card_question', 'unclear', 'next_steps'].includes(check.intent)) return true;
+  if (key === 'expensive_reply' && ['expensive_question', 'unclear', 'next_steps'].includes(check.intent)) return true;
+
+  // Admin ma'lumot/oferta/link yuborganidan keyin noaniq gapga bot aralashmaydi;
+  // lekin kuchli yangi signal bo'lsa davom etishi mumkin.
+  if (check.intent === 'reject' || check.intent === 'human_needed' || check.intent === 'application_submitted') return false;
+  if (check.intent === 'read_offer') return false;
+  if ((check.intent === 'questions_request' || check.intent === 'agree_bio') && lead.stage === STAGE.ASKED_BIO_CONFIRM) return false;
+  if (check.intent === 'card_question' && key !== 'card_reply') return false;
+  if (check.intent === 'price_question' && key !== 'price_reply') return false;
+  if (check.intent === 'expensive_question' && key !== 'expensive_reply') return false;
+
+  return true;
 }
 
 async function processBusinessTurn({ chatId, businessConnectionId, from, text, messageCount = 1, turnId = 'manual' }) {
@@ -1846,7 +1890,10 @@ async function handleBusinessMessage(message) {
   // O'zimiz/admin yuborgan yoki botdan kelgan xabarlarni qayta ishlamaymiz.
   // Lekin Outreach Auto yoqilgan bo'lsa, admin yuborgan salomni eslab qolamiz.
   if (isIgnoredBusinessSender(message)) {
-    if (isOwnerBusinessSender(message)) {
+    // Telegram Business ayrim qo'lda yuborilgan outgoing xabarlarni from.id bilan emas, is_from_offline kabi flag bilan beradi.
+    // Shuning uchun admin/business profil xabari ko'rinsa, uni ham chat mavzusi sifatida yozib olamiz.
+    const isManualBusinessOutgoing = Boolean(message?.is_from_offline) && !message?.from?.is_bot && !message?.sender_business_bot;
+    if (isOwnerBusinessSender(message) || isManualBusinessOutgoing) {
       // Avval aniq mavzuni yozib olamiz: admin qo'lda qaysi shablon/mavzuni yuborgan bo'lsa, bot shu stage'da davom etadi.
       const topicRecorded = await maybeRecordOutgoingTopic(message);
       if (!topicRecorded) await maybeRecordOutgoingOutreach(message);

@@ -268,4 +268,5 @@ AI muhim faktlarni o‘zidan yozmaydi: narx, karta, oferta, ariza havolasi va bi
 - Admin paneldagi `🤖 Mos joydan davom ettirish` tugmasi endi suhbatni boshidan boshlamaydi. Bot oxirgi admin xabari, oxirgi lid javobi va stage bo‘yicha mos joydan davom etadi.
 - Agar admin botdan tezroq loyiha ma’lumoti, oferta, karta yoki ariza linkini qo‘lda yuborsa, bot shu xabarni qayta yubormaydi.
 - `ADMIN_TAKEOVER_PAUSE_MS=60000` vaqtida admin qo‘lda yuborgan ma’lumotdan keyin bot shu chatga ehtiyotkorlik bilan aralashmaydi; lekin `tanishdim`, `savollarni yuboring`, `to‘lov qildim` kabi kuchli signal bo‘lsa davom etadi.
+- `MANUAL_TOPIC_COOLDOWN_MS=600000` admin qo‘lda narx/karta/qimmat mavzusiga javob bergan bo‘lsa, bot shu mavzuni 10 daqiqa ichida qayta yubormaydi.
 - Supabase SQL eski tahrirlangan shablonlarni overwrite qilmaydi: template seedlar `ON CONFLICT DO NOTHING` bilan kiritilgan.
