@@ -269,4 +269,28 @@ AI muhim faktlarni o‘zidan yozmaydi: narx, karta, oferta, ariza havolasi va bi
 - Agar admin botdan tezroq loyiha ma’lumoti, oferta, karta yoki ariza linkini qo‘lda yuborsa, bot shu xabarni qayta yubormaydi.
 - `ADMIN_TAKEOVER_PAUSE_MS=60000` vaqtida admin qo‘lda yuborgan ma’lumotdan keyin bot shu chatga ehtiyotkorlik bilan aralashmaydi; lekin `tanishdim`, `savollarni yuboring`, `to‘lov qildim` kabi kuchli signal bo‘lsa davom etadi.
 - `MANUAL_TOPIC_COOLDOWN_MS=600000` admin qo‘lda narx/karta/qimmat mavzusiga javob bergan bo‘lsa, bot shu mavzuni 10 daqiqa ichida qayta yubormaydi.
+- `SIDE_ACTION_COOLDOWN_MS=1800000` narx/karta/qimmat kabi side-question javoblari 30 daqiqa ichida qayta ketmasin.
+- `SIDE_QUESTION_GRACE_MS=12000` narx/karta/qimmat so‘ralganda bot 12 soniya kutadi; admin shu orada qo‘lda javob bersa, bot takrorlamaydi.
 - Supabase SQL eski tahrirlangan shablonlarni overwrite qilmaydi: template seedlar `ON CONFLICT DO NOTHING` bilan kiritilgan.
+
+## Super AI Guard
+
+Yangi himoya qatlami qo‘shildi:
+
+- AI qaror chiqargandan keyin ham kod `Super AI Guard` orqali tekshiradi.
+- Narx, karta, qimmat, ma’lumot, oferta, ariza havolasi, bio savollar kabi muhim mavzular `topic` sifatida nazorat qilinadi.
+- Bir mavzu yaqinda admin yoki bot tomonidan yuborilgan bo‘lsa, bot shu mavzuni qayta yubormaydi.
+- Har bir lid kartochkasida mini audit ko‘rinadi: oxirgi intent, stage, yuborilgan topic va skip sabablari.
+- `👤 Admin oldi` tugmasi chatni odamga o‘tkazadi va botni jim qiladi.
+- `🤖 Bot davom etsin` tugmasi botni qayta yoqadi.
+
+Muhim: 100% xatosiz AI bo‘lmaydi, lekin bu guard bot xato qilishga yaqinlashsa ham xabarni mijozga yubormaslikka harakat qiladi.
+
+Tavsiya etilgan yangi env qiymatlar:
+
+```env
+SUPER_AI_GUARD_ENABLED=true
+SUPER_AI_CONTEXT_LIMIT=20
+TOPIC_COOLDOWN_MS=1800000
+ADMIN_ACTIVITY_SUPPRESS_MS=120000
+```

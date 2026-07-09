@@ -63,6 +63,19 @@ const AUTO_TOPIC_FROM_OUTGOING = String(process.env.AUTO_TOPIC_FROM_OUTGOING || 
 const ADMIN_TAKEOVER_PAUSE_MS = Number(process.env.ADMIN_TAKEOVER_PAUSE_MS || 60000);
 // Admin qo'lda narx/ma'lumot/karta kabi mavzuni yuborgan bo'lsa, bot shu mavzuni qayta yubormasligi uchun uzunroq cooldown.
 const MANUAL_TOPIC_COOLDOWN_MS = Number(process.env.MANUAL_TOPIC_COOLDOWN_MS || 10 * 60 * 1000);
+// Side-question (narx/karta/qimmat) takrorini DB darajasida bloklaymiz.
+// Bu Telegram retry yoki timer qayta ishlashi sabab bir xil javob ikki marta ketishini to'xtatadi.
+const SIDE_ACTION_COOLDOWN_MS = Number(process.env.SIDE_ACTION_COOLDOWN_MS || 30 * 60 * 1000);
+// Admin botdan tezroq qo'lda javob berishi uchun side-questionlarda qisqa kutish.
+// Agar Telegram outgoing xabarni botga bersa, shu vaqt ichida manual sync yoziladi va bot takrorlamaydi.
+const SIDE_QUESTION_GRACE_MS = Number(process.env.SIDE_QUESTION_GRACE_MS || 12000);
+
+// Super AI Guard: AI qaroridan keyin ham kod xabarni yuborish xavfsizligini tekshiradi.
+// Maqsad: admin javobini takrorlamaslik, bir mavzuni qayta yubormaslik, stage sakrashlarini yopish.
+const SUPER_AI_GUARD_ENABLED = String(process.env.SUPER_AI_GUARD_ENABLED || 'true').toLowerCase() !== 'false';
+const SUPER_AI_CONTEXT_LIMIT = Number(process.env.SUPER_AI_CONTEXT_LIMIT || 20);
+const TOPIC_COOLDOWN_MS = Number(process.env.TOPIC_COOLDOWN_MS || 30 * 60 * 1000);
+const ADMIN_ACTIVITY_SUPPRESS_MS = Number(process.env.ADMIN_ACTIVITY_SUPPRESS_MS || 120000);
 
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL missing');
@@ -409,6 +422,11 @@ function leadCardKeyboard(lead) {
   rows.push([
     { text: '🔗 Ariza havolasi', callback_data: `lead:send_app:${chatId}` },
     { text: '📄 Ma’lumot berish', callback_data: `lead:send_info:${chatId}` }
+  ]);
+
+  rows.push([
+    { text: '👤 Admin oldi', callback_data: `lead:takeover:${chatId}` },
+    { text: '🤖 Bot davom etsin', callback_data: `lead:resume:${chatId}` }
   ]);
 
   rows.push([
@@ -816,6 +834,7 @@ async function maybeRecordOutgoingTopic(message) {
   else await createLead({ chatId, businessConnectionId, from: message.from || {}, text, status: patch.status, botEnabled: patch.bot_enabled });
   await updateLead(chatId, patch);
   await logEvent(chatId, `outgoing_topic_recorded_${topic.topic}`, text);
+  await recordTopicHandled(chatId, topic.topic, 'admin', text);
   return true;
 }
 
@@ -884,6 +903,220 @@ async function markPackageComplete(packageId) {
   } catch (err) {
     console.error('markPackageComplete:', err.message);
   }
+}
+
+
+function isCooldownProtectedAction(actionName = '') {
+  const a = String(actionName || '');
+  return a.startsWith('side_') || a.startsWith('return_');
+}
+
+async function wasActionRecentlySent(chatId, actionName, cooldownMs = SAME_ACTION_COOLDOWN_MS) {
+  if (!cooldownMs) return false;
+  try {
+    const since = new Date(Date.now() - Number(cooldownMs)).toISOString();
+    const { data, error } = await supabase
+      .from('response_packages')
+      .select('package_id,created_at')
+      .eq('chat_id', str(chatId))
+      .eq('action_name', String(actionName || ''))
+      .gte('created_at', since)
+      .limit(1);
+
+    if (error) {
+      console.error('wasActionRecentlySent:', error);
+      return false;
+    }
+    return Boolean(data && data.length);
+  } catch (err) {
+    console.error('wasActionRecentlySent:', err.message);
+    return false;
+  }
+}
+
+async function waitForPossibleManualSync(lead, text, sideType = '') {
+  if (!SIDE_QUESTION_GRACE_MS) return lead;
+  // Faqat yon savollar uchun kutamiz. Asosiy oqimni sekinlashtirmaymiz.
+  if (!['price', 'card', 'expensive'].includes(String(sideType))) return lead;
+  await sleep(SIDE_QUESTION_GRACE_MS);
+  return (await getLead(lead.chat_id)) || lead;
+}
+
+function normalizeTopicName(topic = '') {
+  const t = String(topic || '').replace(/^manual_/, '').replace(/^side_/, '').trim();
+  if (!t) return '';
+  if (['manual_price', 'price_reply', 'payment', 'badal', 'tolov'].includes(t)) return 'price';
+  if (['manual_card', 'card_reply', 'karta'].includes(t)) return 'card';
+  if (['manual_expensive', 'expensive_reply', 'qimmat'].includes(t)) return 'expensive';
+  if (['manual_intro', 'full_intro', 'short_intro', 'explain_reply', 'intro'].includes(t)) return 'intro';
+  if (['offer', 'offer_end', 'offer_instruction', 'return_offer_instruction', 'return_waiting_offer_read'].includes(t)) return 'offer';
+  if (['application_link', 'application_link_reply'].includes(t)) return 'application_link';
+  if (['bio_confirm', 'ask_bio_confirm'].includes(t)) return 'bio_confirm';
+  if (['bio_questions', 'questions'].includes(t)) return 'bio_questions';
+  return t;
+}
+
+function topicFromTemplateKey(templateKey = '') {
+  const key = String(templateKey || '');
+  if (key === 'price_reply') return 'price';
+  if (key === 'card_reply') return 'card';
+  if (key === 'expensive_reply') return 'expensive';
+  if (['full_intro', 'short_intro', 'explain_reply'].includes(key)) return 'intro';
+  if (['offer_end', 'offer_followup', 'return_waiting_offer_read'].includes(key)) return 'offer';
+  if (key === 'application_link_reply') return 'application_link';
+  if (key === 'ask_bio_confirm') return 'bio_confirm';
+  if (key === 'bio_questions') return 'bio_questions';
+  return '';
+}
+
+function topicFromActionName(actionName = '', resolved = []) {
+  const a = String(actionName || '');
+  if (a.includes('price')) return 'price';
+  if (a.includes('card')) return 'card';
+  if (a.includes('expensive')) return 'expensive';
+  if (a.includes('intro') || a.includes('explanation') || a.includes('info')) return 'intro';
+  if (a.includes('offer') || a.includes('waiting_offer')) return 'offer';
+  if (a.includes('application_link') || a.includes('send_app')) return 'application_link';
+  if (a.includes('bio_confirm')) return 'bio_confirm';
+  if (a.includes('bio_questions') || a.includes('questions')) return 'bio_questions';
+  for (const item of resolved || []) {
+    const t = topicFromTemplateKey(item.templateKey);
+    if (t) return t;
+  }
+  return '';
+}
+
+function topicFromIntent(intent = '') {
+  const i = String(intent || '');
+  if (i === 'price_question') return 'price';
+  if (i === 'card_question') return 'card';
+  if (i === 'expensive_question') return 'expensive';
+  if (i === 'explain_project' || i === 'has_info' || i === 'partial_info' || i === 'no_info') return 'intro';
+  if (i === 'read_offer' || i === 'ok_wait' || i === 'next_steps') return 'offer';
+  if (i === 'application_not_submitted' || i === 'application_denied' || i === 'application_submitted') return 'application_link';
+  if (i === 'agree_bio') return 'bio_questions';
+  return '';
+}
+
+function isSensitiveRepeatTopic(topic = '') {
+  return ['price', 'card', 'expensive', 'intro', 'offer', 'application_link', 'bio_confirm', 'bio_questions'].includes(normalizeTopicName(topic));
+}
+
+async function recentEvents(chatId, limit = SUPER_AI_CONTEXT_LIMIT) {
+  try {
+    const { data, error } = await supabase
+      .from('lead_events')
+      .select('event_type,message,created_at')
+      .eq('chat_id', str(chatId))
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (error) {
+      console.error('recentEvents:', error);
+      return [];
+    }
+    return data || [];
+  } catch (err) {
+    console.error('recentEvents:', err.message);
+    return [];
+  }
+}
+
+function eventMatchesTopic(event, topic) {
+  const t = normalizeTopicName(topic);
+  const e = String(event?.event_type || '').toLowerCase();
+  const m = normalizeText(event?.message || '');
+  if (!t || !e) return false;
+
+  if (e.includes(`topic_${t}`) || e.includes(`_${t}_`) || e.endsWith(`_${t}`)) return true;
+  if (t === 'price' && (e.includes('manual_price') || e.includes('side_price') || e.includes('price_reply') || hasAny(m, ['badal', '100 000', '100000', 'to‘lov', "to'lov", 'tolov', 'so‘m', "so'm"]))) return true;
+  if (t === 'card' && (e.includes('manual_card') || e.includes('side_card') || hasAny(m, ['karta raqam', 'karta egasi', 'rekvizit']))) return true;
+  if (t === 'expensive' && (e.includes('manual_expensive') || e.includes('side_expensive') || hasAny(m, ['qimmat', '14 kunda', 'bo‘lib', "bo'lib"]))) return true;
+  if (t === 'intro' && (e.includes('manual_intro') || e.includes('full_intro') || e.includes('short_intro') || hasAny(m, ['ensiklopediya', 'biografik maqola', 'google', 'portfolio', 'sertifikat']))) return true;
+  if (t === 'offer' && (e.includes('offer') || hasAny(m, ['oferta', 'tanishib chiqing', 'tanishdim']))) return true;
+  if (t === 'application_link' && (e.includes('application_link') || hasAny(m, ['ariza havolasi', 'ariza qoldiring', 'ariza qoldirish']))) return true;
+  if (t === 'bio_confirm' && (e.includes('bio_confirm') || hasAny(m, ['biografik maqola', 'yozamizmi']))) return true;
+  if (t === 'bio_questions' && (e.includes('bio_questions') || hasAny(m, ['ism familiyangiz', 'tug‘ilgan sana', 'tugilgan sana', 'rasm yuboring']))) return true;
+  return false;
+}
+
+async function wasTopicRecentlyHandled(chatId, topic, cooldownMs = TOPIC_COOLDOWN_MS) {
+  const t = normalizeTopicName(topic);
+  if (!SUPER_AI_GUARD_ENABLED || !t || !isSensitiveRepeatTopic(t)) return false;
+  const events = await recentEvents(chatId, 60);
+  const cutoff = Date.now() - Number(cooldownMs || TOPIC_COOLDOWN_MS);
+  return events.some(ev => {
+    const ts = new Date(ev.created_at).getTime();
+    if (!Number.isFinite(ts) || ts < cutoff) return false;
+    return eventMatchesTopic(ev, t);
+  });
+}
+
+async function recordTopicHandled(chatId, topic, source = 'bot', message = '') {
+  const t = normalizeTopicName(topic);
+  if (!t) return;
+  await logEvent(chatId, `topic_${t}_${source}`, message || t);
+}
+
+function enforceStageSafety(lead, intentResult, userText = '') {
+  const stage = lead?.stage || STAGE.NEW;
+  const forced = forceIntentByStage(userText, stage, intentResult);
+  let intent = forced.intent;
+  let confidence = Number(forced.confidence || 0.35);
+  let reason = 'stage_ok';
+
+  // Bio savollar faqat maqola taklifi bosqichida yuboriladi. Aks holda bot savollarga sakramaydi.
+  if (intent === 'questions_request' && stage !== STAGE.ASKED_BIO_CONFIRM) {
+    if (stage === STAGE.WAITING_OFFER_READ) {
+      intent = 'next_steps';
+      reason = 'questions_request_before_read_offer_blocked';
+    } else {
+      intent = 'unclear';
+      reason = 'questions_request_wrong_stage_blocked';
+    }
+  }
+
+  // Maqola taklifi faqat oferta o'qilgandan keyin.
+  if ((intent === 'agree_bio' || intent === 'read_offer') && ![STAGE.WAITING_OFFER_READ, STAGE.ASKED_BIO_CONFIRM].includes(stage)) {
+    intent = 'unclear';
+    reason = 'bio_or_read_offer_wrong_stage_blocked';
+  }
+
+  // Narx/karta/qimmat side-question bo'lib qoladi, stage'ni oldinga sakratmaydi.
+  if (['price_question', 'card_question', 'expensive_question'].includes(intent)) {
+    reason = 'side_question_stage_preserved';
+    confidence = Math.max(confidence, 0.9);
+  }
+
+  return { ...forced, intent, confidence, safety_reason: reason, topic: topicFromIntent(intent) };
+}
+
+async function superPreSendGuard(lead, actionName, resolved = []) {
+  if (!SUPER_AI_GUARD_ENABLED) return { ok: true, reason: 'disabled' };
+  const topic = topicFromActionName(actionName, resolved);
+  if (!topic || !isSensitiveRepeatTopic(topic)) return { ok: true, reason: 'non_sensitive' };
+
+  // Takroriy muhim mavzularni bloklaymiz. Bu admin/bot bir mavzuni qayta yuborib qo'yishini to'xtatadi.
+  const cooldown = ['price', 'card', 'expensive', 'intro'].includes(topic)
+    ? Math.max(TOPIC_COOLDOWN_MS, MANUAL_TOPIC_COOLDOWN_MS, SIDE_ACTION_COOLDOWN_MS)
+    : TOPIC_COOLDOWN_MS;
+  if (await wasTopicRecentlyHandled(lead.chat_id, topic, cooldown)) {
+    return { ok: false, reason: `topic_${topic}_recently_handled`, topic };
+  }
+
+  // Agar admin yaqinda chatga qo'lda xabar yozgan bo'lsa va biz aniq mavzuni ko'ra olgan bo'lsak, bot aralashmaydi.
+  const events = await recentEvents(lead.chat_id, 20);
+  const cutoff = Date.now() - ADMIN_ACTIVITY_SUPPRESS_MS;
+  const recentManual = events.some(ev => {
+    const ts = new Date(ev.created_at).getTime();
+    if (!Number.isFinite(ts) || ts < cutoff) return false;
+    const e = String(ev.event_type || '');
+    return e.startsWith('outgoing_topic_recorded_') || e.includes('manual_');
+  });
+  if (recentManual && ['price', 'card', 'expensive', 'intro', 'offer'].includes(topic)) {
+    return { ok: false, reason: `recent_admin_activity_suppressed_${topic}`, topic };
+  }
+
+  return { ok: true, reason: 'safe', topic };
 }
 
 async function reservePackageMessage(packageId, chatId, messageIndex, templateKey) {
@@ -1261,9 +1494,25 @@ async function sendResponsePackage({ lead, turnId = 'manual', actionName, items 
   const resolved = await resolvePackageItems(items);
   if (resolved.length === 0) return lead;
 
+  const superGuard = await superPreSendGuard(lead, actionName, resolved);
+  if (!superGuard.ok) {
+    await logEvent(lead.chat_id, `super_guard_skipped_${actionName}`, `${superGuard.reason}: ${resolved[0]?.text || ''}`);
+    return lead;
+  }
+
   if (shouldSuppressRepeatedSingleAction(lead, resolved, actionName)) {
     await logEvent(lead.chat_id, `same_action_cooldown_skipped_${actionName}`, resolved[0]?.text || '');
     return lead;
+  }
+
+  // Action-level cooldown: bir xil yon savol/return javobi turli turnId bilan qayta ishlansa ham takror ketmasin.
+  if (isCooldownProtectedAction(actionName)) {
+    const actionCooldown = String(actionName || '').startsWith('side_') ? SIDE_ACTION_COOLDOWN_MS : SAME_ACTION_COOLDOWN_MS;
+    const recentlySent = await wasActionRecentlySent(lead.chat_id, actionName, actionCooldown);
+    if (recentlySent) {
+      await logEvent(lead.chat_id, `recent_action_skipped_${actionName}`, resolved[0]?.text || '');
+      return lead;
+    }
   }
 
   const packageReserved = await ensureResponsePackage(packageId, lead.chat_id, turnId, actionName);
@@ -1319,6 +1568,8 @@ async function sendResponsePackage({ lead, turnId = 'manual', actionName, items 
   }
 
   await markPackageComplete(packageId);
+  const sentTopic = topicFromActionName(actionName, resolved);
+  if (sentTopic) await recordTopicHandled(lead.chat_id, sentTopic, 'bot', combined);
   const updated = await updateLead(lead.chat_id, update);
   return updated || { ...lead, ...update };
 }
@@ -1414,17 +1665,31 @@ async function sendFullIntroFlow(lead, turnId = 'manual') {
   });
 }
 
-async function sendSideQuestionReply(lead, templateKey, sideType, turnId = 'manual') {
-  const returnText = await sideQuestionReturnText(lead, sideType);
+async function sendSideQuestionReply(lead, templateKey, sideType, turnId = 'manual', userText = '') {
+  // Admin bilan bir butun ishlash: narx/karta/qimmat so'ralganda qisqa kutamiz.
+  // Agar admin shu orada qo'lda javob yuborgan bo'lsa va Telegram uni botga ko'rsatgan bo'lsa, manual sync sabab bot takrorlamaydi.
+  let freshLead = await waitForPossibleManualSync(lead, userText, sideType);
+  if (shouldSkipForRecentManualSync(freshLead, userText || freshLead.last_user_message || '')) {
+    await logEvent(freshLead.chat_id, `side_${sideType}_skipped_manual_sync`, userText || '');
+    return freshLead;
+  }
+
+  const actionName = `side_${sideType}`;
+  if (await wasActionRecentlySent(freshLead.chat_id, actionName, SIDE_ACTION_COOLDOWN_MS)) {
+    await logEvent(freshLead.chat_id, `side_${sideType}_skipped_recent_action`, userText || '');
+    return freshLead;
+  }
+
+  const returnText = await sideQuestionReturnText(freshLead, sideType);
   return sendResponsePackage({
-    lead,
+    lead: freshLead,
     turnId,
-    actionName: `side_${sideType}`,
+    actionName,
     items: [
       { templateKey },
-      { text: returnText, templateKey: `return_${lead.stage}` }
+      { text: returnText, templateKey: `return_${freshLead.stage}` }
     ],
-    nextStage: lead.stage,
+    nextStage: freshLead.stage,
     patch: { last_bot_template_key: templateKey, ai_intent: `side_${sideType}_sent` }
   });
 }
@@ -1453,8 +1718,8 @@ async function sendBioQuestionsAndStop(lead, turnId = 'manual') {
 }
 
 async function continueByIntent(lead, intentResult, userText = '', turnId = 'manual') {
-  // Yakuniy himoya: AI noto'g'ri tushunsa ham stage-specific qoida yutadi.
-  const forced = forceIntentByStage(userText, lead.stage, intentResult);
+  // Super AI safety: AI noto'g'ri tushunsa ham stage guard va biznes qoidalar yutadi.
+  const forced = enforceStageSafety(lead, intentResult, userText);
   const { intent, confidence } = forced;
 
   // Aniq rad bo'lsa to'xtaydi. Oddiy "yo'q" yoki "tanimadim" kabi gaplar bridge orqali aniqlashtiriladi.
@@ -1520,18 +1785,18 @@ Xabar: ${htmlEscape(clip(userText, 700))}`);
 
   // Yon savollar: narx/karta/qimmat asosiy stage'ni buzmaydi, javobdan keyin o'sha savolga qaytaradi.
   if (intent === 'price_question') {
-    await sendSideQuestionReply(lead, 'price_reply', 'price', turnId);
+    await sendSideQuestionReply(lead, 'price_reply', 'price', turnId, userText);
     return;
   }
 
   if (intent === 'card_question') {
     await updateLead(lead.chat_id, { hot_lead: true });
-    await sendSideQuestionReply(lead, 'card_reply', 'card', turnId);
+    await sendSideQuestionReply(lead, 'card_reply', 'card', turnId, userText);
     return;
   }
 
   if (intent === 'expensive_question') {
-    await sendSideQuestionReply(lead, 'expensive_reply', 'expensive', turnId);
+    await sendSideQuestionReply(lead, 'expensive_reply', 'expensive', turnId, userText);
     return;
   }
 
@@ -2056,9 +2321,13 @@ async function showLeadList(chatId, type, edit = null) {
 async function leadCardText(chatId) {
   const lead = await getLead(chatId);
   if (!lead) return { lead: null, text: `Chat ID ${chatId} bo‘yicha lid topilmadi.` };
+  const events = await recentEvents(chatId, 5);
+  const audit = events.length
+    ? events.map(ev => `— ${ev.event_type}: ${clip(ev.message || '', 120)}`).join('\n')
+    : '-';
   return {
     lead,
-    text: `👤 Lid kartochkasi\n\nIsm: ${lead.first_name || '-'}\nUsername: ${lead.username ? '@' + lead.username : '-'}\nChat ID: ${lead.chat_id}\nStatus: ${lead.status}\nStage: ${lead.stage}\nOldingi stage: ${lead.review_stage || '-'}\nBot: ${lead.bot_enabled ? 'yoqilgan' : 'o‘chirilgan'}\nAI intent: ${lead.ai_intent || '-'}\nAI ishonch: ${lead.ai_confidence ?? '-'}\n\nOxirgi xabar:\n${lead.last_user_message || '-'}\n\nOxirgi bot javobi:\n${clip(lead.last_bot_message || '-', 700)}`
+    text: `👤 Lid kartochkasi\n\nIsm: ${lead.first_name || '-'}\nUsername: ${lead.username ? '@' + lead.username : '-'}\nChat ID: ${lead.chat_id}\nStatus: ${lead.status}\nStage: ${lead.stage}\nOldingi stage: ${lead.review_stage || '-'}\nBot: ${lead.bot_enabled ? 'yoqilgan' : 'o‘chirilgan'}\nAI intent: ${lead.ai_intent || '-'}\nAI ishonch: ${lead.ai_confidence ?? '-'}\nOxirgi template/topic: ${lead.last_bot_template_key || '-'}\n\nOxirgi xabar:\n${lead.last_user_message || '-'}\n\nOxirgi bot/admin javobi:\n${clip(lead.last_bot_message || '-', 700)}\n\nMini audit:\n${audit}`
   };
 }
 
@@ -2457,8 +2726,25 @@ async function handleCallback(query) {
   if (data.startsWith('lead:on:')) {
     const leadChatId = data.split(':')[2];
     const lead = await getLead(leadChatId);
-    const stage = [STAGE.PAUSED, STAGE.NEEDS_ADMIN].includes(lead?.stage) ? (lead?.review_stage || STAGE.ASKED_APPLICATION) : lead?.stage;
+    const stage = [STAGE.PAUSED, STAGE.NEEDS_ADMIN, STAGE.HUMAN_NEEDED].includes(lead?.stage) ? (lead?.review_stage || STAGE.ASKED_APPLICATION) : lead?.stage;
     await updateLead(leadChatId, { status: STATUS.ACTIVE, bot_enabled: true, stage, review_stage: null });
+    return showLeadCard(chatId, leadChatId, { messageId });
+  }
+
+  if (data.startsWith('lead:takeover:')) {
+    const leadChatId = data.split(':')[2];
+    const lead = await getLead(leadChatId);
+    await updateLead(leadChatId, { status: STATUS.HUMAN_NEEDED, bot_enabled: false, review_stage: lead?.stage || null, stage: STAGE.HUMAN_NEEDED, ai_intent: 'admin_takeover_manual', ai_confidence: 1 });
+    await logEvent(leadChatId, 'manual_admin_takeover_enabled', 'Admin oldi tugmasi bosildi');
+    return showLeadCard(chatId, leadChatId, { messageId });
+  }
+
+  if (data.startsWith('lead:resume:')) {
+    const leadChatId = data.split(':')[2];
+    const lead = await getLead(leadChatId);
+    const stage = lead?.review_stage || (lead?.stage === STAGE.HUMAN_NEEDED ? STAGE.ASKED_APPLICATION : lead?.stage) || STAGE.ASKED_APPLICATION;
+    await updateLead(leadChatId, { status: STATUS.ACTIVE, bot_enabled: true, stage, review_stage: null, ai_intent: 'admin_bot_resumed', ai_confidence: 1 });
+    await logEvent(leadChatId, 'manual_admin_takeover_disabled', 'Bot davom etsin tugmasi bosildi');
     return showLeadCard(chatId, leadChatId, { messageId });
   }
 
