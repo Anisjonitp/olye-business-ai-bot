@@ -1076,6 +1076,63 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, time: nowIso() });
 });
 
+// Browser orqali /webhook ochilganda "Cannot GET /webhook" chiqmasligi uchun.
+// Telegram webhook update'larni baribir POST orqali yuboradi.
+app.get('/webhook', (req, res) => {
+  res.json({
+    ok: true,
+    message: "Webhook endpoint ishlayapti. Telegram update'larni POST orqali yuboradi.",
+    method: 'POST /webhook'
+  });
+});
+
+
+// Brauzer orqali webhook ulash uchun qulay route.
+// Render URL: https://SENING-SERVICE.onrender.com/set-webhook
+app.get('/set-webhook', async (req, res) => {
+  try {
+    const host = req.get('host');
+    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+    const webhookUrl = process.env.WEBHOOK_URL || `${proto}://${host}/webhook`;
+
+    const payload = {
+      url: webhookUrl,
+      allowed_updates: ['message', 'callback_query', 'business_message']
+    };
+
+    if (WEBHOOK_SECRET) {
+      payload.secret_token = WEBHOOK_SECRET;
+    }
+
+    const result = await tg('setWebhook', payload);
+
+    res.json({
+      ok: true,
+      message: 'Webhook ulandi.',
+      webhook_url: webhookUrl,
+      allowed_updates: payload.allowed_updates,
+      result
+    });
+  } catch (err) {
+    console.error('set-webhook route error:', err);
+    res.status(500).json({
+      ok: false,
+      error: err.message
+    });
+  }
+});
+
+// Webhook holatini brauzerda tekshirish uchun.
+app.get('/webhook-info', async (req, res) => {
+  try {
+    const result = await tg('getWebhookInfo', {});
+    res.json({ ok: true, result });
+  } catch (err) {
+    console.error('webhook-info route error:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post('/webhook', async (req, res) => {
   try {
     if (WEBHOOK_SECRET) {

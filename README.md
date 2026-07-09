@@ -61,6 +61,22 @@ FIRST_CONTACT_MODE=approval
 
 ## Webhook ulash
 
+Eng oson yo‘l: Render deploy bo‘lgandan keyin brauzerda shu URL’ni oching:
+
+```text
+https://SENING-RENDER-URL.onrender.com/set-webhook
+```
+
+Agar JSON ichida `ok: true` va `Webhook ulandi` chiqsa, webhook ulangan bo‘ladi.
+
+Webhook holatini ko‘rish uchun:
+
+```text
+https://SENING-RENDER-URL.onrender.com/webhook-info
+```
+
+Qo‘lda curl orqali ulash varianti ham bor:
+
 Render saytingiz URL'i masalan shunday bo'lsa:
 
 ```text
