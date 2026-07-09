@@ -29,6 +29,15 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 const FIRST_CONTACT_MODE = (process.env.FIRST_CONTACT_MODE || 'silent_queue').toLowerCase();
 const AI_CONFIDENCE_MIN = Number(process.env.AI_CONFIDENCE_MIN || 0.65);
 
+// Aqlli turn processing:
+// - lid ketma-ket yozgan xabarlarni bitta batch qiladi;
+// - bitta chatda bir vaqtda faqat bitta jarayon ishlaydi;
+// - bot yangi savol yuborgandan keyin juda qisqa/generic davom-xabarlarni keyingi javob deb olmaydi.
+const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 7000);
+const TURN_COOLDOWN_MS = Number(process.env.TURN_COOLDOWN_MS || 12000);
+const MAX_BATCH_MESSAGES = Number(process.env.MAX_BATCH_MESSAGES || 8);
+const MAX_BATCH_CHARS = Number(process.env.MAX_BATCH_CHARS || 3000);
+
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL missing');
 if (!SUPABASE_KEY) throw new Error('SUPABASE key missing');
@@ -37,6 +46,10 @@ if (!ADMIN_CHAT_ID) console.warn('ADMIN_CHAT_ID missing. Admin menu will not wor
 const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+
+// Per-chat in-memory turn queue. Render'da odatda bitta instance bo'ladi;
+// shuning uchun bu Telegram webhook burstlarini tartiblash uchun yetarli va tez.
+const businessTurnBuffers = new Map();
 
 const STAGE = Object.freeze({
   NEW: 'new',
@@ -102,6 +115,17 @@ function htmlEscape(text = '') {
 function clip(text = '', max = 3500) {
   const s = String(text || '');
   return s.length <= max ? s : s.slice(0, max - 20) + '\n...';
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function msSince(iso) {
+  if (!iso) return Infinity;
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return Infinity;
+  return Date.now() - t;
 }
 
 function normalizeText(text = '') {
@@ -661,6 +685,8 @@ async function sendTemplateToLead({ lead, templateKey, nextStage, stop = false, 
 
   const update = {
     last_bot_message: body,
+    last_bot_sent_at: nowIso(),
+    last_bot_template_key: templateKey,
     stage: nextStage || lead.stage,
     ...patch
   };
@@ -838,6 +864,165 @@ async function continueByIntent(lead, intentResult, userText = '') {
   await moveToNeedsAdmin(lead, userText, intentResult);
 }
 
+function compactBatchTexts(texts = []) {
+  const cleaned = texts
+    .map(x => String(x || '').trim())
+    .filter(Boolean)
+    .slice(-MAX_BATCH_MESSAGES);
+  const joined = cleaned.join('\n').slice(0, MAX_BATCH_CHARS).trim();
+  return joined || '[empty]';
+}
+
+function isLikelyTrailingContinuation(text, lead) {
+  if (!lead?.last_bot_sent_at) return false;
+  if (msSince(lead.last_bot_sent_at) > TURN_COOLDOWN_MS) return false;
+
+  const t = normalizeText(text);
+  if (!t) return false;
+
+  // Agar lid shu batchda aniq savol yoki aniq javob bersa, uni ignore qilmaymiz.
+  const explicitSignals = [
+    'yoq', "yo'q", 'yo‘q', 'bor', 'bilmayman', 'egaman', 'malumotim', "ma'lumotim", 'ma’lumotim',
+    'pullik', 'narx', 'qancha', 'karta', 'qimmat', 'tanishdim', 'oqib chiqdim', "o'qib chiqdim", 'o‘qib chiqdim',
+    'savollarni yuboring', 'savol yuboring', 'nima qilish kerak', 'nima bu', 'tushuntiring'
+  ];
+  if (hasAny(t, explicitSignals)) return false;
+
+  const genericTrailing = [
+    'shunaqa', 'ha shunaqa', 'xa shunaqa', 'ha shunday', 'xa shunday', 'shunday',
+    'albatta', 'togri', "to'g'ri", 'to‘g‘ri', 'rost', 'ha endi', 'xa endi'
+  ];
+
+  // Masalan: bot "ma'lumotga egamisiz?" deb yubordi, lid esa 2-3 soniyadan keyin
+  // "shunaqa" deb oldingi fikrini davom ettirdi. Buni keyingi bosqich javobi deb olmaymiz.
+  if (lead.stage === STAGE.ASKED_INFO && lead.last_bot_template_key === 'ask_info') {
+    return isExactAny(t, genericTrailing);
+  }
+
+  // Oferta yuborilgandan keyin "shunaqa/albatta" kabi gaplar ko'pincha eski fikr davomi bo'lishi mumkin.
+  // "tanishdim" yoki "ho'p" explicitSignals orqali o'tib ketadi.
+  if (lead.stage === STAGE.WAITING_OFFER_READ && lead.last_bot_template_key === 'offer_end') {
+    return isExactAny(t, genericTrailing);
+  }
+
+  return false;
+}
+
+function enqueueBusinessTurn({ chatId, businessConnectionId, from, text }) {
+  const key = str(chatId);
+  let entry = businessTurnBuffers.get(key);
+
+  if (!entry) {
+    entry = {
+      texts: [],
+      latest: null,
+      timer: null,
+      processing: false
+    };
+    businessTurnBuffers.set(key, entry);
+  }
+
+  entry.texts.push(text);
+  if (entry.texts.length > MAX_BATCH_MESSAGES) {
+    entry.texts = entry.texts.slice(-MAX_BATCH_MESSAGES);
+  }
+
+  entry.latest = { chatId, businessConnectionId, from };
+
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.timer = setTimeout(() => {
+    drainBusinessTurnBuffer(key).catch(err => console.error('drainBusinessTurnBuffer:', err));
+  }, MESSAGE_BUFFER_MS);
+}
+
+async function drainBusinessTurnBuffer(chatId) {
+  const entry = businessTurnBuffers.get(str(chatId));
+  if (!entry) return;
+
+  if (entry.processing) {
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      drainBusinessTurnBuffer(chatId).catch(err => console.error('drainBusinessTurnBuffer:', err));
+    }, MESSAGE_BUFFER_MS);
+    return;
+  }
+
+  entry.processing = true;
+  if (entry.timer) {
+    clearTimeout(entry.timer);
+    entry.timer = null;
+  }
+
+  const texts = entry.texts.splice(0, entry.texts.length);
+  const latest = entry.latest;
+  const batchText = compactBatchTexts(texts);
+
+  try {
+    if (latest && batchText && batchText !== '[empty]') {
+      await processBusinessTurn({ ...latest, text: batchText, messageCount: texts.length });
+    }
+  } finally {
+    entry.processing = false;
+
+    // Agar bot javob berayotgan paytda yangi xabar kelgan bo'lsa, uni alohida keyingi turn qilib ishlaymiz.
+    // Shu bilan bitta lid uchun parallel javoblar chiqmaydi.
+    if (entry.texts.length > 0) {
+      entry.timer = setTimeout(() => {
+        drainBusinessTurnBuffer(chatId).catch(err => console.error('drainBusinessTurnBuffer:', err));
+      }, MESSAGE_BUFFER_MS);
+    } else {
+      businessTurnBuffers.delete(str(chatId));
+    }
+  }
+}
+
+async function processBusinessTurn({ chatId, businessConnectionId, from, text, messageCount = 1 }) {
+  let lead = await findOrCreateLead({
+    chatId,
+    businessConnectionId,
+    from,
+    text,
+    status: STATUS.ACTIVE,
+    botEnabled: true
+  });
+  if (!lead) return;
+
+  if (!lead.bot_enabled || FINAL_STATUSES.has(lead.status) || STOP_STAGES.has(lead.stage)) {
+    await updateLead(chatId, {
+      last_user_message: text,
+      last_message_at: nowIso(),
+      business_connection_id: businessConnectionId || lead.business_connection_id
+    });
+    await logEvent(chatId, 'ignored_not_active_batch', text);
+    return;
+  }
+
+  // Bot yangi savol yuborgandan keyingi juda qisqa "shunaqa/albatta" kabi davom-xabarlar
+  // keyingi bosqich javobi deb olinmaydi. Bu screenshotdagi sakrash xatosini to'xtatadi.
+  if (isLikelyTrailingContinuation(text, lead)) {
+    await updateLead(chatId, {
+      last_user_message: text,
+      last_message_at: nowIso(),
+      business_connection_id: businessConnectionId || lead.business_connection_id
+    });
+    await logEvent(chatId, 'ignored_trailing_continuation', text);
+    return;
+  }
+
+  const intentResult = await aiIntent(text, lead.stage);
+  await updateLead(chatId, {
+    last_user_message: text,
+    last_message_at: nowIso(),
+    business_connection_id: businessConnectionId || lead.business_connection_id,
+    ai_intent: intentResult.intent,
+    ai_confidence: intentResult.confidence
+  });
+  await logEvent(chatId, `intent_${intentResult.intent}_${intentResult.confidence}_batch_${messageCount}`, text);
+
+  lead = await getLead(chatId) || lead;
+  await continueByIntent(lead, intentResult, text);
+}
+
 async function handleBusinessMessage(message) {
   const text = message?.text || message?.caption || '';
   const chatId = message?.chat?.id;
@@ -852,14 +1037,12 @@ async function handleBusinessMessage(message) {
   if (!firstTime) return;
 
   // O'zimiz/admin yuborgan yoki botdan kelgan xabarlarni qayta ishlamaymiz.
-  // MUHIM: Render env'da BUSINESS_OWNER_ID yoki OWNER_TELEGRAM_ID to'g'ri qo'yilmasa,
-  // Telegram Business'da o'zingiz yozgan xabarga bot javob berib yuborishi mumkin.
   if (isIgnoredBusinessSender(message)) {
     await logEvent(chatId, 'ignored_owner_or_bot_message', text || '[non-text]');
     return;
   }
 
-  const textForDb = text.trim() ? text : '[non-text message]';
+  const textForDb = text.trim() ? text.trim() : '[non-text message]';
   const existingLeadBeforeMessage = await getLead(chatId);
 
   // DB'da yo'q chat: default silent_queue. Bot ham, admin ham spam qilmaydi.
@@ -876,22 +1059,19 @@ async function handleBusinessMessage(message) {
     return;
   }
 
-  let lead = await findOrCreateLead({
-    chatId,
-    businessConnectionId,
-    from,
-    text: textForDb,
-    status: FIRST_CONTACT_MODE === 'approval' ? STATUS.PENDING : STATUS.ACTIVE,
-    botEnabled: FIRST_CONTACT_MODE !== 'approval'
-  });
-  if (!lead) return;
-
   if (!existingLeadBeforeMessage && FIRST_CONTACT_MODE === 'approval') {
-    await updateLead(chatId, { status: STATUS.PENDING, bot_enabled: false, stage: STAGE.NEW });
+    const lead = await createLead({
+      chatId,
+      businessConnectionId,
+      from,
+      text: textForDb,
+      status: STATUS.PENDING,
+      botEnabled: false
+    });
     await logEvent(chatId, 'pending_first_contact_approval', textForDb);
     await sendAdmin(
       `🆕 Yangi/aniqlanmagan chat yozdi. Bot hozircha javob bermadi.\n\nChat ID: <code>${htmlEscape(chatId)}</code>\nIsm: ${htmlEscape(from.first_name || '')}\nUsername: ${from.username ? '@' + htmlEscape(from.username) : '-'}\n\nXabar: ${htmlEscape(clip(textForDb, 800))}`,
-      { reply_markup: leadCardKeyboard({ ...lead, chat_id: str(chatId), status: STATUS.PENDING, stage: STAGE.NEW }) }
+      { reply_markup: leadCardKeyboard({ ...(lead || {}), chat_id: str(chatId), status: STATUS.PENDING, stage: STAGE.NEW }) }
     );
     return;
   }
@@ -901,20 +1081,21 @@ async function handleBusinessMessage(message) {
     return;
   }
 
-  if (!lead.bot_enabled || FINAL_STATUSES.has(lead.status) || STOP_STAGES.has(lead.stage)) {
-    await logEvent(chatId, 'ignored_not_active', textForDb);
+  // Pending/disabled/stopped chatlarda bot javob bermaydi, faqat oxirgi xabarni yangilab qo'yadi.
+  if (existingLeadBeforeMessage && (!existingLeadBeforeMessage.bot_enabled || FINAL_STATUSES.has(existingLeadBeforeMessage.status) || STOP_STAGES.has(existingLeadBeforeMessage.stage))) {
+    await updateLead(chatId, {
+      business_connection_id: businessConnectionId || existingLeadBeforeMessage.business_connection_id,
+      first_name: from?.first_name || existingLeadBeforeMessage.first_name,
+      username: from?.username || existingLeadBeforeMessage.username,
+      last_user_message: textForDb,
+      last_message_at: nowIso()
+    });
+    await logEvent(chatId, 'queued_or_inactive_updated_only', textForDb);
     return;
   }
 
-  const intentResult = await aiIntent(text, lead.stage);
-  await updateLead(chatId, {
-    ai_intent: intentResult.intent,
-    ai_confidence: intentResult.confidence
-  });
-  await logEvent(chatId, `intent_${intentResult.intent}_${intentResult.confidence}`, text);
-
-  lead = await getLead(chatId) || lead;
-  await continueByIntent(lead, intentResult, text);
+  // Auto/active chatlar: darrov javob bermaymiz; avval per-chat turn queue'ga tushadi.
+  enqueueBusinessTurn({ chatId, businessConnectionId, from, text: textForDb });
 }
 
 // -------------------- Reports and lists --------------------

@@ -19,11 +19,12 @@ Bot CRM emas. Vazifasi bitta: lidni tartibli savdo oqimidan olib o‘tib, bio sa
 - `silent_queue`: yangi/aniqlanmagan chatlar adminni spam qilmaydi.
 - AI intent: “instagramda qoldirdim”, “do‘stim aytdi”, “yozgandim” kabi g‘alati javoblarni tushunadi.
 - Stage sistemi: “ha” har bosqichda to‘g‘ri talqin qilinadi.
-- AI tushunmasa: mijozga xato javob yubormaydi, oldingi stage saqlanadi va `⚠️ AI tushunmaganlar` ro‘yxatiga tushadi.
+- AI tushunmasa: dastlabki bosqichlarda eng xavfsiz yo‘l bilan shablon bo‘yicha batafsil tushuntiradi; juda noaniq holatda admin ro‘yxatiga tushadi.
 - Rad javob: “kerak emas”, “qiziq emas” desa bot yumshoq yakunlaydi va to‘xtaydi.
 - Keyinroq: “hozir bandman”, “keyinroq” desa bot keyinroqqa qo‘yadi.
 - Narx savoli: “narxi qancha?”, “pullikmi?” desa tayyor shablondan javob beradi.
 - Duplicate protection: bir xil Telegram message qayta kelsa, bot ikki marta javob bermaydi.
+- Aqlli turn queue: lid ketma-ket xabar yozsa, bot ularni bitta javob deb ko‘radi va bir vaqtda bir nechta javob yuborib tashlamaydi.
 - Admin tugmali panel: ro‘yxatlar, lid kartochkasi, shablon tahrirlash.
 
 ## Fayllar
@@ -65,6 +66,10 @@ OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4.1-mini
 AI_CONFIDENCE_MIN=0.65
 FIRST_CONTACT_MODE=silent_queue
+MESSAGE_BUFFER_MS=7000
+TURN_COOLDOWN_MS=12000
+MAX_BATCH_MESSAGES=8
+MAX_BATCH_CHARS=3000
 WEBHOOK_URL=https://your-render-service.onrender.com/webhook
 ```
 
@@ -165,6 +170,9 @@ offer_end
 ask_bio_confirm
 bio_questions
 price_reply
+card_reply
+expensive_reply
+next_steps_reply
 later_reply
 reject_reply
 ```
@@ -185,6 +193,11 @@ agree_bio
 reject
 later
 price_question
+card_question
+expensive_question
+explain_project
+next_steps
+questions_request
 unclear
 ```
 
@@ -234,3 +247,33 @@ Bot erkin matn yozmaydi, lekin odamning savolini ma'no bo'yicha intentga ajratad
 - `savollarni yuboring` → `bio_questions` va bot shu chatda to'xtaydi
 
 Karta raqam va narx matnlarini `/templates` orqali o'zingiz tahrirlang.
+
+
+## Aqlli turn queue: bir lid bir vaqtda ko'p xabar yozsa
+
+Bu versiyada bot `har xabar = yangi javob` deb ishlamaydi. Har bir chat uchun kichik navbat bor:
+
+```text
+1. Lid ketma-ket xabar yozsa, bot MESSAGE_BUFFER_MS davomida kutadi.
+2. Shu vaqt ichidagi xabarlarni bitta batch qiladi.
+3. Bitta chatda bir vaqtda faqat bitta process ishlaydi.
+4. Bot savol yuborgandan keyin `shunaqa/albatta` kabi qisqa davom-xabarlar TURN_COOLDOWN_MS ichida kelsa, ularni keyingi savolga javob deb olmaydi.
+```
+
+Tavsiya qilingan sozlama:
+
+```env
+MESSAGE_BUFFER_MS=7000
+TURN_COOLDOWN_MS=12000
+MAX_BATCH_MESSAGES=8
+MAX_BATCH_CHARS=3000
+```
+
+Masalan lid shunday yozsa:
+
+```text
+Albatta
+Shunaqa
+```
+
+bot buni bitta batch qiladi va faqat `ask_info` bosqichiga o'tadi. `Shunaqa`ni darrov keyingi savolga javob deb olib, full info yuborib tashlamaydi.

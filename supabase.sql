@@ -17,6 +17,8 @@ create table if not exists business_leads (
   review_stage text,
   ai_intent text,
   ai_confidence numeric,
+  last_bot_sent_at timestamptz,
+  last_bot_template_key text,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
@@ -34,6 +36,8 @@ alter table business_leads add column if not exists last_message_at timestamptz 
 alter table business_leads add column if not exists review_stage text;
 alter table business_leads add column if not exists ai_intent text;
 alter table business_leads add column if not exists ai_confidence numeric;
+alter table business_leads add column if not exists last_bot_sent_at timestamptz;
+alter table business_leads add column if not exists last_bot_template_key text;
 alter table business_leads add column if not exists created_at timestamptz default now();
 alter table business_leads add column if not exists updated_at timestamptz default now();
 
