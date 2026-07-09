@@ -1,8 +1,9 @@
 {
-  "name": "olye-business-ai-crm-bot",
-  "version": "5.0.0",
-  "description": "Telegram Business AI CRM bot for OLYE",
+  "name": "olye-business-ai-bot-v5-lite",
+  "version": "5.0.0-lite",
+  "description": "OLYE Telegram Business AI Bot v5 Lite",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
@@ -10,11 +11,9 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.4",
-    "axios": "^1.7.7",
+    "@supabase/supabase-js": "^2.49.4",
+    "dotenv": "^16.4.7",
     "express": "^4.18.3",
-    "form-data": "^4.0.0",
-    "openai": "^4.67.1",
-    "xlsx": "^0.18.5"
+    "openai": "^6.0.0"
   }
 }

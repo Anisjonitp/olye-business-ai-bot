@@ -1,22 +1,25 @@
-# OLYE Business AI CRM Bot v5
+# OLYE Business AI Bot v5 Lite
 
-Bu versiya Telegram Business profilingizga ulangan CRM bot.
+Bu bot Telegram Business profilingiz nomidan yangi lidlarni biografik savollargacha olib keladi.
 
-## Asosiy funksiyalar
+Botning vazifasi oddiy:
 
-- Tugmali admin panel: Hisobot, Lidlar, To‘lovlar, Eslatmalar, Shablonlar, Ssenariy qurish, Chek tekshirish, Maqola jarayoni, Excel.
-- Faqat yangi lidlarga avtomatik javob.
-- Eski lid qayta yozsa, bot javob bermaydi, admin chatga signal beradi.
-- Har bir chatda botni tugma bilan yoqish/o‘chirish.
-- Har bir lid uchun status: qayerda to‘xtagani aniq ko‘rinadi.
-- Chala qolgan lidlarni guruhlash.
-- Ommaviy chegirma yuborish: faqat admin tasdiqlasa ketadi.
-- 14 kunlik bo‘lib to‘lash: boshlang‘ich to‘lov, 5/10/14-kun eslatmalar.
-- Rozilik arxivi: `MEN YAKUNIY SHARTLARGA ROZIMAN` yozsa saqlanadi.
-- Chek rasmini AI orqali o‘qish va admin tasdiqlashi.
-- Shablonlarni tugma orqali tahrirlash.
-- AI ssenariy quruvchi: oddiy tilda yangi qadam qo‘shish.
-- Excel eksport.
+1. Siz odamga Telegramda birinchi yozasiz: `Assalomu alaykum, yaxshimisiz?`
+2. Odam javob bersa, bot xavfsiz rejimda avval admin chatga signal beradi.
+3. Admin `✅ Oqimni boshlash` tugmasini bossa, bot savdo oqimini davom ettiradi.
+4. Agar bu eski yozishma bo'lsa, admin `🔕 Eski chat / botni o'chirish` tugmasini bosadi.
+5. Bot ariza, ma'lumot, oferta va maqola taklifini bosqichma-bosqich olib boradi.
+6. Biografik savollar yuborilgach bot shu chatda to'xtaydi.
+7. Qolgan ishlarni o'zingiz qo'lda davom ettirasiz.
+
+## Fayllar
+
+```text
+index.js          Asosiy bot kodi
+package.json      Render uchun Node sozlamalari
+.env.example      Environment variables namunasi
+supabase.sql      Supabase jadvallar va boshlang'ich shablonlar
+```
 
 ## Render sozlamalari
 
@@ -34,44 +37,144 @@ node index.js
 
 ## Environment Variables
 
-Render → Environment Variables:
-
-```env
-BOT_TOKEN=BotFather_token
-ADMIN_CHAT_ID=sizning_telegram_id
-BUSINESS_OWNER_ID=sizning_telegram_id
-TELEGRAM_WEBHOOK_SECRET=oddiy_maxfiy_soz
-
-SUPABASE_URL=https://xxxxx.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=supabase_service_role_key
-
-OPENAI_API_KEY=openai_api_key
-OPENAI_MODEL=gpt-4.1-mini
-OPENAI_VISION_MODEL=gpt-4.1-mini
-
-AUTO_REPLY_ENABLED=true
-TOTAL_AMOUNT=100000
-INITIAL_PAYMENT_AMOUNT=40000
-DAILY_REPORT_HOUR=21
-TZ=Asia/Tashkent
-```
-
-## O‘rnatish tartibi
-
-1. `schema.sql` ni Supabase → SQL Editor → New query → Run qiling.
-2. GitHub repo rootiga fayllarni yuklang: `index.js`, `templates.js`, `package.json`, `schema.sql`, `README.md`.
-3. Render’da Manual Deploy → Deploy latest commit qiling.
-4. Deploy tugagach brauzerda webhook ulang:
+Render → Environment bo'limiga quyidagilarni qo'shing:
 
 ```text
-https://SIZNING-RENDER-LINK.onrender.com/set-webhook?secret=TELEGRAM_WEBHOOK_SECRET
+BOT_TOKEN=
+ADMIN_CHAT_ID=
+OWNER_TELEGRAM_ID=
+WEBHOOK_SECRET=
+SUPABASE_URL=
+SUPABASE_SERVICE_ROLE_KEY=
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4.1-mini
+FIRST_CONTACT_MODE=approval
 ```
 
-5. Telegramda botning o‘ziga `/start` yozing, tugmali menyu chiqadi.
-6. Telegram → Settings → Telegram Business → Chatbots ichida bot ulanganini tekshiring.
+`OWNER_TELEGRAM_ID` ixtiyoriy, lekin xavfsizlik uchun qo'ygan yaxshi.
 
-## Muhim eslatma
+## Supabase
 
-Chekni AI o‘qiydi, lekin pul haqiqatan tushganini 100% isbotlamaydi. Oxirgi tasdiq admin tugmasi orqali qilinadi.
+1. Supabase loyihangizga kiring.
+2. SQL Editor'ni oching.
+3. `supabase.sql` ichidagi kodni to'liq ishlating.
 
-Free Render servis uxlab qolishi mumkin. Eslatmalar menyuda ishlaydi; avtomatik vaqtli ishlar Render uxlab qolsa kechikishi mumkin.
+## Webhook ulash
+
+Render saytingiz URL'i masalan shunday bo'lsa:
+
+```text
+https://olye-business-ai-bot.onrender.com
+```
+
+Webhook URL:
+
+```text
+https://olye-business-ai-bot.onrender.com/webhook
+```
+
+Telegram webhook o'rnatish:
+
+```bash
+curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url":"https://olye-business-ai-bot.onrender.com/webhook",
+    "secret_token":"WEBHOOK_SECRET_BU_YERGA",
+    "allowed_updates":["message","callback_query","business_message"]
+  }'
+```
+
+`<BOT_TOKEN>` va `WEBHOOK_SECRET_BU_YERGA` joylariga o'zingiznikini yozing.
+
+
+
+## Eski chatlar xavfsizligi
+
+Telegram Business bot eski yozishmalar tarixini avtomatik ko'ra olmaydi. Shuning uchun DB'da yo'q chat birinchi marta yozsa, bot uni yangi lid deb darrov boshlamaydi.
+
+Default sozlama:
+
+```text
+FIRST_CONTACT_MODE=approval
+```
+
+Bu rejimda:
+
+```text
+1. Eski yoki yangi aniqlanmagan chat yozadi.
+2. Bot mijozga javob bermaydi.
+3. Admin chatga xabar keladi.
+4. Admin `✅ Oqimni boshlash` bossa — bot ariza shablonidan boshlaydi.
+5. Admin `🔕 Eski chat / botni o'chirish` bossa — bot shu chatda jim turadi.
+```
+
+Keyinchalik hammasi toza bo'lib ketgach, avtomatik start kerak bo'lsa:
+
+```text
+FIRST_CONTACT_MODE=auto
+```
+
+lekin eski chatlar ko'p bo'lgan holatda `approval` xavfsizroq.
+
+## Admin buyruqlar
+
+```text
+/menu — tugmali menyu
+/report — hisobot
+/stalled — chala lidlar
+/templates — shablonlar
+/gettemplate key — shablonni ko'rish
+/settemplate key matn — shablonni o'zgartirish
+/leadson chat_id — chatda botni yoqish
+/leadsoff chat_id — chatda botni o'chirish
+/status chat_id — lid holati
+/discount_preview — chegirma yuborishni oldindan ko'rish
+/discount_confirm ID — chegirmani tasdiqlab yuborish
+/discount_cancel ID — chegirmani bekor qilish
+/installment chat_id amount — bo'lib to'lashni qayd qilish
+/installments_due — eslatma muddati kelgan bo'lib to'lashlar
+```
+
+## Shablon kalitlari
+
+```text
+ask_application
+ask_info
+short_intro
+full_intro
+offer_end
+ask_bio_confirm
+bio_questions
+discount_message
+```
+
+## Muhim mantiq
+
+AI mijozga erkin javob yozmaydi. AI faqat mijoz javobining niyatini aniqlaydi:
+
+```text
+greeting_positive
+yes
+has_info
+no_info
+ok_wait
+read_offer
+agree_bio
+no
+unclear
+```
+
+Ketma-ketlikni AI emas, Supabase'dagi `stage` ushlab turadi. Shuning uchun `ha` javobi qaysi bosqichda kelganiga qarab tushuniladi.
+
+## Savollardan keyin
+
+`bio_questions` yuborilgach:
+
+```text
+stage = bio_questions_sent
+status = stopped
+bot_enabled = false
+```
+
+Bot shu chatda to'xtaydi va sizga admin chatga signal yuboradi.
