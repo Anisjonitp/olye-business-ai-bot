@@ -23,6 +23,9 @@ create table if not exists business_leads (
   hot_lead boolean default false,
   outreach_sent_at timestamptz,
   outreach_session_id text,
+  offer_followup_due_at timestamptz,
+  offer_followup_sent boolean default false,
+  offer_followup_sent_at timestamptz,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
@@ -45,6 +48,9 @@ alter table business_leads add column if not exists last_bot_template_key text;
 alter table business_leads add column if not exists hot_lead boolean default false;
 alter table business_leads add column if not exists outreach_sent_at timestamptz;
 alter table business_leads add column if not exists outreach_session_id text;
+alter table business_leads add column if not exists offer_followup_due_at timestamptz;
+alter table business_leads add column if not exists offer_followup_sent boolean default false;
+alter table business_leads add column if not exists offer_followup_sent_at timestamptz;
 alter table business_leads add column if not exists created_at timestamptz default now();
 alter table business_leads add column if not exists updated_at timestamptz default now();
 
@@ -53,6 +59,7 @@ create index if not exists idx_business_leads_status on business_leads(status);
 create index if not exists idx_business_leads_updated_at on business_leads(updated_at);
 create index if not exists idx_business_leads_hot_lead on business_leads(hot_lead);
 create index if not exists idx_business_leads_outreach_session on business_leads(outreach_session_id);
+create index if not exists idx_business_leads_offer_followup on business_leads(offer_followup_due_at) where offer_followup_sent = false;
 
 create table if not exists reply_templates (
   key text primary key,
@@ -163,6 +170,8 @@ Foydali jihatlari:
 ('explain_reply', 'Loyiha haqida tushuntirish boshlanishi', $$Tushunarli. Keling, hozir batafsil tushuntirib beraman.$$),
 
 ('offer_end', 'Oferta oxiri', $$Oferta va xabar bilan tanishib chiqing va ayting!!!$$),
+
+('offer_followup', 'Oferta follow-up eslatmasi', $$Tanishib chiqdingizmi? Biz sizni kutyapmiz.$$),
 
 ('ask_bio_confirm', 'Biografik maqola taklifi', $$Ajoyib, sizga ma’qulmi? Sizga ham biografik maqola yozamizmi unda ensiklopediyamizga kiritish uchun?$$),
 

@@ -10,8 +10,13 @@ Telegram Business profilingiz nomidan yangi lidlarni biografik savollargacha oli
 - `message_id`, `chat_lock`, `response_package`, `sent_bot_messages` orqali duplicate himoya bor.
 - `biroz` = qisman ma’lumot bor deb tushuniladi, `birozdan keyin` = keyinroq.
 - Ovozli/rasm/sticker/fayl kelsa, bot matn ko‘rinishida javob so‘raydi.
+- Salomdan keyin birinchi savol doim aynan `ask_application` shablonidan ketadi; AI bu joyda `Aniqlashtirib olay...` deb almashtirmaydi.
+- `asked_application` bosqichida oddiy “yo‘q” desa ham ariza havolasini yuboradi.
 - “Yo‘q, qoldirmaganman” yoki “qoldirmoqchiman, bilmayman” desa, ariza havolasini yuboradi.
+- `offer_end` yuborilgandan keyin 1 soat ichida “tanishdim” demasa, bot bir marta `offer_followup` eslatmasini yuboradi.
 - Outreach Auto rejimi: siz yuborgan “Assalomu alaykum...” salomlarni eslab, faqat o‘sha chatlardan kelgan javoblarni avto start qiladi.
+- Auto Topic: siz qo‘lda yuborgan xabar mazmunidan bot chat stage’ini tushunadi. Masalan qo‘lda oferta yuborsangiz, keyingi javobni `waiting_offer_read` deb davom ettiradi.
+- Bir xil qaytaruvchi javob 10 daqiqa ichida takror yuborilmaydi.
 - Admin panelda bulk clear: tasdiq kutayotganlarni bitta tugma bilan disabled qilish mumkin.
 - SQL endi eski tahrirlangan shablonlarni overwrite qilmaydi.
 
@@ -60,6 +65,9 @@ MESSAGE_BUFFER_MS=7000
 TURN_COOLDOWN_MS=12000
 CHAT_LOCK_MS=30000
 AUTO_START_REQUIRE_OUTREACH=true
+AUTO_TOPIC_FROM_OUTGOING=true
+OFFER_FOLLOWUP_MS=3600000
+FOLLOWUP_TICK_MS=300000
 ```
 
 `BUSINESS_OWNER_ID`ni olish uchun botga admin chatdan yozing:
@@ -117,6 +125,25 @@ Menyuda shular bor:
 - ✅ Savollargacha yetganlar
 - 📣 Outreach Auto
 - ✏️ Shablonlar
+
+
+## Auto Topic — biz yozgan xabardan stage aniqlash
+
+Agar Telegram Business bot outgoing xabarlarni ko‘rsa, admin/Business profil egasi yozgan xabar mazmuniga qarab chat mavzusi avtomatik saqlanadi.
+
+Misollar:
+
+- Siz qo‘lda `Siz “O‘zbekiston Lider Yoshlari Ensiklopediyasi”ga kirish uchun ariza qoldirgansiz. Shunaqami?` yuborsangiz, bot `stage=asked_application` deb eslab qoladi.
+- Siz qo‘lda oferta yoki `Oferta va xabar bilan tanishib chiqing...` yuborsangiz, bot `stage=waiting_offer_read` deb davom ettiradi va 1 soatlik follow-upni belgilaydi.
+- Siz qo‘lda bio savollarni yuborsangiz, bot shu chatda to‘xtaydi.
+
+Bu funksiya shablonlarni o‘zgartirmaydi. Faqat `business_leads` ichida chat stage’ini yangilaydi.
+
+Render env:
+
+```env
+AUTO_TOPIC_FROM_OUTGOING=true
+```
 
 ## Outreach Auto
 
@@ -182,6 +209,25 @@ yubordim
 
 desa, bot keyingi savolga o‘tadi.
 
+
+## Oferta follow-up
+
+Bot `full_intro + offer_end` yoki `short_intro + offer_end` yuborgandan keyin `offer_followup_due_at` ni 1 soat keyinga belgilaydi.
+
+Agar lid shu vaqt ichida `tanishdim`, `o‘qidim`, `ko‘rib chiqdim` demasa va stage hali `waiting_offer_read` bo‘lsa, bot bir marta yuboradi:
+
+```text
+Tanishib chiqdingizmi? Biz sizni kutyapmiz.
+```
+
+`ho‘p`, `mayli`, `ok` kabi javoblar reminder’ni bekor qilmaydi. Eslatma faqat bir marta yuboriladi.
+
+Tashqi cron ishlatmoqchi bo‘lsangiz, har 5 daqiqada shu endpointni chaqiring:
+
+```text
+https://YOUR-RENDER-URL.onrender.com/tick
+```
+
 ## Shablonlar overwrite bo‘lmasligi
 
 Avvalgi versiyada `supabase.sql` template body’larni qayta yozib yuborishi mumkin edi. Hozir tuzatildi.
@@ -215,3 +261,11 @@ Endi:
 ## Eslatma
 
 AI muhim faktlarni o‘zidan yozmaydi: narx, karta, oferta, ariza havolasi va bio savollar shablondan olinadi. Noaniq gaplarda esa faqat qisqa ko‘prik javob yozadi va suhbatni asosiy oqimga qaytaradi.
+
+
+## Smart Resume va Manual Admin Sync
+
+- Admin paneldagi `🤖 Mos joydan davom ettirish` tugmasi endi suhbatni boshidan boshlamaydi. Bot oxirgi admin xabari, oxirgi lid javobi va stage bo‘yicha mos joydan davom etadi.
+- Agar admin botdan tezroq loyiha ma’lumoti, oferta, karta yoki ariza linkini qo‘lda yuborsa, bot shu xabarni qayta yubormaydi.
+- `ADMIN_TAKEOVER_PAUSE_MS=60000` vaqtida admin qo‘lda yuborgan ma’lumotdan keyin bot shu chatga ehtiyotkorlik bilan aralashmaydi; lekin `tanishdim`, `savollarni yuboring`, `to‘lov qildim` kabi kuchli signal bo‘lsa davom etadi.
+- Supabase SQL eski tahrirlangan shablonlarni overwrite qilmaydi: template seedlar `ON CONFLICT DO NOTHING` bilan kiritilgan.
