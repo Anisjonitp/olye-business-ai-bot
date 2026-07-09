@@ -452,60 +452,97 @@ async function clearAdminSession(chatId) {
 
 // -------------------- Intent classifier --------------------
 
-function localIntent(text, stage) {
+function isExactAny(t, words) {
+  return words.some(w => t === normalizeText(w));
+}
+
+function hasAny(t, words) {
+  return words.some(w => t.includes(normalizeText(w)));
+}
+
+function forceIntentByStage(text, stage, current = { intent: 'unclear', confidence: 0.35 }) {
   const t = normalizeText(text);
-  if (!t) return { intent: 'unclear', confidence: 0.2 };
+  if (!t) return { intent: 'unclear', confidence: 0.2, forced: true };
 
-  const rejectWords = ['kerak emas', 'qiziq emas', 'xohlamayman', 'bezovta qilmang', 'yozmang', 'rad etaman'];
-  if (rejectWords.some(w => t.includes(w))) return { intent: 'reject', confidence: 0.92 };
+  // Eng muhim qoida: oddiy "yo'q" HAMMA joyda rad emas.
+  // U qaysi savol berilganiga qarab talqin qilinadi.
+  const plainYes = ['ha', 'xa', 'haa', 'haaa', 'ha shunday', 'xa shunday', 'shunday', 'to\'g\'ri', 'togri', 'to‘g‘ri'];
+  const plainNo = ['yoq', "yo'q", 'yo‘q', 'yuq', 'yo'];
 
-  const laterWords = ['keyinroq', 'hozir bandman', 'vaqtim yoq', "vaqtim yo'q", 'ertaga', 'kechqurun', 'keyin yozing', 'keyin gaplashamiz'];
-  if (laterWords.some(w => t.includes(w))) return { intent: 'later', confidence: 0.9 };
+  // Haqiqiy rad so'zlari. Bu yerga oddiy "yo'q" qo'shilmaydi.
+  const hardReject = [
+    'kerak emas', 'kerakmas', 'qiziq emas', 'qiziqmas', 'xohlamayman', 'hohlamayman',
+    'bezovta qilmang', 'yozmang', 'rad etaman', 'bekor qiling', 'menga kerak emas',
+    'endi yozmang', 'spam qilmang'
+  ];
+  if (hasAny(t, hardReject)) return { intent: 'reject', confidence: 0.99, forced: true };
 
-  const priceWords = ['narx', 'qancha', 'pullikmi', 'tolov', "to'lov", 'badal', 'necha pul', 'sum', "so'm", 'som'];
-  if (priceWords.some(w => t.includes(w))) return { intent: 'price_question', confidence: 0.86 };
+  const laterWords = ['keyinroq', 'hozir bandman', 'vaqtim yoq', "vaqtim yo'q", 'ertaga', 'kechqurun', 'keyin yozing', 'keyin gaplashamiz', 'boshqa payt'];
+  if (hasAny(t, laterWords)) return { intent: 'later', confidence: 0.96, forced: true };
 
-  const greetings = ['assalomu alaykum', 'assalom', 'salom', 'va alaykum', 'valaykum', 'yaxshi', 'ha yaxshi', 'rahmat yaxshi', 'yaxshiman', 'alhamdulillah'];
-  if (stage === STAGE.NEW && greetings.some(w => t.includes(w))) return { intent: 'greeting_positive', confidence: 0.9 };
+  const priceWords = ['narx', 'qancha', 'pullikmi', 'pullik', 'tolov', "to'lov", 'to‘lov', 'badal', 'necha pul', 'sum', "so'm", 'so‘m', 'som'];
+  if (hasAny(t, priceWords)) return { intent: 'price_question', confidence: 0.96, forced: true };
+
+  if (stage === STAGE.NEW) {
+    const greetings = ['assalomu alaykum', 'assalom', 'salom', 'va alaykum', 'valaykum', 'yaxshi', 'ha yaxshi', 'rahmat yaxshi', 'yaxshiman', 'alhamdulillah'];
+    if (hasAny(t, greetings)) return { intent: 'greeting_positive', confidence: 0.95, forced: true };
+  }
 
   if (stage === STAGE.ASKED_APPLICATION) {
     const applicationYes = [
-      'ha', 'xa', 'haa', 'haaa', 'qoldirdim', 'qoldirgandim', 'ariza', 'anketa',
-      'instagramda', 'instagram', 'instada', 'reklamadan', 'yozgandim', 'yozgan edim',
-      'dostim aytdi', "do'stim aytdi", 'tanishim aytdi', 'aytishgandi', 'ko‘rgandim', "ko'rgandim",
-      'qiziqib yozgandim', 'malumot olmoqchi', "ma'lumot olmoqchi", 'bilmoqchi edim'
+      'qoldirdim', 'qoldirgandim', 'ariza', 'anketa', 'forma', 'google form',
+      'instagramda', 'instagram', 'instada', 'reklamadan', 'reklamada', 'ko\'rdim', 'ko‘rdim',
+      'yozgandim', 'yozgan edim', 'yozganman', 'murojaat qilgandim',
+      'dostim aytdi', "do'stim aytdi", 'do‘stim aytdi', 'tanishim aytdi', 'ustozim aytdi',
+      'aytishgandi', 'ko\'rgandim', 'ko‘rgandim', 'qiziqib yozgandim', 'qiziqdim',
+      'malumot olmoqchi', "ma'lumot olmoqchi", 'ma’lumot olmoqchi', 'bilmoqchi edim'
     ];
-    const applicationNo = ['yoq', "yo'q", 'qanaqa ariza', 'men yozmadim', 'adashdingiz', 'tushunmadim', 'eslolmadim'];
-    if (applicationNo.some(w => t.includes(w))) return { intent: 'application_denied', confidence: 0.9 };
-    if (applicationYes.some(w => t.includes(w))) return { intent: 'application_confirmed', confidence: 0.9 };
+    const applicationNo = ['qanaqa ariza', 'men yozmadim', 'ariza qoldirmadim', 'adashdingiz', 'adashdingiz shekilli'];
+
+    if (isExactAny(t, plainYes) || hasAny(t, applicationYes)) return { intent: 'application_confirmed', confidence: 0.98, forced: true };
+    if (hasAny(t, applicationNo) || isExactAny(t, plainNo)) return { intent: 'application_denied', confidence: 0.92, forced: true };
   }
 
   if (stage === STAGE.ASKED_INFO) {
-    const hasInfo = ['egaman', 'bilaman', 'xabardorman', "ma'lumotim bor", 'malumotim bor', 'ha bor', 'bor', 'tushunaman'];
-    const noInfo = ['bilmayman', "ma'lumotim yo", 'malumotim yo', 'xabardor emasman', 'tushuntiring', 'bilmadim', 'yoq', "yo'q"];
-    if (hasInfo.some(w => t.includes(w)) || t === 'ha' || t === 'xa') return { intent: 'has_info', confidence: 0.86 };
-    if (noInfo.some(w => t.includes(w))) return { intent: 'no_info', confidence: 0.86 };
+    const hasInfo = ['egaman', 'bilaman', 'xabardorman', "ma'lumotim bor", 'ma’lumotim bor', 'malumotim bor', 'ha bor', 'bor', 'tushunaman'];
+    const noInfo = ['bilmayman', "ma'lumotim yo", 'ma’lumotim yo', 'malumotim yo', 'xabardor emasman', 'tushuntiring', 'bilmadim', 'ma\'lumot bering', 'malumot bering', 'berolasizmi malumot'];
+
+    // Shu savolga oddiy "yo'q" degani: "ma'lumotga ega emasman".
+    // Bu RAD EMAS. Bot to'liq ma'lumot yuborishi shart.
+    if (isExactAny(t, plainNo) || hasAny(t, noInfo)) return { intent: 'no_info', confidence: 0.99, forced: true };
+    if (isExactAny(t, plainYes) || hasAny(t, hasInfo)) return { intent: 'has_info', confidence: 0.96, forced: true };
   }
 
   if (stage === STAGE.WAITING_OFFER_READ) {
-    const read = ['tanishdim', 'oqib chiqdim', "o'qib chiqdim", 'korib chiqdim', "ko'rib chiqdim", 'tushunarli', 'tanishib chiqdim'];
-    const okWait = ['hop', "ho'p", 'mayli', 'ok', 'boladi', "bo'ladi", 'tanishib chiqaman', 'oqib chiqaman', "o'qib chiqaman"];
-    if (read.some(w => t.includes(w))) return { intent: 'read_offer', confidence: 0.9 };
-    if (okWait.some(w => t.includes(w))) return { intent: 'ok_wait', confidence: 0.85 };
+    const read = ['tanishdim', 'oqib chiqdim', "o'qib chiqdim", 'o‘qib chiqdim', 'korib chiqdim', "ko'rib chiqdim", 'ko‘rib chiqdim', 'tushunarli', 'tanishib chiqdim'];
+    const okWait = ['hop', "ho'p", 'ho‘p', 'mayli', 'ok', 'boladi', "bo'ladi", 'bo‘ladi', 'tanishib chiqaman', 'oqib chiqaman', "o'qib chiqaman", 'o‘qib chiqaman'];
+    if (hasAny(t, read)) return { intent: 'read_offer', confidence: 0.96, forced: true };
+    if (hasAny(t, okWait)) return { intent: 'ok_wait', confidence: 0.9, forced: true };
+    // Bu bosqichda oddiy "yo'q" noaniq: radmi yoki hali tanishmaganmi — admin ko'rsin.
+    if (isExactAny(t, plainNo)) return { intent: 'unclear', confidence: 0.4, forced: true };
   }
 
   if (stage === STAGE.ASKED_BIO_CONFIRM) {
-    const agree = ['ha', 'xa', 'yozing', 'ha yozing', 'maqola yoz', 'boshlayver', 'qilavering', 'roziman', 'mayli', 'boladi', "bo'ladi"];
-    const no = ['yoq', "yo'q", 'kerakmas', 'kerak emas', 'keyin', 'o‘ylab ko‘raman', "o'ylab ko'raman"];
-    if (no.some(w => t.includes(w))) return { intent: 'reject', confidence: 0.86 };
-    if (agree.some(w => t.includes(w))) return { intent: 'agree_bio', confidence: 0.88 };
+    const agree = ['yozing', 'ha yozing', 'maqola yoz', 'boshlayver', 'qilavering', 'roziman', 'mayli', 'boladi', "bo'ladi", 'bo‘ladi'];
+    const no = ['o\'ylab ko\'raman', 'o‘ylab ko‘raman'];
+    if (isExactAny(t, plainNo) || hasAny(t, no)) return { intent: 'reject', confidence: 0.96, forced: true };
+    if (isExactAny(t, plainYes) || hasAny(t, agree)) return { intent: 'agree_bio', confidence: 0.96, forced: true };
   }
 
-  return { intent: 'unclear', confidence: 0.35 };
+  return current;
+}
+
+function localIntent(text, stage) {
+  return forceIntentByStage(text, stage, { intent: 'unclear', confidence: 0.35 });
 }
 
 async function aiIntent(text, stage) {
   const fallback = localIntent(text, stage);
+  // Stage bo'yicha aniq qoida topilgan bo'lsa, AI'ga topshirmaymiz.
+  // Masalan asked_info bosqichidagi oddiy "yo'q" = no_info, reject emas.
+  if (fallback.forced && fallback.confidence >= 0.9) {
+    return { intent: fallback.intent, confidence: fallback.confidence };
+  }
   if (!openai) return fallback;
 
   try {
@@ -520,7 +557,10 @@ Qoidalar:
 - "instagramda qoldirdim", "do'stim aytdi", "yozgandim", "reklamadan ko'rdim" kabi javoblar asked_application bosqichida application_confirmed.
 - "narxi qancha", "pullikmi", "badal bormi" kabi javoblar price_question.
 - "keyinroq", "hozir bandman" kabi javoblar later.
-- "kerak emas", "qiziq emas", "bezovta qilmang" kabi javoblar reject.
+- "kerak emas", "qiziq emas", "bezovta qilmang" kabi aniq rad javoblar reject.
+- Oddiy "yo'q"ni avtomatik reject qilma. Stage asked_info bo'lsa "yo'q" = no_info.
+- Stage asked_info savoli: "ma'lumotga egamisiz?". Bu bosqichda "yo'q", "bilmayman", "ma'lumotim yo'q" => no_info, bot to'liq ma'lumot yuboradi.
+- Stage asked_application bosqichida "instagramda qoldirdim", "do'stim aytdi", "yozgandim", "qiziqib yozgandim" => application_confirmed.
 - Ishonching past bo'lsa unclear.
 
 Faqat mana shu JSON formatda qaytar:
@@ -545,9 +585,17 @@ User message: ${text}`;
     const confidence = Number(parsed.confidence || 0);
 
     if (!allowed.has(intent)) return fallback;
-    // Local aniq taniydigan muhim signal bo'lsa, AI past baholasa ham localni saqlaymiz.
+
+    const aiResult = { intent, confidence: Math.max(0, Math.min(1, confidence)) };
+    const forcedAfterAi = forceIntentByStage(text, stage, aiResult);
+    if (forcedAfterAi.forced && forcedAfterAi.confidence >= 0.9) {
+      return { intent: forcedAfterAi.intent, confidence: forcedAfterAi.confidence };
+    }
+
+    // Local aniq taniydigan signal bo'lsa, AI uni boshqa ma'noga burib yubormasin.
+    if (fallback.forced && fallback.confidence >= 0.8) return { intent: fallback.intent, confidence: fallback.confidence };
     if (fallback.confidence >= 0.86 && confidence < 0.55) return fallback;
-    return { intent, confidence: Math.max(0, Math.min(1, confidence)) };
+    return aiResult;
   } catch (err) {
     console.error('aiIntent fallback:', err.message);
     return fallback;
@@ -619,7 +667,9 @@ async function stopLeadWithReject(lead) {
 }
 
 async function continueByIntent(lead, intentResult, userText = '') {
-  const { intent, confidence } = intentResult;
+  // Yakuniy himoya: AI noto'g'ri tushunsa ham stage-specific qoida yutadi.
+  const forced = forceIntentByStage(userText, lead.stage, intentResult);
+  const { intent, confidence } = forced;
 
   if (intent === 'unclear' || confidence < AI_CONFIDENCE_MIN) {
     await moveToNeedsAdmin(lead, userText, intentResult);
@@ -969,6 +1019,18 @@ async function handleAdminText(message) {
     if (!TEMPLATE_TITLES[key]) return sendMessage(chatId, `Bunday key yo‘q: ${key}\n/templates orqali ko‘ring.`);
     await setTemplate(key, body);
     return sendMessage(chatId, `✅ Shablon yangilandi: ${key}`);
+  }
+
+  if (cmd === '/testintent') {
+    const [stage, ...messageParts] = args.split(/\s+/);
+    const sample = messageParts.join(' ').trim();
+    if (!stage || !sample) return sendMessage(chatId, "Namuna: /testintent asked_info yo'q");
+    const allowedStages = Object.values(STAGE);
+    if (!allowedStages.includes(stage)) return sendMessage(chatId, `Stage noto‘g‘ri: ${stage}\nMavjud stage: ${allowedStages.join(', ')}`);
+    const local = localIntent(sample, stage);
+    const ai = await aiIntent(sample, stage);
+    const final = forceIntentByStage(sample, stage, ai);
+    return sendMessage(chatId, `🧠 Intent test\n\nStage: ${stage}\nMatn: ${sample}\n\nLocal: ${local.intent} (${local.confidence})${local.forced ? ' forced' : ''}\nAI/final: ${ai.intent} (${ai.confidence})\nYakuniy: ${final.intent} (${final.confidence})${final.forced ? ' forced' : ''}`);
   }
 
   if (cmd === '/status') {

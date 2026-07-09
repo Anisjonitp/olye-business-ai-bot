@@ -189,3 +189,23 @@ unclear
 ```
 
 Javoblar faqat Supabase’dagi `reply_templates` jadvalidan chiqadi.
+
+## v5 Lite smart-intent fix
+
+Bu versiyada oddiy `yo‘q` endi hamma joyda rad javob deb olinmaydi. Bot `stage` bo‘yicha talqin qiladi:
+
+```text
+asked_info + "yo‘q"       => no_info => full_intro yuboriladi
+asked_application + "yo‘q" => application_denied => yumshoq to‘xtaydi
+asked_bio_confirm + "yo‘q" => reject => yumshoq to‘xtaydi
+```
+
+Ya’ni `Siz ma’lumotga egamisiz?` savolidan keyin odam `yo‘q` desa, bot savdoni yopmaydi, aksincha to‘liq ma’lumot yuboradi.
+
+Admin test buyrug‘i:
+
+```text
+/testintent asked_info yo‘q
+/testintent asked_application instagramda qoldirdim
+/testintent asked_bio_confirm ha yozing
+```
