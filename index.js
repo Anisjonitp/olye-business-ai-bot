@@ -41,6 +41,10 @@ const MAX_BATCH_CHARS = Number(process.env.MAX_BATCH_CHARS || 3000);
 const CHAT_LOCK_MS = Number(process.env.CHAT_LOCK_MS || 30000);
 const PACKAGE_MESSAGE_DELAY_MS = Number(process.env.PACKAGE_MESSAGE_DELAY_MS || 500);
 
+// Oferta follow-up: offer_end yuborilgandan keyin lid "tanishdim" demasa bir marta eslatma.
+const OFFER_FOLLOWUP_MS = Number(process.env.OFFER_FOLLOWUP_MS || 60 * 60 * 1000);
+const FOLLOWUP_TICK_MS = Number(process.env.FOLLOWUP_TICK_MS || 5 * 60 * 1000);
+
 // Ariza havolasi va ish vaqti. Shablonlarda {APPLICATION_LINK} avtomatik shu qiymatga almashadi.
 const APPLICATION_LINK = process.env.APPLICATION_LINK || '';
 const QUIET_HOURS_ENABLED = String(process.env.QUIET_HOURS_ENABLED || 'false').toLowerCase() === 'true';
@@ -102,6 +106,7 @@ const TEMPLATE_TITLES = {
   full_intro: 'To‘liq tanishtiruv',
   explain_reply: 'Loyiha haqida tushuntirish boshlanishi',
   offer_end: 'Oferta oxiri',
+  offer_followup: 'Oferta follow-up eslatmasi',
   ask_bio_confirm: 'Biografik maqola taklifi',
   bio_questions: 'Biografik savollar',
   price_reply: 'Narx/badal savoliga javob',
@@ -852,9 +857,9 @@ function forceIntentByStage(text, stage, current = { intent: 'unclear', confiden
     ];
     const applicationNo = ['men yozmadim', 'adashdingiz', 'adashdingiz shekilli'];
 
-    if (hasAny(t, applicationNotSubmitted)) return { intent: 'application_not_submitted', confidence: 0.98, forced: true };
+    if (hasAny(t, applicationNotSubmitted) || isExactAny(t, plainNo)) return { intent: 'application_not_submitted', confidence: 0.99, forced: true };
     if (isExactAny(t, plainYes) || hasAny(t, applicationYes)) return { intent: 'application_confirmed', confidence: 0.98, forced: true };
-    if (hasAny(t, applicationNo) || isExactAny(t, plainNo)) return { intent: 'application_denied', confidence: 0.88, forced: true };
+    if (hasAny(t, applicationNo)) return { intent: 'application_denied', confidence: 0.88, forced: true };
   }
 
   if (stage === STAGE.WAITING_APPLICATION_SUBMIT) {
@@ -925,7 +930,7 @@ Qoidalar:
 - "nima bu o'zi", "do'stim aytgandi, ikkilanib turibman", "ma'lumot bering" kabi javoblar explain_project.
 - "nima qilish kerak", "jarayon qanday" kabi javoblar next_steps.
 - "savollarni yuboring", "anketa savollari" kabi javoblar questions_request.
-- "yo'q qoldirmaganman", "qoldirmoqchiman", "ariza havolasi" kabi javoblar application_not_submitted.
+- "yo'q", "yo'q qoldirmaganman", "qoldirmoqchiman", "ariza havolasi" kabi javoblar asked_application bosqichida application_not_submitted.
 - "ariza qoldirdim", "yubordim", "to'ldirdim" waiting_application_submit bosqichida application_submitted.
 - "biroz", "ozgina", "qisman" asked_info bosqichida partial_info.
 - "chek yubordim", "to'lov qildim", "operator bilan gaplashay" kabi javoblar human_needed.
@@ -981,7 +986,7 @@ User message: ${text}`;
 function stageReturnQuestion(lead) {
   const stage = lead?.stage;
   if (stage === STAGE.NEW || stage === STAGE.ASKED_APPLICATION) {
-    return 'Aniqlashtirib olay: siz ensiklopediyaga kirish bo‘yicha ariza yoki qiziqish qoldirganmidingiz?';
+    return 'Siz “O‘zbekiston Lider Yoshlari Ensiklopediyasi”ga kirish uchun ariza qoldirgansiz. Shunaqami?';
   }
   if (stage === STAGE.WAITING_APPLICATION_SUBMIT) {
     return 'Arizani yuborganingizdan so‘ng shu chatga “ariza qoldirdim” deb yozing, keyin davom ettiramiz.';
@@ -1134,11 +1139,18 @@ async function sendResponsePackage({ lead, turnId = 'manual', actionName, items 
   }
 
   const combined = resolved.map(x => x.text).join('\n\n---\n\n');
+  const templateKeys = resolved.map(x => x.templateKey);
+  const schedulesOfferFollowup = (nextStage || lead.stage) === STAGE.WAITING_OFFER_READ && templateKeys.includes('offer_end');
   const update = {
     last_bot_message: combined,
     last_bot_sent_at: nowIso(),
     last_bot_template_key: lastTemplateKey || resolved.at(-1)?.templateKey || actionName,
     stage: nextStage || lead.stage,
+    ...(schedulesOfferFollowup ? {
+      offer_followup_due_at: addMsIso(OFFER_FOLLOWUP_MS),
+      offer_followup_sent: false,
+      offer_followup_sent_at: null
+    } : {}),
     ...patch
   };
 
@@ -2175,6 +2187,61 @@ async function handleCallback(query) {
   }
 }
 
+
+// -------------------- Scheduled follow-ups --------------------
+
+let followupTickRunning = false;
+
+async function processOfferFollowups(limit = 20) {
+  if (followupTickRunning) return { ok: true, skipped: 'already_running' };
+  followupTickRunning = true;
+  let sent = 0;
+  try {
+    const { data, error } = await supabase
+      .from('business_leads')
+      .select('*')
+      .eq('status', STATUS.ACTIVE)
+      .eq('bot_enabled', true)
+      .eq('stage', STAGE.WAITING_OFFER_READ)
+      .eq('offer_followup_sent', false)
+      .lte('offer_followup_due_at', nowIso())
+      .order('offer_followup_due_at', { ascending: true })
+      .limit(limit);
+
+    if (error) {
+      console.error('processOfferFollowups select:', error);
+      return { ok: false, error: error.message };
+    }
+
+    for (const lead of data || []) {
+      try {
+        // Yana bir marta tekshiramiz: agar shu orada stage o'zgargan bo'lsa, yubormaymiz.
+        const fresh = await getLead(lead.chat_id);
+        if (!fresh || fresh.status !== STATUS.ACTIVE || !fresh.bot_enabled || fresh.stage !== STAGE.WAITING_OFFER_READ || fresh.offer_followup_sent) continue;
+
+        await sendResponsePackage({
+          lead: fresh,
+          turnId: `offer_followup:${fresh.chat_id}:${fresh.offer_followup_due_at || Date.now()}`,
+          actionName: 'offer_followup_once',
+          items: [{ templateKey: 'offer_followup' }],
+          nextStage: STAGE.WAITING_OFFER_READ,
+          patch: {
+            offer_followup_sent: true,
+            offer_followup_sent_at: nowIso()
+          }
+        });
+        sent += 1;
+        await logEvent(fresh.chat_id, 'offer_followup_sent_once', fresh.last_user_message || '');
+      } catch (err) {
+        console.error('processOfferFollowups item:', err.message);
+      }
+    }
+    return { ok: true, sent, checked: (data || []).length };
+  } finally {
+    followupTickRunning = false;
+  }
+}
+
 // -------------------- Express routes --------------------
 
 app.get('/', (req, res) => {
@@ -2183,6 +2250,16 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({ ok: true, time: nowIso() });
+});
+
+app.get('/tick', async (req, res) => {
+  try {
+    const result = await processOfferFollowups();
+    res.json({ ok: true, time: nowIso(), followups: result });
+  } catch (err) {
+    console.error('tick route error:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 app.get('/webhook', (req, res) => {
@@ -2249,4 +2326,9 @@ app.post('/webhook', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`OLYE Business AI Bot v5 Lite running on port ${PORT}`);
+  if (FOLLOWUP_TICK_MS > 0) {
+    setInterval(() => {
+      processOfferFollowups().catch(err => console.error('followup interval error:', err.message));
+    }, FOLLOWUP_TICK_MS);
+  }
 });
