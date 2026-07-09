@@ -1,53 +1,77 @@
-# OLYE Business AI Bot v4
+# OLYE Business AI CRM Bot v5
 
-Bu versiya qat'iy oqim bilan ishlaydi: AI erkin javob yozmaydi, faqat intent tanlaydi. Noma'lum savollarga bot javob bermaydi.
+Bu versiya Telegram Business profilingizga ulangan CRM bot.
 
-Render sozlamasi:
+## Asosiy funksiyalar
+
+- Tugmali admin panel: Hisobot, Lidlar, To‘lovlar, Eslatmalar, Shablonlar, Ssenariy qurish, Chek tekshirish, Maqola jarayoni, Excel.
+- Faqat yangi lidlarga avtomatik javob.
+- Eski lid qayta yozsa, bot javob bermaydi, admin chatga signal beradi.
+- Har bir chatda botni tugma bilan yoqish/o‘chirish.
+- Har bir lid uchun status: qayerda to‘xtagani aniq ko‘rinadi.
+- Chala qolgan lidlarni guruhlash.
+- Ommaviy chegirma yuborish: faqat admin tasdiqlasa ketadi.
+- 14 kunlik bo‘lib to‘lash: boshlang‘ich to‘lov, 5/10/14-kun eslatmalar.
+- Rozilik arxivi: `MEN YAKUNIY SHARTLARGA ROZIMAN` yozsa saqlanadi.
+- Chek rasmini AI orqali o‘qish va admin tasdiqlashi.
+- Shablonlarni tugma orqali tahrirlash.
+- AI ssenariy quruvchi: oddiy tilda yangi qadam qo‘shish.
+- Excel eksport.
+
+## Render sozlamalari
 
 Build Command:
-```
+
+```bash
 npm install
 ```
 
 Start Command:
-```
+
+```bash
 node index.js
 ```
 
-Supabase SQL Editor ichida `schema.sql` ni Run qiling.
+## Environment Variables
 
-Muhim env:
-```
-BOT_TOKEN=
-ADMIN_CHAT_ID=
-BUSINESS_OWNER_ID=
-TELEGRAM_WEBHOOK_SECRET=
+Render → Environment Variables:
+
+```env
+BOT_TOKEN=BotFather_token
+ADMIN_CHAT_ID=sizning_telegram_id
+BUSINESS_OWNER_ID=sizning_telegram_id
+TELEGRAM_WEBHOOK_SECRET=oddiy_maxfiy_soz
+
 SUPABASE_URL=https://xxxxx.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=
-OPENAI_API_KEY=
+SUPABASE_SERVICE_ROLE_KEY=supabase_service_role_key
+
+OPENAI_API_KEY=openai_api_key
 OPENAI_MODEL=gpt-4.1-mini
+OPENAI_VISION_MODEL=gpt-4.1-mini
+
 AUTO_REPLY_ENABLED=true
+TOTAL_AMOUNT=100000
+INITIAL_PAYMENT_AMOUNT=40000
+DAILY_REPORT_HOUR=21
+TZ=Asia/Tashkent
 ```
 
-Admin komandalar:
+## O‘rnatish tartibi
 
-- `/start` — chat ID ko'rsatadi
-- `/resetall` — barcha lead holatini boshidan qiladi
-- `/templates` — shablonlar ro'yxati
-- `/gettemplate KEY` — shablonni ko'rish
-- `/settemplate KEY | MATN` — shablonni o'zgartirish
-- `/status` — oxirgi chatlar
-- `/pausechat CHAT_ID` — chatda botni o'chirish
-- `/unpausechat CHAT_ID` — chatda botni yoqish
-- `/addrule phrase | template_key | new_stage | stop` — qo'shimcha qoida
-- `/rules` — qoidalar
-- `/delrule ID` — qoidani o'chirish
+1. `schema.sql` ni Supabase → SQL Editor → New query → Run qiling.
+2. GitHub repo rootiga fayllarni yuklang: `index.js`, `templates.js`, `package.json`, `schema.sql`, `README.md`.
+3. Render’da Manual Deploy → Deploy latest commit qiling.
+4. Deploy tugagach brauzerda webhook ulang:
 
-Oqim:
-1. Siz birinchi lidga yozasiz.
-2. Lead salom yoki ha yaxshi desa, bot ariza savolini beradi.
-3. Ha desa, bot foyda haqida so'raydi.
-4. Ha yoki yo'q desa ham info yuboradi.
-5. Ho'p desa bot jim turadi.
-6. Tanishdim desa maqola yozish ma'qulmi deb so'raydi.
-7. Ha desa savollar ro'yxatini yuboradi va shu chatda to'xtaydi.
+```text
+https://SIZNING-RENDER-LINK.onrender.com/set-webhook?secret=TELEGRAM_WEBHOOK_SECRET
+```
+
+5. Telegramda botning o‘ziga `/start` yozing, tugmali menyu chiqadi.
+6. Telegram → Settings → Telegram Business → Chatbots ichida bot ulanganini tekshiring.
+
+## Muhim eslatma
+
+Chekni AI o‘qiydi, lekin pul haqiqatan tushganini 100% isbotlamaydi. Oxirgi tasdiq admin tugmasi orqali qilinadi.
+
+Free Render servis uxlab qolishi mumkin. Eslatmalar menyuda ishlaydi; avtomatik vaqtli ishlar Render uxlab qolsa kechikishi mumkin.
