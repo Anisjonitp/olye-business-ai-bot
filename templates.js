@@ -15,9 +15,14 @@ export const DEFAULT_TEMPLATES = {
     text: 'Tushunarli, unda bezovta qilgan bo‘lsam uzr. Agar keyinroq loyiha haqida ma’lumot kerak bo‘lsa, bemalol yozishingiz mumkin.'
   },
   needs_info: {
-    title: 'Ma’lumot kerak',
+    title: 'Ma’lumot kerak / foydali jihatlarni bilmaydi',
     lead_status: 'needs_info',
     text: 'Qisqacha tushuntiraman: ensiklopediyaga kiritilgan ishtirokchi uchun alohida sahifa tayyorlanadi. Bu sahifa internetda ko‘rinadi, portfolio sifatida ishlatiladi va keyinchalik grant, forum, tanlov yoki rasmiy tavsiyanomalarda foyda berishi mumkin. Kirish tartibi va texnik badal haqida ham aytib beraymi?'
+  },
+  info_known: {
+    title: 'Ma’lumotga ega ekanini aytdi',
+    lead_status: 'qualified',
+    text: 'Juda yaxshi. Unda kirish tartibi va yillik texnik badal haqida qisqacha aytib beraymi?'
   },
   asks_price: {
     title: 'Narx / badal so‘radi',

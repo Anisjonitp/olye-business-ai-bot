@@ -174,26 +174,147 @@ async function setTemplateText(key, text) {
   return { ok: true };
 }
 
+function normalizeText(value = '') {
+  return String(value)
+    .toLowerCase()
+    .replaceAll('ʻ', "'")
+    .replaceAll('‘', "'")
+    .replaceAll('’', "'")
+    .replaceAll('`', "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function hasAny(t, patterns) {
+  return patterns.some((p) => p.test(t));
+}
+
+function ruleBasedTemplateKey(text, lead) {
+  const t = normalizeText(text);
+  const status = lead?.lead_status || 'new';
+  const lastIntent = lead?.last_intent || '';
+
+  const salom = /^(assalomu|assalom|salom|hello|hi|va alaykum|vaalaykum)/i.test(t);
+  const yes = /^(ha|xa|haa|ha shunday|xa shunday|shunday|to'?g'?ri|togri|mayli|xo'?p|xop|albatta|bo'ladi|boladi|yuboring|ayting|tushuntiring)\b/i.test(t);
+  const yesKnows = hasAny(t, [/\b(ha|xa).*(egaman|bilaman|xabardorman|tanishman)\b/i, /\b(egaman|bilaman|xabardorman)\b/i]);
+  const noKnowledge = hasAny(t, [
+    /\b(yoq|yo'q|yuq|yo‘q).*(ega emas|bilmay|bilmayman|xabardor emas|ma'?lumot.*yoq|ma'?lumot.*yo'q|tushunmayman)\b/i,
+    /\b(ega emasman|bilmayman|xabardor emasman|ma'?lumot kerak|ma'?lumot bering|tushuntiring|batafsil)\b/i
+  ]);
+  const noGeneric = /^(yoq|yo'q|yuq|yo‘q|yoq adashibsiz|yo'q adashibsiz|adashibsiz|qoldirmaganman)\b/i.test(t);
+  const noInterest = hasAny(t, [/kerak emas/i, /qiziqmayman/i, /qiziq emas/i, /bekor/i, /xohlamayman/i, /hohlamayman/i, /yozmang/i, /bezovta qilmang/i]);
+  const asksHuman = hasAny(t, [/operator/i, /odam/i, /inson/i, /admin/i, /menejer/i, /bog'?lan/i, /o'zingiz/i, /o‘zingiz/i]);
+  const botQuestion = hasAny(t, [/botmisan/i, /botmisiz/i, /robot/i, /avto/i, /sun'iy/i]);
+  const certificate = hasAny(t, [/sertifikat/i, /certificate/i, /guvohnoma/i]);
+  const searchVisibility = hasAny(t, [/google/i, /qidiruv/i, /internet/i, /chatgpt/i, /ai/i, /ko'?rin/i, /chiqadimi/i]);
+  const paymentMethod = hasAny(t, [/karta/i, /plastik/i, /payme/i, /click/i, /uzum/i, /chek/i, /rekvizit/i, /hisob/i]);
+  const asksPrice = hasAny(t, [/narx/i, /qancha/i, /badal/i, /necha pul/i, /summasi/i, /to'?lov qancha/i]);
+  const wantsPay = hasAny(t, [/to'?layman/i, /tolayman/i, /to'?lov qilaman/i, /hozir qilaman/i, /tayyorman/i, /qayerga to'?lay/i, /karta yubor/i]);
+  const trust = hasAny(t, [/ishon/i, /rost/i, /aldov/i, /firib/i, /kafolat/i, /haqiq/i, /isbot/i]);
+  const later = hasAny(t, [/keyin/i, /ertaga/i, /o'?ylab/i, /hozir emas/i, /sal keyin/i, /vaqtim yo'q/i]);
+  const asksInfo = hasAny(t, [/ma'?lumot/i, /batafsil/i, /tushuntir/i, /foyda/i, /qanday foyda/i]);
+
+  // Umumiy kuchli signallar.
+  if (asksHuman) return 'asks_human';
+  if (botQuestion) return 'bot_question';
+  if (wantsPay && (status === 'price_asked' || status === 'qualified' || status === 'needs_info')) return 'wants_to_pay';
+  if (paymentMethod) return 'payment_method';
+  if (asksPrice) return 'asks_price';
+  if (certificate) return 'certificate_question';
+  if (searchVisibility) return 'search_visibility';
+  if (trust) return 'trust_objection';
+  if (later) return 'later';
+  if (noInterest) return 'not_interested';
+
+  // Bosqich bo'yicha aniq qoidalar.
+  if (salom && status === 'new') return 'greeting';
+
+  // Birinchi savol: “ariza qoldirgandingizmi?”
+  if (status === 'new') {
+    if (yes || /ariza.*(qoldir|ber)/i.test(t) || /qoldirgandim/i.test(t)) return 'application_yes';
+    if (noKnowledge || asksInfo) return 'needs_info';
+    if (noGeneric) return 'application_no';
+  }
+
+  // Ikkinchi savol: “foydali jihatlari haqida ma'lumotga egamisiz?”
+  if (status === 'qualified' || lastIntent === 'application_yes') {
+    if (noKnowledge) return 'needs_info';
+    if (yesKnows || yes) return 'info_known';
+    if (noGeneric) return 'needs_info';
+    if (asksInfo) return 'needs_info';
+  }
+
+  // Ma'lumot berilgandan keyin: “badal haqida aytaymi?”
+  if (status === 'needs_info' || lastIntent === 'needs_info' || lastIntent === 'info_known') {
+    if (yes || /ayt/i.test(t) || /yubor/i.test(t)) return 'asks_price';
+    if (noGeneric) return 'later';
+    if (asksInfo) return 'needs_info';
+  }
+
+  // Narxdan keyin.
+  if (status === 'price_asked' || lastIntent === 'asks_price') {
+    if (yes || wantsPay) return 'payment_method';
+    if (noGeneric) return 'later';
+  }
+
+  if (asksInfo) return 'needs_info';
+  if (salom) return 'greeting';
+
+  return null;
+}
+
+async function makeAnalysisFromTemplate(templateKey, from) {
+  const template = await getTemplate(templateKey);
+  return {
+    intent: templateKey,
+    lead_status: template.lead_status || 'new',
+    template_key: templateKey,
+    reply: renderTemplate(template.text, {
+      username: from?.username ? `@${from.username}` : '',
+      full_name: [from?.first_name, from?.last_name].filter(Boolean).join(' ')
+    }),
+    should_notify_admin: Boolean(template.notify_admin),
+    should_pause_bot: Boolean(template.pause_bot)
+  };
+}
+
 async function analyzeIntentOnly({ text, lead, from }) {
   const currentStatus = lead?.lead_status || 'new';
+  const lastIntent = lead?.last_intent || '';
+
+  // Avval oddiy savdo oqimini qoidalar bilan hal qilamiz.
+  // Bu “yo‘q, ega emasman” kabi javoblar noto‘g‘ri rad javobiga tushib ketmasligi uchun kerak.
+  const ruleKey = ruleBasedTemplateKey(text, lead);
+  if (ruleKey && DEFAULT_TEMPLATES[ruleKey]) {
+    return makeAnalysisFromTemplate(ruleKey, from);
+  }
+
+  const allowedKeys = Object.keys(DEFAULT_TEMPLATES).join('|');
 
   const systemPrompt = `
 Sen Telegram Business profil uchun klassifikator yordamchisan.
-Vazifa: foydalanuvchi xabarini tushunib, faqat mos shablon kalitini tanlash.
+Vazifa: foydalanuvchi xabarini tushunib, faqat mos SHABLON KALITINI tanlash.
 
 JUDA MUHIM:
 - Foydalanuvchiga yuboriladigan javob yozma.
 - Erkin matn yaratma.
 - Faqat quyidagi shablonlardan bittasini tanla.
-- Qo‘shimcha savol bo‘lsa ham, eng yaqin shablonni tanla. Agar aniq javob yo‘q bo‘lsa, asks_human yoki unknown tanla.
-- To‘lovga tayyor, operator kerak, odam bilan gaplashmoqchi bo‘lsa should_notify_admin=true qil.
+- Agar odam "yo'q, ega emasman", "bilmayman", "ma'lumotim yo'q" desa, bu rad etish emas; bu needs_info.
+- Agar oldingi savol foydali jihatlar haqida bo'lsa va odam "ha, egaman" desa, info_known tanla.
+- Agar odam to'lovga tayyor, operator kerak, odam bilan gaplashmoqchi bo'lsa should_notify_admin=true qil.
+
+Joriy bosqichlar:
+- new: hali ariza tasdiqlanmagan. "ha" => application_yes, "yo'q/adashibsiz" => application_no.
+- qualified: ariza tasdiqlandi, foydali jihatlar haqida savol berilgan. "yo'q, bilmayman/ega emasman" => needs_info. "ha, egaman/bilaman" => info_known.
+- needs_info: ma'lumot berilgan, endi badal/tartibga o'tish mumkin. "ha/mayli/ayting" => asks_price.
+- price_asked: narx aytilgan. "ha/yuboring/to'layman" => payment_method yoki wants_to_pay.
 
 Mavjud shablonlar:
 ${templateListForPrompt()}
 
 JSON qaytar:
 {
-  "template_key": "greeting|application_yes|application_no|needs_info|asks_price|wants_to_pay|trust_objection|certificate_question|search_visibility|payment_method|later|not_interested|asks_human|bot_question|off_topic|unknown",
+  "template_key": "${allowedKeys}",
   "intent": "qisqa_intent_nomi",
   "lead_status": "new|qualified|needs_info|price_asked|hot|not_interested|human_needed",
   "should_notify_admin": true/false,
@@ -202,6 +323,7 @@ JSON qaytar:
 
   const userPrompt = `
 Joriy lead status: ${currentStatus}
+Oxirgi intent: ${lastIntent}
 Foydalanuvchi: ${userLabel(from)}
 Xabar: ${text}
 JSON qaytar.
@@ -220,49 +342,25 @@ JSON qaytar.
     const raw = response.output_text?.trim() || '';
     const jsonText = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '').trim();
     const parsed = JSON.parse(jsonText);
-    const templateKey = DEFAULT_TEMPLATES[parsed.template_key] ? parsed.template_key : fallbackTemplateKey(text, currentStatus);
+    const templateKey = DEFAULT_TEMPLATES[parsed.template_key] ? parsed.template_key : 'unknown';
     const template = await getTemplate(templateKey);
 
     return {
       intent: parsed.intent || templateKey,
       lead_status: parsed.lead_status || template.lead_status || currentStatus,
       template_key: templateKey,
-      reply: renderTemplate(template.text, { username: from?.username ? `@${from.username}` : '', full_name: [from?.first_name, from?.last_name].filter(Boolean).join(' ') }),
+      reply: renderTemplate(template.text, {
+        username: from?.username ? `@${from.username}` : '',
+        full_name: [from?.first_name, from?.last_name].filter(Boolean).join(' ')
+      }),
       should_notify_admin: Boolean(parsed.should_notify_admin || template.notify_admin),
       should_pause_bot: Boolean(parsed.should_pause_bot || template.pause_bot)
     };
   } catch (e) {
     console.error('OpenAI classify failed:', e.message);
-    const templateKey = fallbackTemplateKey(text, currentStatus);
-    const template = await getTemplate(templateKey);
-    return {
-      intent: templateKey,
-      lead_status: template.lead_status || currentStatus,
-      template_key: templateKey,
-      reply: renderTemplate(template.text, { username: from?.username ? `@${from.username}` : '', full_name: [from?.first_name, from?.last_name].filter(Boolean).join(' ') }),
-      should_notify_admin: Boolean(template.notify_admin),
-      should_pause_bot: Boolean(template.pause_bot)
-    };
+    const templateKey = ruleBasedTemplateKey(text, lead) || 'unknown';
+    return makeAnalysisFromTemplate(templateKey, from);
   }
-}
-
-function fallbackTemplateKey(text, currentStatus) {
-  const t = String(text || '').toLowerCase();
-
-  if (/botmisan|botmisiz|robot|avto/i.test(t)) return 'bot_question';
-  if (/operator|odam|inson|admin|menejer|bog.?lan/i.test(t)) return 'asks_human';
-  if (/sertifikat|certificate/i.test(t)) return 'certificate_question';
-  if (/google|qidiruv|internet|ai|chatgpt|ko.?rin/i.test(t)) return 'search_visibility';
-  if (/karta|plastik|to.?lov|tolov qil|pul o.?tkaz|chek/i.test(t)) return 'payment_method';
-  if (/narx|qancha|pul|badal|to.?lov|tolov/i.test(t)) return 'asks_price';
-  if (/ishon|rost|aldov|firib|kafolat|haqiq/i.test(t)) return 'trust_objection';
-  if (/keyin|ertaga|o.?ylab|hozir emas/i.test(t)) return 'later';
-  if (/qiziqmay|kerak emas|yoq|yo.?q|bekor/i.test(t)) return currentStatus === 'new' ? 'application_no' : 'not_interested';
-  if (/^(salom|assalomu|assalom|hello|hi|va alaykum)/i.test(t)) return 'greeting';
-  if (/ha|xa|mayli|qoldirgandim|ariza/i.test(t) && currentStatus === 'new') return 'application_yes';
-  if (/malumot|ma.?lumot|batafsil|tushuntir|foyda/i.test(t)) return 'needs_info';
-
-  return 'unknown';
 }
 
 async function handleAdminMessage(message) {
@@ -317,6 +415,23 @@ async function handleAdminMessage(message) {
     });
     return;
   }
+
+  if (text.startsWith('/resetlead ')) {
+    const targetChatId = text.split(/\s+/)[1];
+    if (!targetChatId) {
+      await tg('sendMessage', { chat_id: message.chat.id, text: 'Format: /resetlead chat_id' });
+      return;
+    }
+    const { error } = await supabase.from('leads').delete().eq('chat_id', String(targetChatId));
+    await tg('sendMessage', { chat_id: message.chat.id, text: error ? `❌ ${error.message}` : `✅ Lead reset qilindi: ${targetChatId}` });
+    return;
+  }
+
+  if (text === '/resetall') {
+    const { error } = await supabase.from('leads').delete().neq('chat_id', '__never__');
+    await tg('sendMessage', { chat_id: message.chat.id, text: error ? `❌ ${error.message}` : '✅ Barcha lead holatlari tozalandi. Endi testni boshidan boshlang.' });
+    return;
+  }
 }
 
 async function handleBusinessMessage(message) {
@@ -346,7 +461,7 @@ async function handleBusinessMessage(message) {
 
   await upsertLead(baseLead, {
     lead_status: analysis.lead_status,
-    last_intent: analysis.intent
+    last_intent: analysis.template_key || analysis.intent
   });
 
   if (analysis.should_notify_admin || analysis.lead_status === 'hot' || analysis.lead_status === 'human_needed') {
@@ -356,6 +471,7 @@ async function handleBusinessMessage(message) {
       `Status: ${escapeHtml(analysis.lead_status)}\n` +
       `Intent: ${escapeHtml(analysis.intent)}\n` +
       `Shablon: ${escapeHtml(analysis.template_key)}\n` +
+      `Chat ID: ${escapeHtml(chat.id)}\n` +
       `Xabar: ${escapeHtml(text)}`
     );
   }
@@ -368,7 +484,7 @@ async function handleBusinessMessage(message) {
 }
 
 app.get('/', (_req, res) => {
-  res.json({ ok: true, service: 'olye-business-ai-bot' });
+  res.json({ ok: true, service: 'olye-business-ai-bot', version: '1.1.0' });
 });
 
 app.get('/health', (_req, res) => {

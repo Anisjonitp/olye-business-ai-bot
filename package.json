@@ -1,12 +1,12 @@
 {
   "name": "olye-business-ai-bot",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Telegram Business AI sales assistant MVP",
   "type": "module",
-  "main": "src/index.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "engines": {
     "node": ">=20"
