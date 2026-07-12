@@ -1,19 +1,16 @@
 {
-  "name": "olye-business-ai-bot-v5-lite",
-  "version": "5.0.0-lite",
-  "description": "OLYE Telegram Business AI Bot v5 Lite",
+  "name": "olye-business-info-bot-v6",
+  "version": "6.0.0-info-only",
+  "description": "OLYE Telegram Business Info Only Bot v6",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=20"
+    "start": "node index.js",
+    "check": "node --check index.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.4",
     "dotenv": "^16.4.7",
-    "express": "^4.18.3",
-    "openai": "^6.0.0"
+    "express": "^4.18.3"
   }
 }
