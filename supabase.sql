@@ -124,8 +124,3 @@ Foydali jihatlari:
 
 ('media_text_request', 'Media o‘rniga matn so‘rash', 'Iltimos, javobingizni qisqa matn ko‘rinishida yuborsangiz, davom ettiramiz.')
 on conflict (key) do nothing;
-
--- New v6 menu/reminder template. Safe: existing edited template is NOT overwritten.
-insert into reply_templates (key, title, body) values
-('offer_followup', 'Oferta eslatma', 'Tanishib chiqdingizmi? Biz sizni kutyapmiz.')
-on conflict (key) do nothing;
