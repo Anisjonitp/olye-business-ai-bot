@@ -21,6 +21,12 @@ const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 5000);
 const AUTO_START_REQUIRE_OUTREACH = String(process.env.AUTO_START_REQUIRE_OUTREACH || 'true') === 'true';
 const AUTO_OUTREACH_DEFAULT_HOURS = Number(process.env.AUTO_OUTREACH_DEFAULT_HOURS || 2);
 const OUTREACH_GREETING_REQUIRED = String(process.env.OUTREACH_GREETING_REQUIRED || 'true') === 'true';
+const DAILY_DEFAULT_START = process.env.DAILY_AUTO_START || '07:00';
+const DAILY_DEFAULT_DURATION_HOURS = Number(process.env.DAILY_AUTO_DURATION_HOURS || 2);
+const LOCAL_UTC_OFFSET_HOURS = Number(process.env.LOCAL_UTC_OFFSET_HOURS || 5);
+const DAILY_NO_OUTREACH_WARN_MIN = Number(process.env.DAILY_NO_OUTREACH_WARN_MIN || 15);
+const REMINDER_AFTER_MS = Number(process.env.REMINDER_AFTER_MS || 3600000);
+const SCHEDULER_TICK_MS = Number(process.env.SCHEDULER_TICK_MS || 60000);
 
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL missing');
@@ -35,14 +41,14 @@ const STAGE = {
   OUTREACH_SENT: 'outreach_sent',
   ASKED_APPLICATION: 'asked_application',
   ASKED_INFO: 'asked_info',
-  WAITING_APPLICATION_SUBMIT: 'waiting_application_submit',
   INFO_SENT_FINISHED: 'info_sent_finished',
   PAUSED: 'paused',
   DISABLED: 'disabled'
 };
 
-const STOP_STAGES = new Set([STAGE.INFO_SENT_FINISHED, STAGE.PAUSED, STAGE.DISABLED]);
+const STOP_REPLY_STAGES = new Set([STAGE.INFO_SENT_FINISHED, STAGE.PAUSED, STAGE.DISABLED]);
 const buffers = new Map();
+let schedulerBusy = false;
 
 // -------------------- Telegram helpers --------------------
 async function tg(method, payload = {}) {
@@ -70,7 +76,7 @@ async function sendAdmin(text, extra = {}) {
 
 async function sendBusinessMessage(lead, text) {
   if (!lead?.business_connection_id) {
-    await logEvent(lead?.chat_id || 'unknown', 'send_skipped_no_business_connection', text.slice(0, 300));
+    await logEvent(lead?.chat_id || 'unknown', 'send_skipped_no_business_connection', String(text || '').slice(0, 300));
     return null;
   }
   await tg('sendMessage', {
@@ -97,11 +103,7 @@ async function logEvent(chatId, eventType, message = '') {
 }
 
 async function getLead(chatId) {
-  const { data, error } = await supabase
-    .from('business_leads')
-    .select('*')
-    .eq('chat_id', String(chatId))
-    .maybeSingle();
+  const { data, error } = await supabase.from('business_leads').select('*').eq('chat_id', String(chatId)).maybeSingle();
   if (error) {
     console.error('getLead:', error.message);
     return null;
@@ -134,18 +136,9 @@ async function createLead({ chatId, businessConnectionId, from, text, stage = ST
 
 async function updateLead(chatId, patch) {
   const changedStage = Object.prototype.hasOwnProperty.call(patch, 'stage');
-  const payload = {
-    ...patch,
-    updated_at: new Date().toISOString()
-  };
+  const payload = { ...patch, updated_at: new Date().toISOString() };
   if (changedStage) payload.stage_started_at = new Date().toISOString();
-
-  const { data, error } = await supabase
-    .from('business_leads')
-    .update(payload)
-    .eq('chat_id', String(chatId))
-    .select()
-    .maybeSingle();
+  const { data, error } = await supabase.from('business_leads').update(payload).eq('chat_id', String(chatId)).select().maybeSingle();
   if (error) console.error('updateLead:', error.message);
   return data;
 }
@@ -242,7 +235,7 @@ async function sendPackage(lead, actionName, templateKeys, nextPatch = {}) {
 async function finishAfterInfo(lead) {
   const updated = await updateLead(lead.chat_id, {
     stage: STAGE.INFO_SENT_FINISHED,
-    status: 'human_needed',
+    status: 'info_sent',
     bot_enabled: false,
     finished_at: new Date().toISOString()
   });
@@ -260,7 +253,7 @@ async function finishAfterInfo(lead) {
 async function resetMeChat({ chatId, businessConnectionId = null, from = null }) {
   const id = String(chatId);
 
-  // Test uchun shu chat bo‘yicha oldingi yuborilgan action/eventlarni tozalaymiz.
+  // Faqat shu chatning test holatini tozalaydi. Boshqa lidlarga tegmaydi.
   // business_leads yozuvini o‘chirmaymiz, chunki business_connection_id kerak bo‘lib qoladi.
   await supabase.from('sent_actions').delete().eq('chat_id', id);
   await supabase.from('processed_messages').delete().eq('chat_id', id);
@@ -324,17 +317,27 @@ async function getAutoOutreach() {
   return getSetting('auto_outreach', { enabled: false });
 }
 
-async function enableAutoOutreach(hours) {
+async function enableAutoOutreach(hours, source = 'manual') {
   const now = Date.now();
   const until = now + hours * 60 * 60 * 1000;
-  const sessionId = `outreach_${new Date(now).toISOString().slice(0, 10)}_${now}`;
-  const value = { enabled: true, until, session_id: sessionId, started_at: now, hours };
+  const sessionId = `outreach_${localDateKey()}_${now}`;
+  const value = {
+    enabled: true,
+    until,
+    session_id: sessionId,
+    started_at: now,
+    hours,
+    source,
+    report_sent: false,
+    no_outreach_warn_sent: false
+  };
   await setSetting('auto_outreach', value);
+  await logEvent('system', 'auto_outreach_enabled', JSON.stringify(value));
   return value;
 }
 
-async function disableAutoOutreach() {
-  await setSetting('auto_outreach', { enabled: false, disabled_at: Date.now() });
+async function disableAutoOutreach(reportSent = false) {
+  await setSetting('auto_outreach', { enabled: false, disabled_at: Date.now(), report_sent: reportSent });
 }
 
 function isAutoActive(auto) {
@@ -346,7 +349,7 @@ function looksLikeOutreachGreeting(text = '') {
   if (!t) return false;
   if (!t.includes('assalomu') && !t.includes('assalom') && !t.includes('salom')) return false;
   if (t.includes('maqola tayyor') || t.includes('chek') || t.includes('karta') || t.includes('tolov') || t.includes('to‘lov')) return false;
-  return t.includes('yaxshimisiz') || t.includes('qalaysiz') || t.includes('yaxshilarmi') || t.length < 90;
+  return t.includes('yaxshimisiz') || t.includes('qalaysiz') || t.includes('yaxshilarmi') || t.length < 110;
 }
 
 async function markOutreach({ chatId, businessConnectionId, from, text }) {
@@ -371,13 +374,115 @@ async function markOutreach({ chatId, businessConnectionId, from, text }) {
   };
 
   if (existing) {
-    if (STOP_STAGES.has(existing.stage) || existing.status === 'disabled') return;
+    if (existing.stage === STAGE.DISABLED || existing.status === 'disabled') return;
     await updateLead(chatId, patch);
   } else {
     await createLead({ chatId, businessConnectionId, from, text, stage: STAGE.OUTREACH_SENT, status: 'active', botEnabled: true });
     await updateLead(chatId, patch);
   }
   await logEvent(chatId, 'outreach_sent_detected', text);
+}
+
+// -------------------- Daily scheduler --------------------
+function localNow() {
+  return new Date(Date.now() + LOCAL_UTC_OFFSET_HOURS * 3600000);
+}
+
+function localDateKey(d = localNow()) {
+  return d.toISOString().slice(0, 10);
+}
+
+function localHHMM(d = localNow()) {
+  return d.toISOString().slice(11, 16);
+}
+
+function minutesOf(hhmm = '07:00') {
+  const [h, m] = String(hhmm).split(':').map(Number);
+  return (h || 0) * 60 + (m || 0);
+}
+
+function localMinuteNow() {
+  const d = localNow();
+  return d.getUTCHours() * 60 + d.getUTCMinutes();
+}
+
+async function getDailyAuto() {
+  return getSetting('daily_auto', {
+    enabled: false,
+    start_time: DAILY_DEFAULT_START,
+    duration_hours: DAILY_DEFAULT_DURATION_HOURS,
+    skip_date: null,
+    last_started_date: null
+  });
+}
+
+async function setDailyAuto(value) {
+  const current = await getDailyAuto();
+  const next = { ...current, ...value, updated_at: Date.now() };
+  await setSetting('daily_auto', next);
+  return next;
+}
+
+async function runSchedulerTick(source = 'interval') {
+  if (schedulerBusy) return;
+  schedulerBusy = true;
+  try {
+    await maybeStartDailyAuto();
+    await maybeWarnNoOutreach();
+    await maybeFinishAutoReport();
+  } catch (err) {
+    console.error('scheduler tick error:', err);
+    await logEvent('system', 'scheduler_error', err.message || String(err));
+  } finally {
+    schedulerBusy = false;
+  }
+}
+
+async function maybeStartDailyAuto() {
+  const daily = await getDailyAuto();
+  if (!daily?.enabled) return;
+  const today = localDateKey();
+  if (daily.skip_date === today) return;
+  if (daily.last_started_date === today) return;
+
+  const nowMin = localMinuteNow();
+  const startMin = minutesOf(daily.start_time || DAILY_DEFAULT_START);
+  if (nowMin < startMin || nowMin > startMin + 10) return;
+
+  const hours = Number(daily.duration_hours || DAILY_DEFAULT_DURATION_HOURS);
+  const auto = await enableAutoOutreach(hours, 'daily');
+  await setDailyAuto({ last_started_date: today });
+  await sendAdmin(
+    `📣 <b>Kunlik Auto Outreach yoqildi</b>\n\n` +
+    `Start: ${html(daily.start_time || DAILY_DEFAULT_START)}\n` +
+    `Davomiylik: ${hours} soat\n` +
+    `Tugash: ${new Date(auto.until).toLocaleString('uz-UZ')}\n\n` +
+    `Telegram scheduled xabarlaringiz yuborilsa, bot faqat o‘sha outreach chatlarga javob beradi.`
+  );
+}
+
+async function maybeWarnNoOutreach() {
+  const auto = await getAutoOutreach();
+  if (!isAutoActive(auto) || auto.no_outreach_warn_sent) return;
+  const startedAt = Number(auto.started_at || 0);
+  if (!startedAt || Date.now() - startedAt < DAILY_NO_OUTREACH_WARN_MIN * 60000) return;
+  const count = await countLeads(q => q.eq('outreach_session_id', auto.session_id));
+  if (count > 0) return;
+  await sendAdmin(
+    `⚠️ <b>Outreach aniqlanmadi</b>\n\n` +
+    `${DAILY_NO_OUTREACH_WARN_MIN} daqiqa bo‘ldi, lekin bugungi outreach xabarlari ko‘rinmadi. ` +
+    `Telegram scheduled xabarlar yuborilganini tekshiring.`
+  );
+  await setSetting('auto_outreach', { ...auto, no_outreach_warn_sent: true });
+}
+
+async function maybeFinishAutoReport() {
+  const auto = await getAutoOutreach();
+  if (!auto?.enabled) return;
+  if (Number(auto.until || 0) > Date.now()) return;
+  if (auto.report_sent) return;
+  await sendAutoSessionReport(ADMIN_CHAT_ID, auto, true);
+  await setSetting('auto_outreach', { ...auto, enabled: false, report_sent: true, disabled_at: Date.now() });
 }
 
 // -------------------- Classifier --------------------
@@ -400,14 +505,17 @@ function includesAny(t, arr) {
 
 function classify(text = '', stage = STAGE.NEW) {
   const t = normalize(text);
-
-  const hardReject = [
-    'kerak emas', 'kerakmas', 'qiziq emas', 'yozmang', 'bezovta qilmang', 'stop', 'rad qilaman', 'xohlamayman'
-  ];
+  const hardReject = ['kerak emas', 'kerakmas', 'qiziq emas', 'yozmang', 'bezovta qilmang', 'stop', 'rad qilaman', 'xohlamayman'];
   if (includesAny(t, hardReject)) return 'hard_reject';
 
   const later = ['keyinroq', 'hozir band', 'bandman', 'birozdan keyin', 'keyin yozaman', 'vaqtim yoq', "vaqtim yo'q"];
   if (includesAny(t, later)) return 'later';
+
+  const readWords = ['tanishdim', 'oqidim', "o'qidim", 'o‘qidim', 'korib chiqdim', "ko'rib chiqdim", 'ko‘rib chiqdim', 'maqul', "ma'qul", 'ma’qul'];
+  if (includesAny(t, readWords)) return 'read_offer';
+
+  const paymentWords = ['karta', 'tolov', 'to‘lov', "to'lov", 'pul', 'qayerga tolay', 'qayerga to‘lay', 'to‘layman', "to'layman", 'kartaga'];
+  if (includesAny(t, paymentWords)) return 'payment_near';
 
   const applicationLink = [
     'yoq', "yo'q", 'qoldirmagan', 'qoldirmadim', 'ariza qoldirmadim', 'hali qoldirmadim',
@@ -486,27 +594,47 @@ async function handleBusinessMessage(msg) {
     return;
   }
 
-  if (isMediaOnly(msg)) {
-    const lead = await upsertLeadBase({ chatId, businessConnectionId, from: msg.from, text: '[media]' });
-    if (!lead || !lead.bot_enabled || STOP_STAGES.has(lead.stage)) return;
-    if (AUTO_START_REQUIRE_OUTREACH && !lead.outreach_sent) return;
-    const sent = await sendPackage(lead, 'media_text_request', ['media_text_request'], {});
-    await logEvent(chatId, 'media_received', JSON.stringify(Object.keys(msg).slice(0, 10)));
-    return sent;
-  }
-
-  const lead = await upsertLeadBase({ chatId, businessConnectionId, from: msg.from, text });
+  const rawText = text || (isMediaOnly(msg) ? '[media]' : '');
+  const lead = await upsertLeadBase({ chatId, businessConnectionId, from: msg.from, text: rawText });
   if (!lead) return;
+
+  if (STOP_REPLY_STAGES.has(lead.stage)) {
+    await handlePostFinishSignal(lead, msg, rawText);
+    return;
+  }
 
   // Default safety: if this was not an outreach chat, do not auto-answer.
   if (AUTO_START_REQUIRE_OUTREACH && !lead.outreach_sent) {
     await updateLead(chatId, { stage: STAGE.PENDING_APPROVAL, status: 'pending_approval', bot_enabled: false });
-    await logEvent(chatId, 'ignored_not_outreach', text);
+    await logEvent(chatId, 'ignored_not_outreach', rawText);
     return;
   }
 
-  if (!lead.bot_enabled || STOP_STAGES.has(lead.stage)) return;
+  if (!lead.bot_enabled) return;
+
+  if (isMediaOnly(msg)) {
+    await sendPackage(lead, 'media_text_request', ['media_text_request'], {});
+    await logEvent(chatId, 'media_received', JSON.stringify(Object.keys(msg).slice(0, 10)));
+    return;
+  }
+
   enqueueLeadMessage(lead, text);
+}
+
+async function handlePostFinishSignal(lead, msg, rawText) {
+  const text = rawText || '';
+  const intent = isMediaOnly(msg) ? 'media_after_info' : classify(text, lead.stage);
+  const patch = { last_user_message: text || '[media]', last_message_at: new Date().toISOString() };
+
+  if (intent === 'read_offer') patch.status = 'tanishdim';
+  else if (intent === 'payment_near') patch.status = 'payment_near';
+  else if (intent === 'hard_reject') {
+    patch.status = 'disabled';
+    patch.stage = STAGE.DISABLED;
+    patch.bot_enabled = false;
+  }
+  await updateLead(lead.chat_id, patch);
+  await logEvent(lead.chat_id, `post_finish_${intent}`, text || '[media]');
 }
 
 function enqueueLeadMessage(lead, text) {
@@ -527,7 +655,7 @@ function enqueueLeadMessage(lead, text) {
 
 async function processLeadBatch(initialLead, texts) {
   let lead = await getLead(initialLead.chat_id) || initialLead;
-  if (!lead.bot_enabled || STOP_STAGES.has(lead.stage)) return;
+  if (!lead.bot_enabled || STOP_REPLY_STAGES.has(lead.stage)) return;
   const text = texts.join('\n').trim();
   const intent = classify(text, lead.stage);
   await updateLead(lead.chat_id, { last_user_message: text, last_message_at: new Date().toISOString() });
@@ -537,7 +665,6 @@ async function processLeadBatch(initialLead, texts) {
     await stopLead(lead, 'hard_reject');
     return;
   }
-
   if (intent === 'later') {
     await updateLead(lead.chat_id, { stage: STAGE.PAUSED, status: 'paused', bot_enabled: false });
     await logEvent(lead.chat_id, 'paused_by_later', text);
@@ -546,11 +673,7 @@ async function processLeadBatch(initialLead, texts) {
 
   // Main info-only flow.
   if (lead.stage === STAGE.OUTREACH_SENT || lead.stage === STAGE.NEW || lead.stage === STAGE.PENDING_APPROVAL) {
-    await sendPackage(lead, 'ask_application', ['ask_application'], {
-      stage: STAGE.ASKED_APPLICATION,
-      status: 'active',
-      bot_enabled: true
-    });
+    await sendPackage(lead, 'ask_application', ['ask_application'], { stage: STAGE.ASKED_APPLICATION, status: 'active', bot_enabled: true });
     return;
   }
 
@@ -559,19 +682,16 @@ async function processLeadBatch(initialLead, texts) {
       await sendPackage(lead, 'ask_info', ['ask_info'], { stage: STAGE.ASKED_INFO });
       return;
     }
-
     if (intent === 'application_not_submitted') {
-      await sendPackage(lead, 'application_link_reply', ['application_link_reply'], {
+      const after = await sendPackage(lead, 'application_link_reply', ['application_link_reply'], {
         stage: STAGE.INFO_SENT_FINISHED,
-        status: 'human_needed',
+        status: 'application_link_sent',
         bot_enabled: false,
         finished_at: new Date().toISOString()
       });
       await sendAdmin(`🔗 <b>Ariza havolasi yuborildi</b>\nChat ID: <code>${lead.chat_id}</code>\nEndi chatni qo‘lda davom ettiring.`);
-      return;
+      return after;
     }
-
-    // One clarification only. If unclear again, stop for admin.
     const clarified = await reserveAction(lead.chat_id, lead.stage, 'clarify_application_once');
     if (clarified) {
       await sendTemplate(lead, 'clarify_application');
@@ -588,16 +708,207 @@ async function processLeadBatch(initialLead, texts) {
       await finishAfterInfo(after || lead);
       return;
     }
-
-    // If the user says no_info OR asks something unclear, still send full info and finish.
     const after = await sendPackage(lead, 'unknown_info_package', ['unknown_info_preface', 'full_intro', 'offer_end'], {});
     await finishAfterInfo(after || lead);
     return;
   }
 
-  // Any other stage should be safe: do not continue automatically.
   await updateLead(lead.chat_id, { stage: STAGE.PAUSED, status: 'needs_admin', bot_enabled: false });
   await logEvent(lead.chat_id, 'unexpected_stage_stopped', `${lead.stage}: ${text}`);
+}
+
+// -------------------- Reports / lists --------------------
+async function countLeads(apply) {
+  let q = supabase.from('business_leads').select('*', { count: 'exact', head: true });
+  if (apply) q = apply(q);
+  const { count, error } = await q;
+  if (error) {
+    console.error('countLeads:', error.message);
+    return 0;
+  }
+  return count || 0;
+}
+
+async function getLeads(apply, limit = 20) {
+  let q = supabase.from('business_leads').select('*').order('updated_at', { ascending: false }).limit(limit);
+  if (apply) q = apply(q);
+  const { data, error } = await q;
+  if (error) {
+    console.error('getLeads:', error.message);
+    return [];
+  }
+  return data || [];
+}
+
+async function sessionStats(sessionId) {
+  const sessionFilter = q => q.eq('outreach_session_id', sessionId);
+  return {
+    outreach: await countLeads(sessionFilter),
+    replied: await countLeads(q => sessionFilter(q).not('last_user_message', 'is', null)),
+    infoSent: await countLeads(q => sessionFilter(q).eq('stage', STAGE.INFO_SENT_FINISHED).in('status', ['info_sent', 'tanishdim', 'payment_near', 'reminder_sent'])),
+    appLink: await countLeads(q => sessionFilter(q).eq('status', 'application_link_sent')),
+    read: await countLeads(q => sessionFilter(q).eq('status', 'tanishdim')),
+    payment: await countLeads(q => sessionFilter(q).eq('status', 'payment_near')),
+    rejected: await countLeads(q => sessionFilter(q).in('status', ['hard_reject', 'disabled']))
+  };
+}
+
+async function sendAutoSessionReport(chatId, auto = null, final = false) {
+  const current = auto || await getAutoOutreach();
+  if (!current?.session_id) return tg('sendMessage', { chat_id: chatId, text: 'Hozircha outreach session yo‘q.' });
+  const s = await sessionStats(current.session_id);
+  const title = final ? '📣 Bugungi Auto Outreach tugadi' : '📊 Outreach hisoboti';
+  return tg('sendMessage', {
+    chat_id: chatId,
+    parse_mode: 'HTML',
+    text:
+      `<b>${title}</b>\n\n` +
+      `Outreach aniqlanganlar: ${s.outreach} ta\n` +
+      `Javob berganlar: ${s.replied} ta\n` +
+      `Ma’lumot yuborilganlar: ${s.infoSent} ta\n` +
+      `Ariza link yuborilganlar: ${s.appLink} ta\n` +
+      `Tanishdim yozganlar: ${s.read} ta\n` +
+      `To‘lovga yaqinlar: ${s.payment} ta\n` +
+      `Rad etganlar: ${s.rejected} ta`
+  });
+}
+
+function dueReminderFilter(q) {
+  const cutoff = new Date(Date.now() - REMINDER_AFTER_MS).toISOString();
+  return q.eq('stage', STAGE.INFO_SENT_FINISHED).in('status', ['info_sent']).not('finished_at', 'is', null).lte('finished_at', cutoff);
+}
+
+async function getReminderDue(limit = 50) {
+  return getLeads(q => dueReminderFilter(q), limit);
+}
+
+function listText(title, rows) {
+  if (!rows.length) return `${title}\n\nHozircha ro‘yxat bo‘sh.`;
+  return `${title}\n\n` + rows.map((l, i) => `${i + 1}. ${l.first_name || '-'} ${l.username ? '@' + l.username : ''}\n   Chat ID: ${l.chat_id}\n   Status: ${l.status}\n   Oxirgi: ${short(l.last_user_message || '-')}`).join('\n\n');
+}
+
+async function sendList(chatId, type) {
+  let rows = [];
+  let title = '';
+  if (type === 'info_sent') {
+    title = '📄 Ma’lumot yuborilganlar';
+    rows = await getLeads(q => q.eq('stage', STAGE.INFO_SENT_FINISHED).in('status', ['info_sent', 'reminder_sent']), 20);
+  } else if (type === 'read') {
+    title = '✅ Tanishdim yozganlar';
+    rows = await getLeads(q => q.eq('status', 'tanishdim'), 20);
+  } else if (type === 'payment') {
+    title = '💳 To‘lovga yaqinlar';
+    rows = await getLeads(q => q.eq('status', 'payment_near'), 20);
+  } else if (type === 'reminders') {
+    title = '⏰ Eslatma keraklar';
+    rows = await getReminderDue(20);
+  } else if (type === 'pending') {
+    title = '🆕 Pending';
+    rows = await getLeads(q => q.in('stage', [STAGE.PENDING_APPROVAL, STAGE.OUTREACH_SENT, STAGE.PAUSED]), 20);
+  }
+  const keyboard = type === 'reminders' && rows.length
+    ? { inline_keyboard: [[{ text: '👁 Eslatma preview', callback_data: 'reminder_preview' }], [{ text: '⬅️ Menyu', callback_data: 'menu' }]] }
+    : { inline_keyboard: [[{ text: '⬅️ Menyu', callback_data: 'menu' }]] };
+  return tg('sendMessage', { chat_id: chatId, text: listText(title, rows), reply_markup: keyboard });
+}
+
+async function sendReminderPreview(chatId) {
+  const rows = await getReminderDue(50);
+  if (!rows.length) return tg('sendMessage', { chat_id: chatId, text: '⏰ Eslatma kerak bo‘lgan lidlar yo‘q.' });
+  const body = await getTemplate('offer_followup') || 'Tanishib chiqdingizmi? Biz sizni kutyapmiz.';
+  const text =
+    `⏰ <b>Ommaviy eslatma preview</b>\n\n` +
+    `Quyidagi xabar <b>${rows.length}</b> ta lidga yuboriladi:\n\n` +
+    `<i>${html(renderTemplate(body))}</i>\n\n` +
+    `Ro‘yxat:\n` + rows.slice(0, 20).map((l, i) => `${i + 1}. ${html(l.first_name || '-')} ${l.username ? '@' + html(l.username) : ''} — <code>${l.chat_id}</code>`).join('\n') +
+    (rows.length > 20 ? `\n... yana ${rows.length - 20} ta` : '') +
+    `\n\nTasdiqlaysizmi?`;
+  return tg('sendMessage', {
+    chat_id: chatId,
+    parse_mode: 'HTML',
+    text,
+    reply_markup: { inline_keyboard: [[{ text: '✅ Ha, yuborish', callback_data: 'reminder_confirm' }, { text: '❌ Bekor qilish', callback_data: 'menu' }]] }
+  });
+}
+
+async function sendReminderConfirm(chatId) {
+  const rows = await getReminderDue(100);
+  if (!rows.length) return tg('sendMessage', { chat_id: chatId, text: '⏰ Yuboriladigan lidlar qolmadi.' });
+  let sent = 0;
+  for (const lead of rows) {
+    const reserved = await reserveAction(lead.chat_id, lead.stage, 'manual_offer_followup');
+    if (!reserved) continue;
+    const ok = await sendTemplate(lead, 'offer_followup');
+    if (ok) {
+      sent += 1;
+      await updateLead(lead.chat_id, { status: 'reminder_sent' });
+      await sleep(400);
+    }
+  }
+  return tg('sendMessage', { chat_id: chatId, text: `✅ ${sent} ta lidga eslatma yuborildi.` });
+}
+
+async function sendDashboard(chatId) {
+  const auto = await getAutoOutreach();
+  const daily = await getDailyAuto();
+  const autoStatus = isAutoActive(auto) ? `yoqilgan, tugaydi: ${new Date(auto.until).toLocaleString('uz-UZ')}` : 'o‘chiq';
+  const today = localDateKey();
+  const todayCount = await countLeads(q => q.gte('outreach_at', `${today}T00:00:00+00:00`));
+  const read = await countLeads(q => q.eq('status', 'tanishdim'));
+  const payment = await countLeads(q => q.eq('status', 'payment_near'));
+  const due = (await getReminderDue(100)).length;
+  return tg('sendMessage', {
+    chat_id: chatId,
+    parse_mode: 'HTML',
+    text:
+      `<b>🏠 OLYE Bot Panel</b>\n\n` +
+      `📣 Auto Outreach: ${html(autoStatus)}\n` +
+      `📅 Kunlik auto: ${daily.enabled ? `yoqilgan (${daily.start_time}, ${daily.duration_hours} soat)` : 'o‘chiq'}\n` +
+      `Bugungi outreach: ${todayCount} ta\n` +
+      `✅ Tanishdim: ${read} ta\n` +
+      `💳 To‘lovga yaqin: ${payment} ta\n` +
+      `⏰ Eslatma kerak: ${due} ta`,
+    reply_markup: mainMenuKeyboard()
+  });
+}
+
+function mainMenuKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: '📣 Outreach', callback_data: 'outreach_menu' }, { text: '📊 Hisobot', callback_data: 'report' }],
+      [{ text: '📄 Ma’lumot yuborilganlar', callback_data: 'list:info_sent' }],
+      [{ text: '✅ Tanishdim yozganlar', callback_data: 'list:read' }, { text: '💳 To‘lovga yaqinlar', callback_data: 'list:payment' }],
+      [{ text: '⏰ Eslatma keraklar', callback_data: 'list:reminders' }],
+      [{ text: '✏️ Shablonlar', callback_data: 'templates' }, { text: '🩺 Bot holati', callback_data: 'diagnostics' }]
+    ]
+  };
+}
+
+function outreachKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: '🚀 Hozir 1 soat', callback_data: 'auto:1' }, { text: '🚀 Hozir 2 soat', callback_data: 'auto:2' }],
+      [{ text: '🚀 Hozir 3 soat', callback_data: 'auto:3' }, { text: '⛔ Auto OFF', callback_data: 'auto:off' }],
+      [{ text: '📅 Kunlik 07:00 / 2 soat', callback_data: 'daily:on_default' }],
+      [{ text: '⛔ Kunlik auto OFF', callback_data: 'daily:off' }, { text: '⏸ Bugun ishlamasin', callback_data: 'daily:skip_today' }],
+      [{ text: '📋 Bugungi hisobot', callback_data: 'report' }, { text: '⬅️ Menyu', callback_data: 'menu' }]
+    ]
+  };
+}
+
+async function sendOutreachMenu(chatId) {
+  const auto = await getAutoOutreach();
+  const daily = await getDailyAuto();
+  return tg('sendMessage', {
+    chat_id: chatId,
+    parse_mode: 'HTML',
+    text:
+      `<b>📣 Outreach boshqaruvi</b>\n\n` +
+      `Hozirgi auto: ${isAutoActive(auto) ? `yoqilgan, tugaydi ${new Date(auto.until).toLocaleString('uz-UZ')}` : 'o‘chiq'}\n` +
+      `Kunlik auto: ${daily.enabled ? `yoqilgan — ${daily.start_time}, ${daily.duration_hours} soat` : 'o‘chiq'}\n` +
+      `Bugun skip: ${daily.skip_date === localDateKey() ? 'ha' : 'yo‘q'}`,
+    reply_markup: outreachKeyboard()
+  });
 }
 
 // -------------------- Admin commands --------------------
@@ -606,7 +917,7 @@ async function handleAdminMessage(msg) {
   const text = String(msg.text || '').trim();
   if (!text) return;
 
-  if (text === '/start' || text === '/menu') return sendMenu(chatId);
+  if (text === '/start' || text === '/menu') return sendDashboard(chatId);
   if (text === '/whoami') return tg('sendMessage', { chat_id: chatId, text: `Sizning Telegram ID: ${msg.from.id}` });
   if (text === '/resetme') {
     await resetMeChat({ chatId, from: msg.from });
@@ -630,15 +941,32 @@ async function handleAdminMessage(msg) {
   if (text === '/autooff') return autoOff(chatId);
   if (text === '/autostatus') return autoStatus(chatId);
   if (text === '/report') return sendReport(chatId);
-  if (text === '/pending') return sendPending(chatId);
+  if (text === '/info') return sendList(chatId, 'info_sent');
+  if (text === '/read') return sendList(chatId, 'read');
+  if (text === '/payment') return sendList(chatId, 'payment');
+  if (text === '/reminders') return sendList(chatId, 'reminders');
+  if (text === '/pending') return sendList(chatId, 'pending');
   if (text === '/healthtemplates') return healthTemplates(chatId);
+  if (text === '/diagnostics') return diagnostics(chatId);
+  if (text === '/tick') return manualTick(chatId);
+
+  if (text.startsWith('/setdaily ')) {
+    const [, start, durationRaw] = text.split(/\s+/);
+    const hours = Number(String(durationRaw || '').replace('h', '')) || DAILY_DEFAULT_DURATION_HOURS;
+    const daily = await setDailyAuto({ enabled: true, start_time: start || DAILY_DEFAULT_START, duration_hours: hours, skip_date: null });
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Kunlik Auto Outreach sozlandi\n\nHar kuni: ${daily.start_time}\nDavomiylik: ${daily.duration_hours} soat` });
+  }
+  if (text === '/dailyoff') {
+    await setDailyAuto({ enabled: false });
+    return tg('sendMessage', { chat_id: chatId, text: '⛔ Kunlik Auto Outreach o‘chirildi.' });
+  }
+  if (text === '/dailystatus') return dailyStatus(chatId);
 
   if (text.startsWith('/gettemplate ')) {
     const key = text.split(/\s+/)[1];
     const body = await getTemplate(key);
     return tg('sendMessage', { chat_id: chatId, text: body ? `Template: ${key}\n\n${body}` : `Topilmadi: ${key}` });
   }
-
   if (text.startsWith('/settemplate ')) {
     const rest = text.replace('/settemplate ', '');
     const firstSpace = rest.indexOf(' ');
@@ -654,48 +982,28 @@ async function handleAdminMessage(msg) {
     await updateLead(id, { stage: STAGE.DISABLED, status: 'disabled', bot_enabled: false });
     return tg('sendMessage', { chat_id: chatId, text: `🔕 ${id} o‘chirildi.` });
   }
-
   if (text.startsWith('/leadson ')) {
     const id = text.split(/\s+/)[1];
     await updateLead(id, { status: 'active', bot_enabled: true });
     return tg('sendMessage', { chat_id: chatId, text: `🔔 ${id} yoqildi.` });
   }
-
   if (text.startsWith('/reset ')) {
     const id = text.split(/\s+/)[1];
     await supabase.from('sent_actions').delete().eq('chat_id', String(id));
     await updateLead(id, { stage: STAGE.OUTREACH_SENT, status: 'active', bot_enabled: true, finished_at: null });
     return tg('sendMessage', { chat_id: chatId, text: `🔁 ${id} reset qilindi. Keyingi xabarida bot ask_application’dan boshlaydi.` });
   }
-
   if (text.startsWith('/status ')) {
     const id = text.split(/\s+/)[1];
     const lead = await getLead(id);
     return tg('sendMessage', { chat_id: chatId, text: lead ? leadCardText(lead) : 'Topilmadi.' });
   }
 
-  return sendMenu(chatId);
-}
-
-async function sendMenu(chatId) {
-  const auto = await getAutoOutreach();
-  const status = isAutoActive(auto) ? `yoqilgan, tugaydi: ${new Date(auto.until).toLocaleString('uz-UZ')}` : 'o‘chiq';
-  return tg('sendMessage', {
-    chat_id: chatId,
-    text: `OLYE Info Bot v6\n\nAuto Outreach: ${status}\n\nBu versiya faqat ma’lumot + oferta yuboradi va keyin to‘xtaydi.`,
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '📣 Auto 1 soat', callback_data: 'auto:1' }, { text: '📣 Auto 2 soat', callback_data: 'auto:2' }],
-        [{ text: '📣 Auto 3 soat', callback_data: 'auto:3' }, { text: '⛔ Auto OFF', callback_data: 'auto:off' }],
-        [{ text: '📊 Hisobot', callback_data: 'report' }, { text: '🆕 Pending', callback_data: 'pending' }],
-        [{ text: '🧹 Pending tozalash', callback_data: 'clear_pending' }]
-      ]
-    }
-  });
+  return sendDashboard(chatId);
 }
 
 async function autoOn(chatId, hours) {
-  const value = await enableAutoOutreach(hours);
+  const value = await enableAutoOutreach(hours, 'manual');
   return tg('sendMessage', {
     chat_id: chatId,
     text: `✅ Auto Outreach ${hours} soatga yoqildi.\n\nTugash vaqti: ${new Date(value.until).toLocaleString('uz-UZ')}\n\nShu vaqt ichida siz yozgan “Assalomu alaykum...” xabarlari eslab qolinadi va faqat o‘sha lidlarga bot avtomatik javob beradi.`
@@ -703,7 +1011,7 @@ async function autoOn(chatId, hours) {
 }
 
 async function autoOff(chatId) {
-  await disableAutoOutreach();
+  await disableAutoOutreach(false);
   return tg('sendMessage', { chat_id: chatId, text: '⛔ Auto Outreach o‘chirildi.' });
 }
 
@@ -715,35 +1023,53 @@ async function autoStatus(chatId) {
   return tg('sendMessage', { chat_id: chatId, text });
 }
 
+async function dailyStatus(chatId) {
+  const daily = await getDailyAuto();
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `📅 Kunlik Auto Outreach\n\nHolat: ${daily.enabled ? 'yoqilgan' : 'o‘chiq'}\nStart: ${daily.start_time}\nDavomiylik: ${daily.duration_hours} soat\nBugun skip: ${daily.skip_date === localDateKey() ? 'ha' : 'yo‘q'}\nOxirgi start: ${daily.last_started_date || '-'}`
+  });
+}
+
 async function sendReport(chatId) {
+  const auto = await getAutoOutreach();
+  if (auto?.session_id) return sendAutoSessionReport(chatId, auto, false);
   const stages = [STAGE.OUTREACH_SENT, STAGE.ASKED_APPLICATION, STAGE.ASKED_INFO, STAGE.INFO_SENT_FINISHED, STAGE.PENDING_APPROVAL, STAGE.PAUSED, STAGE.DISABLED];
   const parts = [];
   for (const st of stages) {
-    const { count } = await supabase.from('business_leads').select('*', { count: 'exact', head: true }).eq('stage', st);
-    parts.push(`${st}: ${count || 0}`);
+    parts.push(`${st}: ${await countLeads(q => q.eq('stage', st))}`);
   }
   return tg('sendMessage', { chat_id: chatId, text: `📊 Hisobot\n\n${parts.join('\n')}` });
 }
 
-async function sendPending(chatId) {
-  const { data, error } = await supabase
-    .from('business_leads')
-    .select('*')
-    .in('stage', [STAGE.PENDING_APPROVAL, STAGE.OUTREACH_SENT, STAGE.PAUSED])
-    .order('updated_at', { ascending: false })
-    .limit(20);
-  if (error) return tg('sendMessage', { chat_id: chatId, text: `Xato: ${error.message}` });
-  if (!data?.length) return tg('sendMessage', { chat_id: chatId, text: 'Pending lidlar yo‘q.' });
-  return tg('sendMessage', { chat_id: chatId, text: data.map(leadCardText).join('\n\n---\n\n') });
+async function healthTemplates(chatId) {
+  const keys = ['ask_application', 'ask_info', 'known_info_preface', 'unknown_info_preface', 'short_intro', 'full_intro', 'offer_end', 'application_link_reply', 'clarify_application', 'media_text_request', 'offer_followup'];
+  const missing = [];
+  for (const k of keys) if (!(await getTemplate(k))) missing.push(k);
+  return tg('sendMessage', { chat_id: chatId, text: missing.length ? `⚠️ Yetishmayotgan template:\n${missing.join('\n')}` : '✅ Barcha kerakli template mavjud.' });
 }
 
-async function healthTemplates(chatId) {
-  const keys = ['ask_application', 'ask_info', 'known_info_preface', 'unknown_info_preface', 'short_intro', 'full_intro', 'offer_end', 'application_link_reply', 'clarify_application', 'media_text_request'];
+async function diagnostics(chatId) {
+  const auto = await getAutoOutreach();
+  const daily = await getDailyAuto();
   const missing = [];
-  for (const k of keys) {
-    if (!(await getTemplate(k))) missing.push(k);
-  }
-  return tg('sendMessage', { chat_id: chatId, text: missing.length ? `⚠️ Yetishmayotgan template:\n${missing.join('\n')}` : '✅ Barcha kerakli template mavjud.' });
+  for (const k of ['ask_application', 'ask_info', 'full_intro', 'offer_end', 'offer_followup']) if (!(await getTemplate(k))) missing.push(k);
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `🩺 Bot holati\n\n` +
+      `Webhook: /webhook-info orqali tekshiring\n` +
+      `Supabase: ok\n` +
+      `Auto Outreach: ${isAutoActive(auto) ? 'yoqilgan' : 'o‘chiq'}\n` +
+      `Kunlik timer: ${daily.enabled ? 'yoqilgan' : 'o‘chiq'}\n` +
+      `Local vaqt: ${localHHMM()}\n` +
+      `Template missing: ${missing.length ? missing.join(', ') : 'yo‘q'}`
+  });
+}
+
+async function manualTick(chatId) {
+  await runSchedulerTick('manual');
+  return tg('sendMessage', { chat_id: chatId, text: '✅ Tick bajarildi.' });
 }
 
 async function handleCallback(cb) {
@@ -751,28 +1077,32 @@ async function handleCallback(cb) {
   const chatId = cb.message?.chat?.id;
   await answerCallback(cb.id);
   if (!chatId) return;
+
+  if (data === 'menu' || data === 'noop') return sendDashboard(chatId);
+  if (data === 'outreach_menu') return sendOutreachMenu(chatId);
   if (data.startsWith('auto:')) {
     const arg = data.split(':')[1];
     if (arg === 'off') return autoOff(chatId);
     return autoOn(chatId, Number(arg) || AUTO_OUTREACH_DEFAULT_HOURS);
   }
+  if (data === 'daily:on_default') {
+    await setDailyAuto({ enabled: true, start_time: DAILY_DEFAULT_START, duration_hours: DAILY_DEFAULT_DURATION_HOURS, skip_date: null });
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Kunlik auto yoqildi: ${DAILY_DEFAULT_START}, ${DAILY_DEFAULT_DURATION_HOURS} soat` });
+  }
+  if (data === 'daily:off') {
+    await setDailyAuto({ enabled: false });
+    return tg('sendMessage', { chat_id: chatId, text: '⛔ Kunlik auto o‘chirildi.' });
+  }
+  if (data === 'daily:skip_today') {
+    await setDailyAuto({ skip_date: localDateKey() });
+    return tg('sendMessage', { chat_id: chatId, text: '⏸ Bugungi kun uchun auto outreach o‘chirildi. Ertaga yana odatdagidek ishlaydi.' });
+  }
   if (data === 'report') return sendReport(chatId);
-  if (data === 'pending') return sendPending(chatId);
-  if (data === 'clear_pending') {
-    return tg('sendMessage', {
-      chat_id: chatId,
-      text: 'Tasdiq kutayotgan/pending lidlar disabled qilinadi. Tasdiqlaysizmi?',
-      reply_markup: { inline_keyboard: [[{ text: '✅ Ha, tozalash', callback_data: 'clear_pending_yes' }, { text: '❌ Bekor qilish', callback_data: 'noop' }]] }
-    });
-  }
-  if (data === 'clear_pending_yes') {
-    const { data: rows } = await supabase.from('business_leads').select('chat_id').in('stage', [STAGE.PENDING_APPROVAL, STAGE.PAUSED]);
-    const ids = (rows || []).map(r => r.chat_id);
-    if (ids.length) {
-      await supabase.from('business_leads').update({ stage: STAGE.DISABLED, status: 'disabled', bot_enabled: false, updated_at: new Date().toISOString() }).in('chat_id', ids);
-    }
-    return tg('sendMessage', { chat_id: chatId, text: `🧹 ${ids.length} ta lid disabled qilindi.` });
-  }
+  if (data === 'diagnostics') return diagnostics(chatId);
+  if (data === 'templates') return tg('sendMessage', { chat_id: chatId, text: '✏️ Shablonlar uchun buyruqlar:\n/gettemplate key\n/settemplate key yangi matn\n\nMuhim: supabase.sql eski shablonlarni overwrite qilmaydi.' });
+  if (data.startsWith('list:')) return sendList(chatId, data.split(':')[1]);
+  if (data === 'reminder_preview') return sendReminderPreview(chatId);
+  if (data === 'reminder_confirm') return sendReminderConfirm(chatId);
 }
 
 function leadCardText(lead) {
@@ -783,6 +1113,10 @@ function leadCardText(lead) {
 app.get('/', (_, res) => res.json({ ok: true, name: 'OLYE Info Bot v6', mode: 'info-only' }));
 app.get('/health', (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
 app.get('/webhook', (_, res) => res.json({ ok: true, note: 'Telegram uses POST /webhook' }));
+app.get('/tick', async (_, res) => {
+  await runSchedulerTick('http');
+  res.json({ ok: true, ticked_at: new Date().toISOString() });
+});
 
 app.get('/set-webhook', async (req, res) => {
   try {
@@ -812,9 +1146,7 @@ app.post('/webhook', async (req, res) => {
     const header = req.get('x-telegram-bot-api-secret-token');
     if (header !== WEBHOOK_SECRET) return res.status(403).json({ ok: false });
   }
-
   res.json({ ok: true });
-
   try {
     const update = req.body || {};
     if (update.callback_query) await handleCallback(update.callback_query);
@@ -834,9 +1166,10 @@ app.post('/webhook', async (req, res) => {
 
 // -------------------- Utils --------------------
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-function html(s = '') {
-  return String(s).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
-}
+function html(s = '') { return String(s).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch])); }
+function short(s = '', n = 80) { const x = String(s || ''); return x.length > n ? x.slice(0, n - 1) + '…' : x; }
+
+setInterval(() => runSchedulerTick('interval'), SCHEDULER_TICK_MS).unref();
 
 app.listen(PORT, () => {
   console.log(`OLYE Info Bot v6 running on port ${PORT}`);
