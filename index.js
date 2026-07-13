@@ -21,6 +21,10 @@ const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 5000);
 const AUTO_START_REQUIRE_OUTREACH = String(process.env.AUTO_START_REQUIRE_OUTREACH || 'true') === 'true';
 const AUTO_OUTREACH_DEFAULT_HOURS = Number(process.env.AUTO_OUTREACH_DEFAULT_HOURS || 2);
 const OUTREACH_GREETING_REQUIRED = String(process.env.OUTREACH_GREETING_REQUIRED || 'true') === 'true';
+// Agar Telegram scheduled/outgoing xabarni outreach sifatida ko‘rmasa ham,
+// bot mijoz javobidan yoki adminning oxirgi xabaridan vaziyatni aniqlab davom ettiradi.
+const CONTEXT_RESUME_ENABLED = String(process.env.CONTEXT_RESUME_ENABLED || 'true') === 'true';
+const CONTEXT_RESUME_FROM_USER_CONFIRM = String(process.env.CONTEXT_RESUME_FROM_USER_CONFIRM || 'true') === 'true';
 const DAILY_DEFAULT_START = process.env.DAILY_AUTO_START || '07:00';
 const DAILY_DEFAULT_DURATION_HOURS = Number(process.env.DAILY_AUTO_DURATION_HOURS || 2);
 const LOCAL_UTC_OFFSET_HOURS = Number(process.env.LOCAL_UTC_OFFSET_HOURS || 5);
@@ -383,6 +387,154 @@ async function markOutreach({ chatId, businessConnectionId, from, text }) {
   await logEvent(chatId, 'outreach_sent_detected', text);
 }
 
+function detectAdminPromptStage(text = '') {
+  const t = normalize(text);
+  if (!t) return null;
+
+  // Admin mijozga o‘zi shu savolni yuborgan bo‘lsa, keyingi mijoz javobini shu bosqichdan davom ettiramiz.
+  const asksApplication =
+    (t.includes('ariza') && (t.includes('qoldirgansiz') || t.includes('qoldirgan') || t.includes('qoldirdingiz')) && (t.includes('shunaqami') || t.includes('shundaymi') || t.includes('togri') || t.includes("to'g'ri") || t.includes('to‘g‘ri')))
+    || (t.includes('ozbekiston lider yoshlari ensiklopediyasi') && t.includes('ariza'));
+  if (asksApplication) return STAGE.ASKED_APPLICATION;
+
+  const asksInfo =
+    (t.includes('foydali jihat') && (t.includes('malumot') || t.includes("ma'lumot") || t.includes('ma’lumot')) && (t.includes('egamisiz') || t.includes('xabardormisiz') || t.includes('bilasizmi')))
+    || ((t.includes('ensiklopediyamiz') || t.includes('ensiklopediya')) && (t.includes('foydali') || t.includes('batafsil')) && (t.includes('egamisiz') || t.includes('bilasizmi')));
+  if (asksInfo) return STAGE.ASKED_INFO;
+
+  // Agar admin oferta/matnni o‘zi yuborgan bo‘lsa, bot bu chatda yana avtomatik aralashmaydi.
+  const looksLikeOffer = t.includes('men yakuniy shartlarga roziman') || (t.includes('oferta') && t.includes('tanish'));
+  if (looksLikeOffer) return STAGE.INFO_SENT_FINISHED;
+
+  return null;
+}
+
+async function syncAdminContext({ chatId, businessConnectionId, from, text }) {
+  const existing = await getLead(chatId);
+  const detectedStage = detectAdminPromptStage(text);
+  const basePatch = {
+    business_connection_id: businessConnectionId || existing?.business_connection_id || null,
+    first_name: existing?.first_name || from?.first_name || null,
+    username: existing?.username || from?.username || null,
+    last_admin_message: text || '[media]',
+    last_message_at: new Date().toISOString()
+  };
+
+  if (!detectedStage) {
+    if (existing) await updateLead(chatId, basePatch);
+    else await createLead({ chatId, businessConnectionId, from, text, stage: STAGE.NEW, status: 'active', botEnabled: false });
+    await logEvent(chatId, 'admin_context_saved', text || '[media]');
+    return;
+  }
+
+  const patch = {
+    ...basePatch,
+    stage: detectedStage,
+    status: detectedStage === STAGE.INFO_SENT_FINISHED ? 'info_sent' : 'active',
+    bot_enabled: detectedStage !== STAGE.INFO_SENT_FINISHED,
+    outreach_sent: true,
+    outreach_session_id: existing?.outreach_session_id || `admin_context_${localDateKey()}_${Date.now()}`,
+    outreach_message: text || '[admin prompt]',
+    outreach_at: existing?.outreach_at || new Date().toISOString(),
+    finished_at: detectedStage === STAGE.INFO_SENT_FINISHED ? (existing?.finished_at || new Date().toISOString()) : null
+  };
+
+  if (existing) await updateLead(chatId, patch);
+  else {
+    await createLead({ chatId, businessConnectionId, from, text, stage: detectedStage, status: patch.status, botEnabled: patch.bot_enabled });
+    await updateLead(chatId, patch);
+  }
+  await logEvent(chatId, `admin_context_stage_${detectedStage}`, text || '[media]');
+}
+
+function strongUserApplicationAnswer(text = '') {
+  const t = normalize(text);
+  if (!t) return null;
+  // Faqat juda aniq javoblarda outreachsiz ham davom ettiramiz.
+  // Oddiy “ha” yoki “yo‘q” yetarli emas, aks holda eski chatlarda xato javob berib yuborishi mumkin.
+  if (includesAny(t, ['ha shunday', 'xa shunday', 'shunday', 'togri', "to'g'ri", 'to‘g‘ri', 'ariza qoldirdim', 'qoldirdim', 'qoldirgandim', 'instagramda', 'yozgandim', 'dostim aytdi', "do'stim aytdi", 'do‘stim aytdi'])) {
+    return 'application_confirmed';
+  }
+  if (includesAny(t, ['ariza qoldirmadim', 'qoldirmadim', 'qoldirmaganman', 'hali qoldirmadim', 'qanday qoshil', "qanday qo'shil", 'qanday qo‘shil', 'qoshilsam', "qo'shilsam", 'qo‘shilsam', 'link yubor', 'havola yubor', 'ariza qayer'])) {
+    return 'application_not_submitted';
+  }
+  return null;
+}
+
+async function tryResumeFromContext(lead, text) {
+  if (!CONTEXT_RESUME_ENABLED || !lead) return { handled: false, lead };
+  const lastAdminStage = detectAdminPromptStage(lead.last_admin_message || '');
+  let assumedStage = lastAdminStage;
+  let reason = lastAdminStage ? 'last_admin_message' : '';
+  let forcedIntent = null;
+
+  // Agar scheduled xabar webhook’da umuman ko‘rinmagan bo‘lsa, mijozning juda aniq javobidan vaziyatni tushunamiz.
+  if (!assumedStage && CONTEXT_RESUME_FROM_USER_CONFIRM) {
+    forcedIntent = strongUserApplicationAnswer(text);
+    if (forcedIntent) {
+      assumedStage = STAGE.ASKED_APPLICATION;
+      reason = 'strong_user_confirmation_without_outreach';
+    }
+  }
+
+  if (!assumedStage) return { handled: false, lead };
+
+  let current = await updateLead(lead.chat_id, {
+    stage: assumedStage,
+    status: assumedStage === STAGE.INFO_SENT_FINISHED ? 'info_sent' : 'active',
+    bot_enabled: assumedStage !== STAGE.INFO_SENT_FINISHED,
+    outreach_sent: true,
+    outreach_session_id: lead.outreach_session_id || `context_resume_${localDateKey()}_${Date.now()}`,
+    outreach_message: lead.last_admin_message || '[context resume]',
+    outreach_at: lead.outreach_at || new Date().toISOString(),
+    finished_at: assumedStage === STAGE.INFO_SENT_FINISHED ? (lead.finished_at || new Date().toISOString()) : null
+  }) || lead;
+
+  await logEvent(lead.chat_id, `context_resume_${assumedStage}_${reason}`, text || '');
+
+  if (assumedStage === STAGE.INFO_SENT_FINISHED) {
+    await handlePostFinishSignal(current, {}, text);
+    return { handled: true, lead: current };
+  }
+
+  if (assumedStage === STAGE.ASKED_APPLICATION) {
+    const intent = forcedIntent || classify(text, STAGE.ASKED_APPLICATION);
+    if (intent === 'application_confirmed' || intent === 'application_submitted') {
+      current = await sendPackage(current, 'ask_info_context_resume', ['ask_info'], { stage: STAGE.ASKED_INFO, status: 'active', bot_enabled: true }) || current;
+      return { handled: true, lead: current };
+    }
+    if (intent === 'application_not_submitted') {
+      current = await sendPackage(current, 'application_link_context_resume', ['application_link_reply'], {
+        stage: STAGE.INFO_SENT_FINISHED,
+        status: 'application_link_sent',
+        bot_enabled: false,
+        finished_at: new Date().toISOString()
+      }) || current;
+      await sendAdmin(`🔗 <b>Ariza havolasi yuborildi</b>
+Chat ID: <code>${current.chat_id}</code>
+Context resume orqali.`);
+      return { handled: true, lead: current };
+    }
+    return { handled: false, lead: current };
+  }
+
+  if (assumedStage === STAGE.ASKED_INFO) {
+    const intent = classify(text, STAGE.ASKED_INFO);
+    if (intent === 'has_info') {
+      const after = await sendPackage(current, 'known_info_context_resume', ['known_info_preface', 'short_intro', 'offer_end'], {});
+      await finishAfterInfo(after || current);
+      return { handled: true, lead: after || current };
+    }
+    if (intent === 'no_info' || intent === 'unclear' || intent === 'payment_near' || intent === 'read_offer') {
+      const after = await sendPackage(current, 'unknown_info_context_resume', ['unknown_info_preface', 'full_intro', 'offer_end'], {});
+      await finishAfterInfo(after || current);
+      return { handled: true, lead: after || current };
+    }
+  }
+
+  return { handled: false, lead: current };
+}
+
 // -------------------- Daily scheduler --------------------
 function localNow() {
   return new Date(Date.now() + LOCAL_UTC_OFFSET_HOURS * 3600000);
@@ -586,11 +738,10 @@ async function handleBusinessMessage(msg) {
     return;
   }
 
-  // Owner/admin outgoing message: remember outreach only. Do not respond.
+  // Owner/admin outgoing message: remember outreach/context. Do not respond to the admin message itself.
   if (isOwnerMessage(msg)) {
     if (text) await markOutreach({ chatId, businessConnectionId, from: msg.from, text });
-    const existing = await getLead(chatId);
-    if (existing) await updateLead(chatId, { last_admin_message: text || '[media]', last_message_at: new Date().toISOString() });
+    await syncAdminContext({ chatId, businessConnectionId, from: msg.from, text: text || '[media]' });
     return;
   }
 
@@ -603,22 +754,30 @@ async function handleBusinessMessage(msg) {
     return;
   }
 
-  // Default safety: if this was not an outreach chat, do not auto-answer.
+  // Default safety: if this was not an outreach chat, try to continue from admin context first.
+  // Masalan scheduled xabar yoki admin qo‘lda “ariza qoldirgansizmi?” deb yozgan,
+  // mijoz “ha shunday” deb javob bergan bo‘lsa, bot to‘g‘ri bosqichdan davom etadi.
+  let activeLead = lead;
   if (AUTO_START_REQUIRE_OUTREACH && !lead.outreach_sent) {
-    await updateLead(chatId, { stage: STAGE.PENDING_APPROVAL, status: 'pending_approval', bot_enabled: false });
-    await logEvent(chatId, 'ignored_not_outreach', rawText);
-    return;
+    const resumed = await tryResumeFromContext(lead, rawText);
+    if (resumed.handled) return;
+    activeLead = resumed.lead || lead;
+    if (!activeLead.outreach_sent) {
+      await updateLead(chatId, { stage: STAGE.PENDING_APPROVAL, status: 'pending_approval', bot_enabled: false });
+      await logEvent(chatId, 'ignored_not_outreach', rawText);
+      return;
+    }
   }
 
-  if (!lead.bot_enabled) return;
+  if (!activeLead.bot_enabled) return;
 
   if (isMediaOnly(msg)) {
-    await sendPackage(lead, 'media_text_request', ['media_text_request'], {});
+    await sendPackage(activeLead, 'media_text_request', ['media_text_request'], {});
     await logEvent(chatId, 'media_received', JSON.stringify(Object.keys(msg).slice(0, 10)));
     return;
   }
 
-  enqueueLeadMessage(lead, text);
+  enqueueLeadMessage(activeLead, text);
 }
 
 async function handlePostFinishSignal(lead, msg, rawText) {
