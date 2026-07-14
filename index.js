@@ -182,6 +182,11 @@ async function getAccount(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   return accounts.find(a => a.account_key === key) || accounts[0] || DEFAULT_ACCOUNT;
 }
 
+async function getAdminChatIdForAccount(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = await getAccount(accountOrKey);
+  return account.admin_chat_id || (isDefaultAccountKey(account.account_key) ? ADMIN_CHAT_ID : '');
+}
+
 async function findAccountForBusinessMessage(msg) {
   const fromId = String(msg?.from?.id || '');
   const businessConnectionId = String(msg?.business_connection_id || msg?.business_connection?.id || '');
@@ -193,6 +198,16 @@ async function findAccountForBusinessMessage(msg) {
   ));
   if (direct) return direct;
   if (businessConnectionId) {
+    let archiveQ = supabase.from('message_archive')
+      .select('account_key')
+      .eq('business_connection_id', businessConnectionId)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (chatId) archiveQ = archiveQ.eq('chat_id', chatId);
+    const { data: archiveRows } = await archiveQ;
+    const archiveKey = archiveRows?.[0]?.account_key;
+    if (archiveKey) return accounts.find(a => a.account_key === archiveKey) || { ...DEFAULT_ACCOUNT, account_key: archiveKey };
+
     let q = supabase.from('business_leads')
       .select('account_key')
       .eq('business_connection_id', businessConnectionId)
@@ -204,6 +219,76 @@ async function findAccountForBusinessMessage(msg) {
     if (learnedKey) return accounts.find(a => a.account_key === learnedKey) || { ...DEFAULT_ACCOUNT, account_key: learnedKey };
   }
   return DEFAULT_ACCOUNT;
+}
+
+async function findAccountByBusinessConnectionId(businessConnectionId) {
+  if (!businessConnectionId) return null;
+  const accounts = await getAccounts();
+  return accounts.find(a => a.business_connection_id && String(a.business_connection_id) === String(businessConnectionId)) || null;
+}
+
+async function findArchivedMessage({ businessConnectionId = '', chatId = '', messageId = null, accountKey: ak = null }) {
+  if (!chatId || !messageId) return null;
+  let q = supabase.from('message_archive')
+    .select('*')
+    .eq('chat_id', String(chatId))
+    .eq('message_id', messageId)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (businessConnectionId) q = q.eq('business_connection_id', String(businessConnectionId));
+  if (ak) q = q.eq('account_key', ak);
+  const { data, error } = await q;
+  if (error) {
+    console.error('findArchivedMessage:', error.message);
+    return null;
+  }
+  return data?.[0] || null;
+}
+
+async function resolveArchiveAccount(update = {}, messageId = null, mode = 'deleted') {
+  const businessConnectionId = update.business_connection_id || update.business_connection?.id || '';
+  const chatId = String(update.chat?.id || update.chat_id || '');
+  const accounts = await getAccounts();
+
+  if (mode === 'deleted') {
+    const direct = await findAccountByBusinessConnectionId(businessConnectionId);
+    if (direct) return { account: direct, reason: 'business_connection_id_account' };
+  }
+
+  if (businessConnectionId && chatId && messageId) {
+    const archived = await findArchivedMessage({ businessConnectionId, chatId, messageId });
+    if (archived?.account_key) {
+      const account = accounts.find(a => a.account_key === archived.account_key) || { ...DEFAULT_ACCOUNT, account_key: archived.account_key };
+      return { account, archived, reason: 'message_archive_business_connection_chat_message' };
+    }
+  }
+
+  if (mode === 'edited' && chatId && messageId) {
+    const archived = await findArchivedMessage({ chatId, messageId });
+    if (archived?.account_key) {
+      const account = accounts.find(a => a.account_key === archived.account_key) || { ...DEFAULT_ACCOUNT, account_key: archived.account_key };
+      return { account, archived, reason: 'message_archive_chat_message' };
+    }
+  }
+
+  const direct = await findAccountByBusinessConnectionId(businessConnectionId);
+  if (direct) return { account: direct, reason: 'business_connection_id_account_late' };
+
+  if (mode === 'edited') {
+    const bySender = accounts.find(a => (
+      (a.business_owner_id && update.from?.id && String(a.business_owner_id) === String(update.from.id)) ||
+      (a.admin_chat_id && update.from?.id && String(a.admin_chat_id) === String(update.from.id))
+    ));
+    if (bySender) return { account: bySender, reason: 'from_id_account' };
+  }
+
+  await logEvent(chatId || 'unknown', 'archive_account_resolution_failed', JSON.stringify({
+    mode,
+    business_connection_id: businessConnectionId || null,
+    chat_id: chatId || null,
+    message_id: messageId || null
+  }).slice(0, 1200));
+  return { account: DEFAULT_ACCOUNT, archived: null, reason: 'fallback_default' };
 }
 
 async function rememberAccountBusinessConnection(account, businessConnectionId) {
@@ -1218,18 +1303,19 @@ async function archiveBusinessMessage(msg, account, direction = 'unknown') {
 }
 
 async function archiveEditedBusinessMessage(msg) {
-  const account = await findAccountForBusinessMessage(msg);
+  const resolved = await resolveArchiveAccount(msg, msg.message_id, 'edited');
+  const account = resolved.account;
   if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false) return;
   const direction = isOwnerMessage(msg) ? 'outgoing' : 'incoming';
   const payload = messageArchivePayload(msg, account, direction, 'edited');
   if (!payload.chat_id || !payload.message_id) return;
 
-  const { data: oldRow } = await supabase.from('message_archive')
-    .select('*')
-    .eq('account_key', payload.account_key)
-    .eq('chat_id', payload.chat_id)
-    .eq('message_id', payload.message_id)
-    .maybeSingle();
+  const oldRow = resolved.archived || await findArchivedMessage({
+    businessConnectionId: payload.business_connection_id,
+    chatId: payload.chat_id,
+    messageId: payload.message_id,
+    accountKey: payload.account_key
+  });
   const storage = oldRow?.storage_path ? {} : await maybeArchiveMediaFile(payload);
 
   await supabase.from('message_edit_history').insert({
@@ -1257,7 +1343,7 @@ async function archiveEditedBusinessMessage(msg) {
   }, { onConflict: 'account_key,chat_id,message_id' });
   if (error) console.error('archiveEditedBusinessMessage:', error.message);
 
-  if (account.archive_notify_enabled !== false) await notifyEditedMessage(account, oldRow, payload);
+  if (account.archive_notify_enabled !== false) await notifyEditedMessage(account, oldRow, payload, resolved.reason);
 }
 
 function deletedMessageIds(update = {}) {
@@ -1266,44 +1352,63 @@ function deletedMessageIds(update = {}) {
 }
 
 async function handleDeletedBusinessMessages(update = {}) {
-  const account = await findAccountForBusinessMessage(update);
-  if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false) return;
-  const ak = account.account_key;
-  const businessConnectionId = update.business_connection_id || update.business_connection?.id || account.business_connection_id || null;
+  const businessConnectionId = update.business_connection_id || update.business_connection?.id || null;
   const chatId = String(update.chat?.id || update.chat_id || '');
   if (!chatId) return;
   for (const messageId of deletedMessageIds(update)) {
     if (!messageId) continue;
-    const { data: oldRow } = await supabase.from('message_archive')
-      .select('*')
-      .eq('account_key', ak)
-      .eq('chat_id', chatId)
-      .eq('message_id', messageId)
-      .maybeSingle();
+    const resolved = await resolveArchiveAccount(update, messageId, 'deleted');
+    const account = resolved.account;
+    if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false) continue;
+    const ak = account.account_key;
+    let oldRow = resolved.archived || await findArchivedMessage({
+      businessConnectionId,
+      chatId,
+      messageId,
+      accountKey: ak
+    });
+    if (!oldRow) {
+      oldRow = await findArchivedMessage({ businessConnectionId, chatId, messageId });
+    }
     const patch = {
       account_key: ak,
-      business_connection_id: businessConnectionId,
+      business_connection_id: businessConnectionId || oldRow?.business_connection_id || account.business_connection_id || null,
       chat_id: chatId,
       message_id: messageId,
       deleted_at: new Date().toISOString(),
       delete_detected: true,
       last_event_type: 'deleted'
     };
+    const storedRow = oldRow?.account_key === ak ? oldRow : null;
     const { error } = await supabase.from('message_archive').upsert({
-      ...(oldRow || {}),
+      ...(storedRow || {}),
       ...patch,
-      id: oldRow?.id
+      id: storedRow?.id
     }, { onConflict: 'account_key,chat_id,message_id' });
     if (error) console.error('handleDeletedBusinessMessages:', error.message);
-    if (account.archive_notify_enabled !== false) await notifyDeletedMessage(account, oldRow || patch);
+    if (account.archive_notify_enabled !== false) await notifyDeletedMessage(account, oldRow ? { ...oldRow, ...patch } : patch, resolved.reason);
   }
 }
 
-async function notifyDeletedMessage(account, row) {
+async function notifyDeletedMessage(account, row, resolutionReason = '') {
   const archived = row?.storage_path || row?.file_id ? 'Ha' : 'Yo‘q';
   const actor = row?.from_username ? `@${row.from_username}` : (row?.from_first_name || 'Foydalanuvchi');
   const item = row?.message_type === 'photo' ? 'rasmni' : row?.file_id ? `${row.message_type || 'media'}ni` : 'xabarni';
-  await sendAdmin(
+  const targetAdminChatId = await getAdminChatIdForAccount(account.account_key);
+  if (!targetAdminChatId) {
+    await logEvent(row?.chat_id || 'unknown', 'archive_deleted_notification_admin_missing', JSON.stringify({
+      resolved_account_key: account.account_key,
+      business_connection_id: row?.business_connection_id || null,
+      chat_id: row?.chat_id || null,
+      message_ids: [row?.message_id].filter(Boolean),
+      resolution_reason: resolutionReason
+    }), account.account_key);
+    return;
+  }
+  await tg('sendMessage', {
+    chat_id: targetAdminChatId,
+    parse_mode: 'HTML',
+    text:
     `🗑 <b>${html(actor)} ushbu ${html(item)} o‘chirdi</b>\n\n` +
     `Akkaunt: ${html(account.label || account.account_key)}\n` +
     `Project: ${html(account.project_name || '-')}\n` +
@@ -1311,30 +1416,58 @@ async function notifyDeletedMessage(account, row) {
     `Message ID: <code>${html(row.message_id || '-')}</code>\n` +
     `Turi: ${html(row.message_type || '-')}\n` +
     `Matn: ${html(short(row.text || row.caption || '-', 500))}\n` +
-    `Media arxiv: ${archived}`,
-    {},
-    account.account_key
-  );
+    `Media arxiv: ${archived}`
+  });
+  await logEvent(row?.chat_id || 'unknown', 'archive_deleted_notification_sent', JSON.stringify({
+    event_type: 'deleted',
+    resolved_account_key: account.account_key,
+    target_admin_chat_id: targetAdminChatId || null,
+    business_connection_id: row?.business_connection_id || null,
+    chat_id: row?.chat_id || null,
+    message_ids: [row?.message_id].filter(Boolean),
+    resolution_reason: resolutionReason
+  }), account.account_key);
   await sendArchivedMediaToAdmin(account, row, `O‘chirilgan ${row?.message_type === 'photo' ? 'rasm' : 'media'} arxivi`);
 }
 
-async function notifyEditedMessage(account, oldRow, payload) {
+async function notifyEditedMessage(account, oldRow, payload, resolutionReason = '') {
   const actor = payload?.from_username ? `@${payload.from_username}` : (payload?.from_first_name || 'Foydalanuvchi');
-  await sendAdmin(
+  const targetAdminChatId = await getAdminChatIdForAccount(account.account_key);
+  if (!targetAdminChatId) {
+    await logEvent(payload.chat_id || 'unknown', 'archive_edited_notification_admin_missing', JSON.stringify({
+      resolved_account_key: account.account_key,
+      business_connection_id: payload.business_connection_id || null,
+      chat_id: payload.chat_id || null,
+      message_ids: [payload.message_id].filter(Boolean),
+      resolution_reason: resolutionReason
+    }), account.account_key);
+    return;
+  }
+  await tg('sendMessage', {
+    chat_id: targetAdminChatId,
+    parse_mode: 'HTML',
+    text:
     `✏️ <b>${html(actor)} ushbu xabarni tahrirladi</b>\n\n` +
     `Akkaunt: ${html(account.label || account.account_key)}\n` +
     `Chat ID: <code>${html(payload.chat_id || '-')}</code>\n` +
     `Message ID: <code>${html(payload.message_id || '-')}</code>\n` +
     `Eski xabar:\n${html(short(oldRow?.text || oldRow?.caption || '-', 700))}\n\n` +
-    `Yangi xabar:\n${html(short(payload.text || payload.caption || '-', 700))}`,
-    {},
-    account.account_key
-  );
+    `Yangi xabar:\n${html(short(payload.text || payload.caption || '-', 700))}`
+  });
+  await logEvent(payload.chat_id || 'unknown', 'archive_edited_notification_sent', JSON.stringify({
+    event_type: 'edited',
+    resolved_account_key: account.account_key,
+    target_admin_chat_id: targetAdminChatId || null,
+    business_connection_id: payload.business_connection_id || null,
+    chat_id: payload.chat_id || null,
+    message_ids: [payload.message_id].filter(Boolean),
+    resolution_reason: resolutionReason
+  }), account.account_key);
 }
 
 async function sendArchivedMediaToAdmin(account, row, caption = 'Media arxiv') {
   if (!row?.file_id) return;
-  const adminChatId = account.admin_chat_id || ADMIN_CHAT_ID;
+  const adminChatId = await getAdminChatIdForAccount(account.account_key);
   if (!adminChatId) return;
   const payload = { chat_id: adminChatId, caption };
   try {
@@ -1725,15 +1858,27 @@ async function getArchiveRows(type, accountOrKey = DEFAULT_ACCOUNT_KEY, chatId =
   return data || [];
 }
 
-function archiveRowsText(title, rows) {
+async function archiveRowsText(title, rows) {
   if (!rows.length) return `${title}\n\nHozircha ro‘yxat bo‘sh.`;
-  return `${title}\n\n` + rows.map((r, i) => (
-    `${i + 1}. ${r.from_username ? '@' + r.from_username : (r.from_first_name || '-') } — ${r.direction || 'unknown'} ${r.message_type || 'other'}\n` +
-    `   Chat ID: ${r.chat_id}\n` +
-    `   Message ID: ${r.message_id}\n` +
-    `   Text: ${short(r.text || r.caption || '-', 90)}\n` +
-    `   Event: ${r.last_event_type || '-'}${r.delete_detected ? ' / deleted' : ''}${r.edit_count ? ` / edits:${r.edit_count}` : ''}`
-  )).join('\n\n');
+  const lines = [];
+  for (const [i, r] of rows.entries()) {
+    const adminChatId = await getAdminChatIdForAccount(r.account_key || DEFAULT_ACCOUNT_KEY);
+    lines.push(
+      `${i + 1}. ${r.from_username ? '@' + r.from_username : (r.from_first_name || '-') } — ${r.direction || 'unknown'} ${r.message_type || 'other'}\n` +
+      `   Chat ID: ${r.chat_id}\n` +
+      `   Message ID: ${r.message_id}\n` +
+      `   Business connection: ${r.business_connection_id || '-'}\n` +
+      `   Account: ${r.account_key || '-'}\n` +
+      `   Notification admin: ${adminChatId || '-'}\n` +
+      `   From username: ${r.from_username ? '@' + r.from_username : '-'}\n` +
+      `   Type: ${r.message_type || 'other'}\n` +
+      `   Deleted at: ${r.deleted_at || '-'}\n` +
+      `   Edited at: ${r.edited_at || '-'}\n` +
+      `   Text: ${short(r.text || r.caption || '-', 90)}\n` +
+      `   Event: ${r.last_event_type || '-'}${r.delete_detected ? ' / deleted' : ''}${r.edit_count ? ` / edits:${r.edit_count}` : ''}`
+    );
+  }
+  return `${title}\n\n${lines.join('\n\n')}`;
 }
 
 function archiveMenuKeyboard() {
@@ -1765,7 +1910,7 @@ async function sendArchiveList(chatId, type = 'recent', accountOrKey = DEFAULT_A
     chat: `🔎 Chat arxivi: ${targetChatId}`
   };
   const rows = await getArchiveRows(type === 'chat' ? 'recent' : type, accountOrKey, targetChatId, 10);
-  return tg('sendMessage', { chat_id: chatId, text: archiveRowsText(titles[type] || titles.recent, rows) });
+  return tg('sendMessage', { chat_id: chatId, text: await archiveRowsText(titles[type] || titles.recent, rows) });
 }
 
 async function parseOptionalAccountArg(parts, selectedAccountKey, startIndex = 1) {
@@ -2211,7 +2356,7 @@ async function handleAdminMessage(msg) {
   if (text === '/deleted' || text.startsWith('/deleted ')) return sendArchiveList(chatId, 'deleted', text.split(/\s+/)[1] || selectedAccountKey);
   if (text === '/edited' || text.startsWith('/edited ')) return sendArchiveList(chatId, 'edited', text.split(/\s+/)[1] || selectedAccountKey);
   if (text === '/media' || text.startsWith('/media ')) return sendArchiveList(chatId, 'media', text.split(/\s+/)[1] || selectedAccountKey);
-  if (text.startsWith('/archivechat ')) {
+  if (text.startsWith('/archivechat ') || text.startsWith('/archive_debug ')) {
     const parts = text.split(/\s+/);
     const accounts = await getAccounts();
     const maybeAccount = accounts.find(a => a.account_key === parts[1]);
