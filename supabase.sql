@@ -5,6 +5,7 @@
 create table if not exists business_leads (
   id bigserial primary key,
   chat_id text unique not null,
+  account_key text,
   business_connection_id text,
   first_name text,
   username text,
@@ -25,6 +26,32 @@ create table if not exists business_leads (
   updated_at timestamptz default now()
 );
 
+create table if not exists bot_accounts (
+  account_key text primary key,
+  label text,
+  business_owner_id text,
+  admin_chat_id text,
+  business_connection_id text,
+  project_name text,
+  auto_reply_enabled boolean default false,
+  daily_auto jsonb default '{}'::jsonb,
+  flow_key text default 'info_only',
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+alter table bot_accounts add column if not exists label text;
+alter table bot_accounts add column if not exists business_owner_id text;
+alter table bot_accounts add column if not exists admin_chat_id text;
+alter table bot_accounts add column if not exists business_connection_id text;
+alter table bot_accounts add column if not exists project_name text;
+alter table bot_accounts add column if not exists auto_reply_enabled boolean default false;
+alter table bot_accounts add column if not exists daily_auto jsonb default '{}'::jsonb;
+alter table bot_accounts add column if not exists flow_key text default 'info_only';
+alter table bot_accounts add column if not exists created_at timestamptz default now();
+alter table bot_accounts add column if not exists updated_at timestamptz default now();
+
+alter table business_leads add column if not exists account_key text;
 alter table business_leads add column if not exists business_connection_id text;
 alter table business_leads add column if not exists first_name text;
 alter table business_leads add column if not exists username text;
@@ -46,18 +73,24 @@ alter table business_leads add column if not exists updated_at timestamptz defau
 
 create table if not exists reply_templates (
   key text primary key,
+  account_key text,
   title text,
   body text not null,
   updated_at timestamptz default now()
 );
 
+alter table reply_templates add column if not exists account_key text;
+
 create table if not exists lead_events (
   id bigserial primary key,
   chat_id text not null,
+  account_key text,
   event_type text not null,
   message text,
   created_at timestamptz default now()
 );
+
+alter table lead_events add column if not exists account_key text;
 
 create table if not exists processed_messages (
   message_key text primary key,
@@ -86,6 +119,106 @@ create table if not exists admin_sessions (
   payload jsonb default '{}'::jsonb,
   updated_at timestamptz default now()
 );
+
+create table if not exists message_archive (
+  id bigserial primary key,
+  account_key text,
+  business_connection_id text,
+  chat_id text not null,
+  message_id bigint not null,
+  from_id text,
+  from_username text,
+  from_first_name text,
+  direction text default 'unknown',
+  message_type text default 'other',
+  text text,
+  caption text,
+  file_id text,
+  file_unique_id text,
+  file_name text,
+  mime_type text,
+  file_size bigint,
+  storage_path text,
+  public_url text,
+  raw_json jsonb default '{}'::jsonb,
+  created_at timestamptz default now(),
+  edited_at timestamptz,
+  deleted_at timestamptz,
+  edit_count integer default 0,
+  delete_detected boolean default false,
+  last_event_type text
+);
+
+create table if not exists message_edit_history (
+  id bigserial primary key,
+  archive_id bigint,
+  account_key text,
+  chat_id text not null,
+  message_id bigint not null,
+  old_text text,
+  new_text text,
+  old_caption text,
+  new_caption text,
+  old_raw_json jsonb,
+  new_raw_json jsonb,
+  edited_at timestamptz default now()
+);
+
+alter table message_archive add column if not exists account_key text;
+alter table message_archive add column if not exists business_connection_id text;
+alter table message_archive add column if not exists chat_id text;
+alter table message_archive add column if not exists message_id bigint;
+alter table message_archive add column if not exists from_id text;
+alter table message_archive add column if not exists from_username text;
+alter table message_archive add column if not exists from_first_name text;
+alter table message_archive add column if not exists direction text default 'unknown';
+alter table message_archive add column if not exists message_type text default 'other';
+alter table message_archive add column if not exists text text;
+alter table message_archive add column if not exists caption text;
+alter table message_archive add column if not exists file_id text;
+alter table message_archive add column if not exists file_unique_id text;
+alter table message_archive add column if not exists file_name text;
+alter table message_archive add column if not exists mime_type text;
+alter table message_archive add column if not exists file_size bigint;
+alter table message_archive add column if not exists storage_path text;
+alter table message_archive add column if not exists public_url text;
+alter table message_archive add column if not exists raw_json jsonb default '{}'::jsonb;
+alter table message_archive add column if not exists created_at timestamptz default now();
+alter table message_archive add column if not exists edited_at timestamptz;
+alter table message_archive add column if not exists deleted_at timestamptz;
+alter table message_archive add column if not exists edit_count integer default 0;
+alter table message_archive add column if not exists delete_detected boolean default false;
+alter table message_archive add column if not exists last_event_type text;
+
+alter table message_edit_history add column if not exists archive_id bigint;
+alter table message_edit_history add column if not exists account_key text;
+alter table message_edit_history add column if not exists chat_id text;
+alter table message_edit_history add column if not exists message_id bigint;
+alter table message_edit_history add column if not exists old_text text;
+alter table message_edit_history add column if not exists new_text text;
+alter table message_edit_history add column if not exists old_caption text;
+alter table message_edit_history add column if not exists new_caption text;
+alter table message_edit_history add column if not exists old_raw_json jsonb;
+alter table message_edit_history add column if not exists new_raw_json jsonb;
+alter table message_edit_history add column if not exists edited_at timestamptz default now();
+
+create index if not exists business_leads_account_idx on business_leads(account_key);
+create index if not exists business_leads_account_stage_idx on business_leads(account_key, stage);
+create index if not exists business_leads_account_status_idx on business_leads(account_key, status);
+create index if not exists business_leads_account_outreach_idx on business_leads(account_key, outreach_session_id);
+create index if not exists reply_templates_account_idx on reply_templates(account_key);
+create index if not exists lead_events_account_idx on lead_events(account_key, created_at desc);
+create unique index if not exists message_archive_account_chat_message_idx on message_archive(account_key, chat_id, message_id);
+create index if not exists message_archive_chat_idx on message_archive(chat_id);
+create index if not exists message_archive_message_idx on message_archive(message_id);
+create index if not exists message_archive_account_idx on message_archive(account_key);
+create index if not exists message_archive_deleted_idx on message_archive(deleted_at);
+create index if not exists message_archive_edited_idx on message_archive(edited_at);
+create index if not exists message_archive_media_idx on message_archive(account_key, message_type) where file_id is not null;
+create index if not exists message_edit_history_chat_idx on message_edit_history(chat_id);
+create index if not exists message_edit_history_message_idx on message_edit_history(message_id);
+create index if not exists message_edit_history_account_idx on message_edit_history(account_key);
+create index if not exists message_edit_history_edited_idx on message_edit_history(edited_at);
 
 -- IMPORTANT: on conflict do nothing = your edited templates will NOT be overwritten.
 insert into reply_templates (key, title, body) values

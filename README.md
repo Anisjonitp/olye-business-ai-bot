@@ -15,11 +15,13 @@ Bu versiya ataylab sodda qilingan: bot faqat yangi outreach lidga ma’lumot ber
 ## Yangi boshqaruv funksiyalari
 
 - Kunlik Auto Outreach timer: masalan har kuni 07:00 da yoqiladi, 09:00 da o‘chadi.
+- Bir nechta Telegram Business/admin akkaunt: har akkaunt o‘z auto outreach session, daily auto, ro‘yxat va shablonlariga ega.
 - Telegram scheduled message bilan ishlash: scheduled xabarlarni 07:02 ga qo‘yish mumkin.
 - 07:00–07:15 oralig‘ida outreach aniqlanmasa admin ogohlantirish oladi.
 - Auto Outreach tugaganda admin chatga hisobot yuboriladi.
 - Tugmali menu: Outreach, Hisobot, Ma’lumot yuborilganlar, Tanishdim, To‘lovga yaqinlar, Eslatma keraklar, Bot holati.
 - Eslatma preview: bot o‘zi ommaviy yozmaydi; admin tasdiqlasa `Tanishib chiqdingizmi? Biz sizni kutyapmiz.` yuboriladi.
+- Dialog arxiv: Telegram Business bot ruxsat olgan chatlarda xabar metadata, media metadata, tahrir va o‘chirish hodisalarini saqlaydi.
 - `supabase.sql` eski tahrirlangan shablonlarni overwrite qilmaydi (`on conflict do nothing`).
 - `/resetme`: faqat test qilayotgan shu chat/profil holatini tozalaydi, eski funksiyalarni olib tashlamaydi.
 
@@ -78,6 +80,70 @@ https://YOUR-RENDER-APP.onrender.com/tick
 /diagnostics
 /healthtemplates
 /tick
+/accounts
+/account ACCOUNT_KEY
+/accountstatus
+/archive
+/deleted
+/edited
+/media
+/archivechat CHAT_ID
+```
+
+## Dialog arxiv
+
+Bot faqat Telegram Bot API orqali kelgan Business update’larni arxivlaydi. Private chatlarni ruxsatsiz o‘qimaydi yoki scrape qilmaydi.
+
+Media fayl metadata doim saqlanadi. Faylni Supabase Storage’ga yuklash optional:
+
+```text
+MEDIA_ARCHIVE_ENABLED=true
+MEDIA_ARCHIVE_DOWNLOAD=false
+MEDIA_ARCHIVE_MAX_BYTES=20000000
+SUPABASE_STORAGE_BUCKET=business-media-archive
+```
+
+`MEDIA_ARCHIVE_DOWNLOAD=false` bo‘lsa, bot faqat `file_id`, `file_unique_id` va metadata saqlaydi.
+
+## Multi-account sozlash
+
+Eski single-account sozlamalar ishlashda davom etadi: `OWNER_TELEGRAM_ID`, `BUSINESS_OWNER_ID`, `ADMIN_CHAT_ID`.
+
+Bir nechta akkaunt uchun optional `BUSINESS_ACCOUNTS_JSON` ishlatiladi:
+
+```json
+[
+  {
+    "account_key": "default",
+    "label": "UZLYE",
+    "business_owner_id": "123456789",
+    "admin_chat_id": "123456789",
+    "project_name": "O‘zbekiston Lider Yoshlari Ensiklopediyasi",
+    "flow_key": "info_only"
+  },
+  {
+    "account_key": "second",
+    "label": "Second Project",
+    "business_owner_id": "987654321",
+    "admin_chat_id": "987654321",
+    "project_name": "Second Project",
+    "flow_key": "info_only_second"
+  }
+]
+```
+
+Shablon komandalarining eski formati saqlangan:
+
+```text
+/gettemplate key
+/settemplate key yangi matn
+```
+
+Account-specific format:
+
+```text
+/gettemplate account_key key
+/settemplate account_key key yangi matn
 ```
 
 ## Muhim
