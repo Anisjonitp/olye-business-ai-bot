@@ -1117,7 +1117,11 @@ async function findMatchingCustomCommand(accountOrKey, text = '') {
   const account = await getAccount(accountOrKey);
   if (account.custom_commands_enabled === false) return null;
   const commands = await getCustomCommands(account.account_key, false);
-  const ordered = commands.sort((a, b) => CUSTOM_TRIGGER_ORDER.indexOf(a.trigger_type) - CUSTOM_TRIGGER_ORDER.indexOf(b.trigger_type));
+  const orderIndex = type => {
+    const index = CUSTOM_TRIGGER_ORDER.indexOf(type);
+    return index === -1 ? 999 : index;
+  };
+  const ordered = commands.sort((a, b) => orderIndex(a.trigger_type) - orderIndex(b.trigger_type));
   return ordered.find(cmd => customCommandMatches(cmd, text)) || null;
 }
 
@@ -1192,18 +1196,14 @@ async function executeCustomCommand(command, lead, text) {
 async function customCommandDryRunText(accountOrKey, sampleText = '') {
   const account = await getAccount(accountOrKey);
   const command = sampleText ? await findMatchingCustomCommand(account.account_key, sampleText) : null;
-  const preview = command ? customCommandPreview(command) : 'Mos command topilmadi.';
+  const preview = command ? customCommandResponsePreview(command) : 'Mos command topilmadi.';
   return (
     `🧪 Buyruq testi\n\n` +
-    `account_key: ${account.account_key}\n` +
-    `sample: ${sampleText || '-'}\n` +
-    `matched command: ${command ? '/' + command.command_key : '-'}\n` +
-    `trigger type: ${command?.trigger_type || '-'}\n` +
-    `response type: ${command?.response_type || '-'}\n` +
-    `response preview: ${command ? customCommandResponsePreview(command) : '-'}\n` +
-    `would notify admin: ${command?.notify_admin ? 'true' : 'false'}\n` +
-    `would stop flow: ${command?.stop_after_response ? 'true' : 'false'}\n\n` +
-    preview
+    `Akkaunt: ${account.label || account.account_key}\n` +
+    `Kiritilgan matn: ${sampleText || '-'}\n` +
+    `Mos buyruq: ${command ? '/' + command.command_key : '-'}\n` +
+    `Javob turi: ${command?.response_type || '-'}\n\n` +
+    `Javob preview:\n${preview}`
   );
 }
 
@@ -1217,14 +1217,29 @@ function customCommandResponsePreview(command = {}) {
 
 async function customCommandsDebugText(accountOrKey, session = null) {
   const account = await getAccount(accountOrKey);
-  const commands = await getCustomCommands(account.account_key, true);
+  let commands = [];
+  let queryStatus = 'ok';
+  const { data, error } = await supabase.from('account_custom_commands')
+    .select('*')
+    .eq('account_key', account.account_key)
+    .order('updated_at', { ascending: false })
+    .limit(50);
+  if (error) {
+    queryStatus = error.message;
+    console.error('customCommandsDebugText:', error.message);
+  } else {
+    commands = data || [];
+  }
   const enabled = commands.filter(c => c.is_enabled !== false);
   const latest = [...commands].sort((a, b) => new Date(b.updated_at || b.created_at || 0) - new Date(a.updated_at || a.created_at || 0)).slice(0, 10);
-  const sessionStep = session?.payload?.step || session?.step || '-';
+  const sessionStep = session?.step || session?.payload?.step || '-';
   return (
     `🧩 Commands debug\n\n` +
     `account_key: ${account.account_key}\n` +
-    `setup state: ${session?.mode || '-'} / ${sessionStep}\n` +
+    `account label: ${account.label || account.account_key}\n` +
+    `wizard session: ${session?.mode || '-'} / ${sessionStep}\n` +
+    `wizard payload: ${short(JSON.stringify(session?.payload || {}), 900)}\n` +
+    `account_custom_commands query: ${queryStatus}\n` +
     `commands count: ${commands.length}\n` +
     `enabled commands: ${enabled.length}\n\n` +
     (latest.length
@@ -1292,7 +1307,7 @@ async function saveCommandCreateSession(chatId, accountKeyForSetup, step, payloa
     account_key: accountKeyForSetup,
     step
   };
-  const result = await setAdminSession(chatId, 'command_create', nextPayload);
+  const result = await setWizardSession(payload.telegram_user_id, 'public', accountKeyForSetup, 'command_create', step, nextPayload, chatId);
   if (!result.ok) throw result.error;
   console.log('command_create state saved', { chat_id: String(chatId), account_key: accountKeyForSetup, step, command_key: nextPayload.command_key || null });
   return nextPayload;
@@ -1305,7 +1320,9 @@ async function startCommandCreate(chatId, accountOrKey, from = {}) {
   }
   console.log('command_add callback pressed', { chat_id: String(chatId), user_id: String(from?.id || ''), account_key: account.account_key });
   try {
-    await saveCommandCreateSession(chatId, account.account_key, 'command_key', {});
+    await saveCommandCreateSession(chatId, account.account_key, 'command_key', {
+      telegram_user_id: String(from?.id || chatId)
+    });
   } catch (err) {
     console.error('command_add state save failed:', err.message);
     return tg('sendMessage', { chat_id: chatId, text: `Xatolik: buyruq yaratish jarayoni davom etmadi. Sabab: ${err.message}` });
@@ -1326,7 +1343,7 @@ async function showCommandCreatePreview(chatId, payload = {}) {
     step_key: payload.step_key || null,
     is_enabled: true,
     notify_admin: Boolean(payload.notify_admin),
-    stop_after_response: Boolean(payload.stop_after_response)
+    stop_after_response: payload.stop_after_response !== false
   };
   try {
     await saveCommandCreateSession(chatId, account.account_key, 'preview', payload);
@@ -1341,14 +1358,15 @@ async function showCommandCreatePreview(chatId, payload = {}) {
       `Akkaunt: ${account.label || account.account_key}\n` +
       `Buyruq: /${command.command_key}\n` +
       `Trigger: ${command.trigger_type}\n` +
-      `Javob turi: ${command.response_type}\n\n` +
+      `Javob turi: ${command.response_type === 'text' ? 'oddiy matn' : command.response_type}\n\n` +
       `Javob:\n${customCommandResponsePreview(command)}\n\n` +
       `Saqlaysizmi?`,
     reply_markup: {
       inline_keyboard: [
-        [{ text: '✅ Saqlash', callback_data: 'command_save' }],
-        [{ text: '✏️ Qayta tahrirlash', callback_data: 'command_rewrite' }],
-        [{ text: '❌ Bekor qilish', callback_data: 'command_cancel' }]
+        [{ text: '✅ Saqlash', callback_data: 'cmd_save' }],
+        [{ text: '✏️ Qayta yozish', callback_data: 'cmd_rewrite' }],
+        [{ text: '⚙️ Kengaytirilgan sozlash', callback_data: 'cmd_advanced' }],
+        [{ text: '❌ Bekor qilish', callback_data: 'cmd_cancel' }]
       ]
     }
   });
@@ -1357,9 +1375,9 @@ async function showCommandCreatePreview(chatId, payload = {}) {
 async function handleCommandCreateInput({ chatId, from = {}, text, session, selectedAccountKey, ownedAccountKeys, denyAccount }) {
   const payload = session?.payload || {};
   const targetAccountKey = payload.selected_account_key || payload.account_key || selectedAccountKey;
-  console.log('owner text received while command_create state exists', { chat_id: String(chatId), user_id: String(from?.id || ''), account_key: targetAccountKey, step: payload.step || session?.step || '-' });
+  console.log('owner text received while wizard session exists', { chat_id: String(chatId), user_id: String(from?.id || ''), account_key: targetAccountKey, mode: session?.mode, step: session?.step || payload.step || '-' });
   if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
-  const step = payload.step || session?.step || 'command_key';
+  const step = session?.step || payload.step || 'command_key';
   try {
     if (step === 'command_key') {
       const sanitized = sanitizeCommandKey(text);
@@ -1367,19 +1385,26 @@ async function handleCommandCreateInput({ chatId, from = {}, text, session, sele
         await saveCommandCreateSession(chatId, targetAccountKey, 'command_key', payload);
         return tg('sendMessage', { chat_id: chatId, text: `⚠️ ${sanitized.error}\nMasalan: narx, manzil, aloqa` });
       }
-      const next = await saveCommandCreateSession(chatId, targetAccountKey, 'trigger_type', {
+      console.log('command_key parsed', { account_key: targetAccountKey, command_key: sanitized.key, user_id: String(from?.id || '') });
+      const next = await saveCommandCreateSession(chatId, targetAccountKey, 'response_text', {
         ...payload,
+        telegram_user_id: String(from?.id || payload.telegram_user_id || chatId),
         command_key: sanitized.key,
-        trigger_patterns: [`/${sanitized.key}`]
+        trigger_type: 'slash_command',
+        trigger_patterns: [`/${sanitized.key}`, sanitized.key],
+        response_type: 'text',
+        is_enabled: true,
+        stop_after_response: true
       });
-      return tg('sendMessage', {
-        chat_id: chatId,
-        text: `/${next.command_key}\n\nTrigger turini tanlang:`,
-        reply_markup: commandTriggerKeyboard()
-      });
+      return tg('sendMessage', { chat_id: chatId, text: `/${next.command_key} buyrug‘iga qanday javob berilsin? Matn yuboring.` });
     }
     if (step === 'response_text') {
-      return showCommandCreatePreview(chatId, { ...payload, response_text: text.slice(0, 3500) });
+      console.log('response_text saved in wizard', { account_key: targetAccountKey, command_key: payload.command_key, user_id: String(from?.id || '') });
+      return showCommandCreatePreview(chatId, {
+        ...payload,
+        telegram_user_id: String(from?.id || payload.telegram_user_id || chatId),
+        response_text: text.slice(0, 3500)
+      });
     }
     if (step === 'template_sequence') {
       return showCommandCreatePreview(chatId, { ...payload, template_sequence: text.split(/[,\n]/).map(x => x.trim()).filter(Boolean) });
@@ -3279,8 +3304,6 @@ async function setSelectedAccountKey(adminChatId, selectedAccountKey) {
   const { error } = await supabase.from('admin_sessions').upsert({
     chat_id: String(adminChatId),
     mode: 'account_selected',
-    account_key: selectedAccountKey,
-    template_key: null,
     payload: { selected_account_key: selectedAccountKey },
     updated_at: new Date().toISOString()
   });
@@ -3300,22 +3323,84 @@ async function setAdminSession(chatId, mode, payload = {}) {
   const row = {
     chat_id: String(chatId),
     mode,
-    account_key: payload.selected_account_key || payload.account_key || null,
-    template_key: payload.template_key || null,
-    step: payload.step || null,
     payload,
     updated_at: new Date().toISOString()
   };
-  let { error } = await supabase.from('admin_sessions').upsert(row);
-  if (error && String(error.message || '').includes('step')) {
-    const { step, ...fallbackRow } = row;
-    const retry = await supabase.from('admin_sessions').upsert(fallbackRow);
-    error = retry.error;
-  }
+  const { error } = await supabase.from('admin_sessions').upsert(row);
   if (error) {
     console.error('setAdminSession:', error.message);
     return { ok: false, error };
   }
+  return { ok: true };
+}
+
+async function getWizardSession(userId, botScope = 'public') {
+  const { data, error } = await supabase.from('bot_wizard_sessions')
+    .select('*')
+    .eq('bot_scope', botScope)
+    .eq('telegram_user_id', String(userId))
+    .maybeSingle();
+  if (error) {
+    if (!String(error.message || '').includes('does not exist')) console.error('getWizardSession:', error.message);
+    return null;
+  }
+  return data || null;
+}
+
+async function setWizardSession(userId, botScope = 'public', accountKeyForSession, mode, step, payload = {}, chatId = null) {
+  const row = {
+    bot_scope: botScope,
+    telegram_user_id: String(userId),
+    chat_id: chatId ? String(chatId) : null,
+    account_key: accountKeyForSession ? accountKey(accountKeyForSession) : null,
+    mode,
+    step,
+    payload: payload || {},
+    updated_at: new Date().toISOString()
+  };
+  const { data, error } = await supabase.from('bot_wizard_sessions')
+    .upsert(row, { onConflict: 'bot_scope,telegram_user_id' })
+    .select()
+    .maybeSingle();
+  if (error) {
+    console.error('setWizardSession:', error.message);
+    return { ok: false, error };
+  }
+  console.log('wizard session saved', {
+    scope: botScope,
+    user_id: String(userId),
+    account_key: row.account_key,
+    mode,
+    step
+  });
+  return { ok: true, data: data || row };
+}
+
+async function updateWizardSession(userId, botScope = 'public', patch = {}) {
+  const current = await getWizardSession(userId, botScope);
+  if (!current) return { ok: false, error: new Error('wizard session topilmadi') };
+  const nextPayload = { ...(current.payload || {}), ...(patch.payload || {}) };
+  return setWizardSession(
+    userId,
+    botScope,
+    patch.account_key || current.account_key,
+    patch.mode || current.mode,
+    patch.step || current.step,
+    nextPayload,
+    patch.chat_id || current.chat_id
+  );
+}
+
+async function clearWizardSession(userId, botScope = 'public') {
+  const { error } = await supabase.from('bot_wizard_sessions')
+    .delete()
+    .eq('bot_scope', botScope)
+    .eq('telegram_user_id', String(userId));
+  if (error && !String(error.message || '').includes('does not exist')) {
+    console.error('clearWizardSession:', error.message);
+    return { ok: false, error };
+  }
+  console.log('wizard session cleared', { scope: botScope, user_id: String(userId) });
   return { ok: true };
 }
 
@@ -3397,12 +3482,12 @@ async function sendCommandsMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const account = await getAccount(accountOrKey);
   const commands = await getCustomCommands(account.account_key, true);
   const rows = [
-    [{ text: '📋 Buyruqlar ro‘yxati', callback_data: 'commands_menu' }],
-    [{ text: '➕ Buyruq qo‘shish', callback_data: 'command_add' }],
-    [{ text: '🧪 Buyruqni test qilish', callback_data: 'command_test' }]
+    [{ text: '📋 Buyruqlar ro‘yxati', callback_data: 'cmd_list' }],
+    [{ text: '➕ Buyruq qo‘shish', callback_data: 'cmd_add' }],
+    [{ text: '🧪 Buyruqni test qilish', callback_data: 'cmd_test' }]
   ];
   for (const cmd of commands.slice(0, 20)) {
-    rows.push([{ text: `${cmd.is_enabled === false ? '🔴' : '🟢'} /${cmd.command_key}`, callback_data: `command_view:${cmd.command_key}` }]);
+    rows.push([{ text: `${cmd.is_enabled === false ? '🔴' : '🟢'} /${cmd.command_key}`, callback_data: `cmd_view:${cmd.command_key}` }]);
   }
   rows.push([{ text: '⬅️ Orqaga', callback_data: 'menu' }]);
   return tg('sendMessage', {
@@ -3421,12 +3506,12 @@ async function sendCommandDetail(chatId, accountOrKey, commandKey) {
     text: `Joriy akkaunt: ${account.label || account.account_key}\n\n${customCommandPreview(command)}`,
     reply_markup: {
       inline_keyboard: [
-        [{ text: '👁 Ko‘rish', callback_data: `command_view:${command.command_key}` }],
-        [{ text: '✏️ Javobni tahrirlash', callback_data: `command_edit_response:${command.command_key}` }],
-        [{ text: '🧠 Triggerni tahrirlash', callback_data: `command_edit_trigger:${command.command_key}` }],
-        [{ text: command.is_enabled === false ? '🟢 Yoqish' : '🔴 O‘chirish', callback_data: `command_toggle:${command.command_key}` }],
-        [{ text: '🧪 Test', callback_data: `command_test:${command.command_key}` }],
-        [{ text: '🗑 O‘chirish', callback_data: `command_delete:${command.command_key}` }],
+        [{ text: '👁 Ko‘rish', callback_data: `cmd_view:${command.command_key}` }],
+        [{ text: '✏️ Javobni tahrirlash', callback_data: `cmd_edit_response:${command.command_key}` }],
+        [{ text: '⚙️ Kengaytirilgan sozlash', callback_data: `cmd_advanced:${command.command_key}` }],
+        [{ text: command.is_enabled === false ? '🟢 Yoqish' : '🔴 O‘chirish', callback_data: `cmd_toggle:${command.command_key}` }],
+        [{ text: '🧪 Test', callback_data: `cmd_test_one:${command.command_key}` }],
+        [{ text: '🗑 O‘chirish', callback_data: `cmd_delete:${command.command_key}` }],
         [{ text: '⬅️ Buyruqlar', callback_data: 'commands_menu' }]
       ]
     }
@@ -3453,8 +3538,8 @@ async function showCommandPreviewForSession(chatId, payload = {}) {
     text: `${customCommandPreview(command)}\n\nSaqlaysizmi?`,
     reply_markup: {
       inline_keyboard: [
-        [{ text: '✅ Saqlash', callback_data: 'command_save' }, { text: '✏️ Qayta tahrirlash', callback_data: 'command_rewrite' }],
-        [{ text: '❌ Bekor qilish', callback_data: 'command_cancel' }]
+        [{ text: '✅ Saqlash', callback_data: 'cmd_save' }, { text: '✏️ Qayta yozish', callback_data: 'cmd_rewrite' }],
+        [{ text: '❌ Bekor qilish', callback_data: 'cmd_cancel' }]
       ]
     }
   });
@@ -4528,6 +4613,7 @@ async function handleAdminMessage(msg) {
   if (!text) return;
   const selectedAccountKey = await getPublicSelectedAccountKey(chatId, from.id);
   const session = await getAdminSession(chatId);
+  const wizardSession = await getWizardSession(from.id || chatId, 'public');
   const ownedAccountKeys = new Set((await getPublicOwnedAccounts(chatId, from.id)).map(a => a.account_key));
   const denyAccount = () => tg('sendMessage', { chat_id: chatId, text: '⛔ Bu akkaunt sizga tegishli emas.' });
   const publicAccountArg = async (maybeAccountKey, fallback = selectedAccountKey) => {
@@ -4543,12 +4629,22 @@ async function handleAdminMessage(msg) {
   }
 
   if (text === '/cancel') {
+    await clearWizardSession(from.id || chatId, 'public');
     await setAdminSession(chatId, 'account_selected', { selected_account_key: selectedAccountKey });
-    return tg('sendMessage', { chat_id: chatId, text: 'Bekor qilindi.' });
+    return sendDashboard(chatId, selectedAccountKey);
   }
 
-  if (session?.mode === 'command_create') {
-    return handleCommandCreateInput({ chatId, from, text, session, selectedAccountKey, ownedAccountKeys, denyAccount });
+  if (wizardSession) {
+    if (wizardSession.mode === 'command_create') {
+      return handleCommandCreateInput({ chatId, from, text, session: wizardSession, selectedAccountKey, ownedAccountKeys, denyAccount });
+    }
+    console.log('owner text received with unsupported wizard session', {
+      chat_id: chatId,
+      user_id: String(from.id || ''),
+      mode: wizardSession.mode,
+      step: wizardSession.step
+    });
+    return tg('sendMessage', { chat_id: chatId, text: 'Xatolik: sozlash jarayoni davom etmadi. /cancel yuborib qayta boshlang.' });
   }
 
   if (session?.mode === 'template_edit_input' && !text.startsWith('/')) {
@@ -4886,7 +4982,7 @@ async function handleAdminMessage(msg) {
     return sendSettings(chatId, ak);
   }
   if (text === '/commands') return sendCommandsMenu(chatId, selectedAccountKey);
-  if (text === '/commands_debug') return tg('sendMessage', { chat_id: chatId, text: await customCommandsDebugText(selectedAccountKey, session) });
+  if (text === '/commands_debug') return tg('sendMessage', { chat_id: chatId, text: await customCommandsDebugText(selectedAccountKey, wizardSession) });
   if (text.startsWith('/testcommand ')) {
     const sample = text.replace('/testcommand ', '');
     return tg('sendMessage', { chat_id: chatId, text: await customCommandDryRunText(selectedAccountKey, sample) });
@@ -5254,6 +5350,7 @@ async function handleCallback(cb) {
   if (!chatId) return;
   const selectedAccountKey = await getPublicSelectedAccountKey(chatId, cb.from?.id);
   const ownedAccountKeys = new Set((await getPublicOwnedAccounts(chatId, cb.from?.id)).map(a => a.account_key));
+  const wizardSession = await getWizardSession(cb.from?.id || chatId, 'public');
   const denyAccount = () => tg('sendMessage', { chat_id: chatId, text: '⛔ Bu akkaunt sizga tegishli emas.' });
 
   if (data.startsWith('platform_')) return tg('sendMessage', { chat_id: chatId, text: 'Platform Admin Bot uchun alohida admin botdan foydalaning.' });
@@ -5265,21 +5362,24 @@ async function handleCallback(cb) {
 
   if (data === 'menu' || data === 'noop') return sendDashboard(chatId, selectedAccountKey);
   if (data === 'accounts') return sendAccountsMenu(chatId);
-  if (data === 'commands_menu' || data === 'cmd_list') return sendCommandsMenu(chatId, selectedAccountKey);
+  if (data === 'cmd_menu' || data === 'commands_menu' || data === 'cmd_list') return sendCommandsMenu(chatId, selectedAccountKey);
   if (data === 'command_add' || data === 'cmd_add') return startCommandCreate(chatId, selectedAccountKey, cb.from);
-  if (data === 'command_test' || data === 'cmd_test_any') {
+  if (data === 'cmd_test' || data === 'command_test' || data === 'cmd_test_any') {
     await setAdminSession(chatId, 'custom_command_test_input', { selected_account_key: selectedAccountKey });
     return tg('sendMessage', { chat_id: chatId, text: 'Test uchun sample lead xabarini yuboring. Masalan: /narx' });
   }
   if (data.startsWith('command_view:') || data.startsWith('cmd_open:') || data.startsWith('cmd_view:')) return sendCommandDetail(chatId, selectedAccountKey, data.split(':')[1]);
-  if (data.startsWith('command_edit_trigger:') || data.startsWith('cmd_edittrigger:')) {
+  if (data === 'cmd_advanced' && wizardSession?.mode === 'command_create') {
+    return tg('sendMessage', { chat_id: chatId, text: '⚙️ Kengaytirilgan sozlash buyruq saqlangandan keyin mavjud. Hozir ✅ Saqlash yoki ✏️ Qayta yozish tugmasidan foydalaning.' });
+  }
+  if (data.startsWith('cmd_advanced:') || data.startsWith('command_edit_trigger:') || data.startsWith('cmd_edittrigger:')) {
     const key = data.split(':')[1];
     const command = await getCustomCommand(selectedAccountKey, key, true);
     if (!command) return tg('sendMessage', { chat_id: chatId, text: 'Buyruq topilmadi.' });
     await setAdminSession(chatId, 'custom_command_trigger_select', { ...command, selected_account_key: selectedAccountKey });
     return tg('sendMessage', {
       chat_id: chatId,
-      text: `/${key}\n\nYangi trigger turini tanlang:`,
+      text: `/${key}\n\n⚙️ Kengaytirilgan sozlash\n\nYangi trigger turini tanlang:`,
       reply_markup: commandTriggerKeyboard()
     });
   }
@@ -5376,12 +5476,17 @@ async function handleCallback(cb) {
       : showCommandPreviewForSession(chatId, payload);
   }
   if (data === 'command_save' || data === 'cmd_save') {
-    const session = await getAdminSession(chatId);
+    const session = wizardSession?.mode === 'command_create' ? wizardSession : await getAdminSession(chatId);
     const payload = session?.payload || {};
-    const targetAccountKey = payload.selected_account_key || selectedAccountKey;
+    const targetAccountKey = payload.selected_account_key || payload.account_key || session?.account_key || selectedAccountKey;
     if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
     const command = {
       ...payload,
+      trigger_type: payload.trigger_type || 'slash_command',
+      trigger_patterns: safeJsonArray(payload.trigger_patterns).length ? safeJsonArray(payload.trigger_patterns) : [`/${payload.command_key}`, payload.command_key].filter(Boolean),
+      response_type: payload.response_type || 'text',
+      is_enabled: payload.is_enabled !== false,
+      stop_after_response: payload.stop_after_response !== false,
       template_sequence: payload.response_type === 'template_sequence'
         ? (safeJsonArray(payload.template_sequence).length ? safeJsonArray(payload.template_sequence) : String(payload.response_text || '').split(/[,\s]+/).filter(Boolean))
         : payload.template_sequence,
@@ -5391,6 +5496,7 @@ async function handleCallback(cb) {
     try {
       const saved = await upsertCustomCommand(targetAccountKey, command, cb.from?.id);
       console.log('custom command inserted into DB', { account_key: targetAccountKey, command_key: saved.command_key, user_id: String(cb.from?.id || '') });
+      if (wizardSession?.mode === 'command_create') await clearWizardSession(cb.from?.id || chatId, 'public');
       await setAdminSession(chatId, 'account_selected', { selected_account_key: targetAccountKey });
       await tg('sendMessage', { chat_id: chatId, text: `✅ Buyruq saqlandi: /${saved.command_key}` });
       return sendCommandDetail(chatId, targetAccountKey, saved.command_key);
@@ -5399,18 +5505,14 @@ async function handleCallback(cb) {
       return tg('sendMessage', { chat_id: chatId, text: `Xatolik: buyruq yaratish jarayoni davom etmadi. Sabab: ${err.message}` });
     }
   }
-  if (data === 'command_rewrite' || data === 'cmd_retry') {
-    const session = await getAdminSession(chatId);
+  if (data === 'cmd_rewrite' || data === 'command_rewrite' || data === 'cmd_retry') {
+    const session = wizardSession?.mode === 'command_create' ? wizardSession : await getAdminSession(chatId);
     const payload = session?.payload || {};
-    const targetAccountKey = payload.selected_account_key || selectedAccountKey;
-    if (session?.mode === 'command_create') {
+    const targetAccountKey = payload.selected_account_key || payload.account_key || session?.account_key || selectedAccountKey;
+    if (wizardSession?.mode === 'command_create') {
       try {
-        if (payload.response_type === 'text') {
-          await saveCommandCreateSession(chatId, targetAccountKey, 'response_text', payload);
-          return tg('sendMessage', { chat_id: chatId, text: 'Yangi javob matnini yuboring.' });
-        }
-        await saveCommandCreateSession(chatId, targetAccountKey, 'response_type', payload);
-        return tg('sendMessage', { chat_id: chatId, text: 'Javob turini qayta tanlang:', reply_markup: commandResponseKeyboard() });
+        await saveCommandCreateSession(chatId, targetAccountKey, 'response_text', payload);
+        return tg('sendMessage', { chat_id: chatId, text: `/${payload.command_key} buyrug‘iga yangi javob matnini yuboring.` });
       } catch (err) {
         console.error('command rewrite failed:', err.message);
         return tg('sendMessage', { chat_id: chatId, text: `Xatolik: buyruq yaratish jarayoni davom etmadi. Sabab: ${err.message}` });
@@ -5420,10 +5522,11 @@ async function handleCallback(cb) {
     return tg('sendMessage', { chat_id: chatId, text: 'Yangi javob matnini yuboring.' });
   }
   if (data === 'command_cancel' || data === 'cmd_cancel') {
+    await clearWizardSession(cb.from?.id || chatId, 'public');
     await setAdminSession(chatId, 'account_selected', { selected_account_key: selectedAccountKey });
     return tg('sendMessage', { chat_id: chatId, text: 'Bekor qilindi.' });
   }
-  if (data.startsWith('command_edit_response:') || data.startsWith('cmd_editresp:')) {
+  if (data.startsWith('cmd_edit_response:') || data.startsWith('command_edit_response:') || data.startsWith('cmd_editresp:')) {
     await setAdminSession(chatId, 'custom_command_edit_response', { selected_account_key: selectedAccountKey, command_key: data.split(':')[1] });
     return tg('sendMessage', { chat_id: chatId, text: 'Yangi javob matnini yuboring.' });
   }
@@ -5440,7 +5543,7 @@ async function handleCallback(cb) {
     if (command) await upsertCustomCommand(selectedAccountKey, { ...command, is_enabled: false, description: 'soft_deleted' }, cb.from?.id);
     return tg('sendMessage', { chat_id: chatId, text: `🗑 /${key} o‘chirildi (disabled).` });
   }
-  if (data.startsWith('command_test:') || data.startsWith('cmd_test:')) {
+  if (data.startsWith('cmd_test_one:') || data.startsWith('command_test:') || data.startsWith('cmd_test:')) {
     await setAdminSession(chatId, 'custom_command_test_input', { selected_account_key: selectedAccountKey, command_key: data.split(':')[1] });
     return tg('sendMessage', { chat_id: chatId, text: 'Test uchun sample lead xabarini yuboring.' });
   }
