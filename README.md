@@ -77,42 +77,76 @@ https://YOUR-RENDER-APP.onrender.com/tick
 ## Asosiy admin buyruqlar
 
 ```text
-/menu
-/resetme
-/auto 2h
-/autooff
-/autostatus
-/setdaily 07:00 2h
-/dailyoff
-/dailystatus
-/report
-/info
-/read
-/payment
-/reminders
-/diagnostics
-/healthtemplates
-/tick
-/accounts
-/account ACCOUNT_KEY
-/accountstatus
-/flow ACCOUNT_KEY
-/setflow ACCOUNT_KEY STEP_KEY TEMPLATE_KEY NEXT_YES NEXT_NO NEXT_PARTIAL NEXT_UNKNOWN STOP_TRUE_FALSE
-/flowtest ACCOUNT_KEY
-/ai on
-/ai off
-/aistatus
-/aistatus ACCOUNT_KEY
-/aitemplate TEMPLATE_KEY text
-/aitemplate ACCOUNT_KEY TEMPLATE_KEY text
-/testrule ACCOUNT_KEY STEP_KEY TEXT
-/testai ACCOUNT_KEY STEP_KEY TEXT
-/archive
-/deleted
-/edited
-/media
-/archivechat CHAT_ID
+/menyu
+/kimman
+/bekor
+/menireset
+/avto 2h
+/avtoochir
+/avtoholat
+/kunliksozla 07:00 2h
+/kunlikochir
+/kunlikholat
+/hisobot
+/hisobot ACCOUNT_KEY
+/kunlikhisobot ACCOUNT_KEY
+/haftalikhisobot ACCOUNT_KEY
+/barchahisobot
+/malumot
+/tanishdim
+/tolov
+/eslatmalar
+/kutilayotgan
+/diagnostika
+/shablonholati
+/tekshir
+/akkauntlar
+/akkaunt ACCOUNT_KEY
+/akkauntholati
+/ulanishlar
+/ulanishbiriktir ACCOUNT_KEY BUSINESS_CONNECTION_ID
+/akkauntsozla ACCOUNT_KEY FIELD VALUE
+/sozlamasozla ACCOUNT_KEY KEY VALUE
+/akkauntadmin ACCOUNT_KEY TELEGRAM_ID
+/akkauntniyoq ACCOUNT_KEY
+/akkauntochir ACCOUNT_KEY
+/sozlamalar
+/sozlamalar ACCOUNT_KEY
+/ketmaketlik ACCOUNT_KEY
+/ketmaketliksozla ACCOUNT_KEY STEP_KEY TEMPLATE_KEY NEXT_YES NEXT_NO NEXT_PARTIAL NEXT_UNKNOWN STOP_TRUE_FALSE
+/ketmaketliktest ACCOUNT_KEY
+/suniyintellekt yoq
+/suniyintellekt ochir
+/aiholati
+/aiholati ACCOUNT_KEY
+/aishablon TEMPLATE_KEY text
+/aishablon ACCOUNT_KEY TEMPLATE_KEY text
+/shablonol key
+/shablonol account_key key
+/shablonsozla key yangi matn
+/shablonsozla account_key key yangi matn
+/qoidatest ACCOUNT_KEY STEP_KEY TEXT
+/aitest ACCOUNT_KEY STEP_KEY TEXT
+/arxiv
+/arxiv ACCOUNT_KEY
+/ochirilgan
+/ochirilgan ACCOUNT_KEY
+/tahrirlangan
+/tahrirlangan ACCOUNT_KEY
+/mediaarxiv ACCOUNT_KEY
+/chatarxiv CHAT_ID
+/chatarxiv ACCOUNT_KEY CHAT_ID
+/arxivdebug ACCOUNT_KEY
+/arxivyoldebug
+/testxabar ACCOUNT_KEY deleted
+/testxabar ACCOUNT_KEY edited
+/lidochir CHAT_ID
+/lidyoq CHAT_ID
+/qaytaboshla CHAT_ID
+/holat CHAT_ID
 ```
+
+Eski inglizcha buyruqlar ham backward compatibility uchun ishlashda davom etadi.
 
 ## Dialog arxiv
 
@@ -122,12 +156,12 @@ Media fayl metadata doim saqlanadi. Faylni Supabase Storage’ga yuklash optiona
 
 ```text
 MEDIA_ARCHIVE_ENABLED=true
-MEDIA_ARCHIVE_DOWNLOAD=true
+MEDIA_ARCHIVE_DOWNLOAD=false
 MEDIA_ARCHIVE_MAX_BYTES=20000000
 SUPABASE_STORAGE_BUCKET=business-media-archive
 ```
 
-`MEDIA_ARCHIVE_DOWNLOAD=false` bo‘lsa, bot faqat `file_id`, `file_unique_id` va metadata saqlaydi.
+`MEDIA_ARCHIVE_DOWNLOAD=false` bo‘lsa, bot faqat `file_id`, `file_unique_id` va metadata saqlaydi. Account sozlamasida `media_archive_download=true` qilinsa, ruxsat berilgan media Supabase Storage bucket’ga yuklanadi.
 
 ## AI yordamchi funksiyalar
 
@@ -180,6 +214,8 @@ Bir nechta akkaunt uchun optional `BUSINESS_ACCOUNTS_JSON` ishlatiladi:
   }
 ]
 ```
+
+Telegram `business_connection` update kelganda bot avval `owner_user_id`/`business_owner_id` bo‘yicha mavjud accountni topadi. Mos account topilmasa `tg_<telegram_user_id>` ko‘rinishida yangi account yaratadi, connectionni shu accountga bog‘laydi va admin chat sifatida account egasining Telegram ID sini saqlaydi.
 
 Shablon komandalarining eski formati saqlangan:
 

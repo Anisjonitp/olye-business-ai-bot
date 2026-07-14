@@ -34,13 +34,14 @@ const DAILY_NO_OUTREACH_WARN_MIN = Number(process.env.DAILY_NO_OUTREACH_WARN_MIN
 const REMINDER_AFTER_MS = Number(process.env.REMINDER_AFTER_MS || 3600000);
 const SCHEDULER_TICK_MS = Number(process.env.SCHEDULER_TICK_MS || 60000);
 const MEDIA_ARCHIVE_ENABLED = String(process.env.MEDIA_ARCHIVE_ENABLED || 'true') === 'true';
-const MEDIA_ARCHIVE_DOWNLOAD = String(process.env.MEDIA_ARCHIVE_DOWNLOAD || 'true') === 'true';
+const MEDIA_ARCHIVE_DOWNLOAD = String(process.env.MEDIA_ARCHIVE_DOWNLOAD || 'false') === 'true';
 const MEDIA_ARCHIVE_MAX_BYTES = Number(process.env.MEDIA_ARCHIVE_MAX_BYTES || 20000000);
 const SUPABASE_STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'business-media-archive';
-const AI_INTENT_ENABLED = String(process.env.AI_INTENT_ENABLED || 'false') === 'true';
-const AI_TEMPLATE_EDITOR_ENABLED = String(process.env.AI_TEMPLATE_EDITOR_ENABLED || 'false') === 'true';
+const AI_INTENT_ENABLED = String(process.env.AI_INTENT_ENABLED || 'true') === 'true';
+const AI_TEMPLATE_EDITOR_ENABLED = String(process.env.AI_TEMPLATE_EDITOR_ENABLED || 'true') === 'true';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const UNKNOWN_ACCOUNT_KEY = 'unknown';
 
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL missing');
@@ -134,6 +135,50 @@ const DEFAULT_ACCOUNT = ENV_ACCOUNTS[0] || {
   archive_notify_enabled: true
 };
 
+function normalizeAccount(account = {}) {
+  const ownerUserId = String(account.owner_user_id || account.business_owner_id || '');
+  const adminChatId = String(account.admin_chat_id || '');
+  return {
+    ...account,
+    account_key: String(account.account_key || DEFAULT_ACCOUNT_KEY),
+    label: account.label || account.account_key || DEFAULT_ACCOUNT_KEY,
+    project_name: account.project_name || account.label || account.account_key || 'Telegram Business',
+    owner_user_id: ownerUserId,
+    business_owner_id: String(account.business_owner_id || ownerUserId || ''),
+    owner_username: account.owner_username || account.username || '',
+    owner_first_name: account.owner_first_name || account.first_name || '',
+    admin_chat_id: adminChatId,
+    business_connection_id: String(account.business_connection_id || ''),
+    bot_enabled: account.bot_enabled !== false,
+    auto_reply_enabled: account.auto_reply_enabled !== false,
+    archive_enabled: account.archive_enabled !== false,
+    archive_notify_enabled: account.archive_notify_enabled !== false,
+    reports_enabled: account.reports_enabled !== false,
+    media_archive_enabled: account.media_archive_enabled !== false,
+    media_archive_download: account.media_archive_download ?? MEDIA_ARCHIVE_DOWNLOAD,
+    media_archive_max_bytes: Number(account.media_archive_max_bytes || MEDIA_ARCHIVE_MAX_BYTES),
+    storage_bucket: account.storage_bucket || SUPABASE_STORAGE_BUCKET,
+    flow_key: account.flow_key || 'info_only',
+    daily_report_time: account.daily_report_time || '18:00',
+    timezone: account.timezone || process.env.TZ || 'Asia/Tashkent'
+  };
+}
+
+function unknownAccount(businessConnectionId = '') {
+  return normalizeAccount({
+    account_key: UNKNOWN_ACCOUNT_KEY,
+    label: 'Unknown business connection',
+    project_name: 'Unknown Telegram Business',
+    business_connection_id: businessConnectionId || '',
+    admin_chat_id: '',
+    bot_enabled: false,
+    auto_reply_enabled: false,
+    archive_enabled: true,
+    archive_notify_enabled: false,
+    reports_enabled: false
+  });
+}
+
 function accountDisplayLabel(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const ak = accountKey(accountOrKey);
   if (ak === 'second') return process.env.SECOND_ACCOUNT_LABEL || 'Ikkinchi akkaunt';
@@ -169,17 +214,17 @@ async function tg(method, payload = {}) {
 }
 
 async function getAccounts() {
-  const byKey = new Map(ENV_ACCOUNTS.map(a => [a.account_key, a]));
+  const byKey = new Map(ENV_ACCOUNTS.map(a => [a.account_key, normalizeAccount(a)]));
   const { data, error } = await supabase.from('bot_accounts').select('*');
   if (!error && Array.isArray(data)) {
     for (const row of data) {
       if (!row?.account_key) continue;
-      byKey.set(row.account_key, { ...byKey.get(row.account_key), ...row });
+      byKey.set(row.account_key, normalizeAccount({ ...byKey.get(row.account_key), ...row }));
     }
   } else if (error && !String(error.message || '').includes('does not exist')) {
     console.error('getAccounts:', error.message);
   }
-  if (!byKey.size) byKey.set(DEFAULT_ACCOUNT.account_key, DEFAULT_ACCOUNT);
+  if (!byKey.size) byKey.set(DEFAULT_ACCOUNT.account_key, normalizeAccount(DEFAULT_ACCOUNT));
   return [...byKey.values()];
 }
 
@@ -193,6 +238,7 @@ async function getAccount(accountOrKey = DEFAULT_ACCOUNT_KEY) {
     return {
       account_key: process.env.SECOND_ACCOUNT_KEY || 'second',
       label: process.env.SECOND_ACCOUNT_LABEL || 'Ikkinchi akkaunt',
+      owner_user_id: process.env.SECOND_ACCOUNT_BUSINESS_OWNER_ID || '8304283149',
       business_owner_id: process.env.SECOND_ACCOUNT_BUSINESS_OWNER_ID || '8304283149',
       admin_chat_id: process.env.SECOND_ACCOUNT_ADMIN_CHAT_ID || '8304283149',
       business_connection_id: process.env.SECOND_ACCOUNT_BUSINESS_CONNECTION_ID || '',
@@ -202,7 +248,8 @@ async function getAccount(accountOrKey = DEFAULT_ACCOUNT_KEY) {
       archive_notify_enabled: true
     };
   }
-  return accounts[0] || DEFAULT_ACCOUNT;
+  if (key === UNKNOWN_ACCOUNT_KEY) return unknownAccount();
+  return accounts[0] || normalizeAccount(DEFAULT_ACCOUNT);
 }
 
 async function getAdminChatIdForAccount(accountOrKey = DEFAULT_ACCOUNT_KEY) {
@@ -234,6 +281,7 @@ function findAccountByUserId(accounts, userId) {
   const uid = String(userId || '');
   if (!uid) return null;
   const found = accounts.find(a => (
+    (a.owner_user_id && String(a.owner_user_id) === uid) ||
     (a.business_owner_id && String(a.business_owner_id) === uid) ||
     (a.admin_chat_id && String(a.admin_chat_id) === uid)
   ));
@@ -243,6 +291,7 @@ function findAccountByUserId(accounts, userId) {
       account_key: process.env.SECOND_ACCOUNT_KEY || 'second',
       label: process.env.SECOND_ACCOUNT_LABEL || 'Ikkinchi akkaunt',
       business_owner_id: process.env.SECOND_ACCOUNT_BUSINESS_OWNER_ID || '8304283149',
+      owner_user_id: process.env.SECOND_ACCOUNT_BUSINESS_OWNER_ID || '8304283149',
       admin_chat_id: process.env.SECOND_ACCOUNT_ADMIN_CHAT_ID || '8304283149',
       business_connection_id: process.env.SECOND_ACCOUNT_BUSINESS_CONNECTION_ID || '',
       project_name: process.env.SECOND_ACCOUNT_PROJECT_NAME || 'Millat Iftixorlari ensiklopediyasi',
@@ -256,11 +305,12 @@ function findAccountByUserId(accounts, userId) {
 
 async function bindBusinessConnectionToAccount(accountOrKey, businessConnectionId, user = {}) {
   if (!businessConnectionId) return null;
-  const account = await getAccount(accountOrKey);
+  const account = normalizeAccount(await getAccount(accountOrKey));
+  const ownerUserId = user.id ? String(user.id) : (account.owner_user_id || account.business_owner_id || account.admin_chat_id || null);
   const { error: mapError } = await supabase.from('business_connection_accounts').upsert({
     business_connection_id: String(businessConnectionId),
     account_key: account.account_key,
-    user_id: user.id ? String(user.id) : (account.business_owner_id || account.admin_chat_id || null),
+    user_id: ownerUserId,
     username: user.username || null,
     first_name: user.first_name || null,
     updated_at: new Date().toISOString()
@@ -273,16 +323,91 @@ async function bindBusinessConnectionToAccount(accountOrKey, businessConnectionI
     account_key: account.account_key,
     label: account.label || account.account_key,
     project_name: account.project_name || account.label || account.account_key,
-    business_owner_id: account.business_owner_id || null,
+    owner_user_id: account.owner_user_id || ownerUserId,
+    owner_username: user.username || account.owner_username || null,
+    owner_first_name: user.first_name || account.owner_first_name || null,
+    business_owner_id: account.business_owner_id || ownerUserId,
     admin_chat_id: account.admin_chat_id || null,
     business_connection_id: String(businessConnectionId),
+    bot_enabled: account.bot_enabled !== false,
+    auto_reply_enabled: account.auto_reply_enabled !== false,
     flow_key: account.flow_key || 'info_only',
     archive_enabled: account.archive_enabled !== false,
     archive_notify_enabled: account.archive_notify_enabled !== false,
+    reports_enabled: account.reports_enabled !== false,
+    media_archive_enabled: account.media_archive_enabled !== false,
+    media_archive_download: account.media_archive_download,
+    media_archive_max_bytes: account.media_archive_max_bytes,
+    storage_bucket: account.storage_bucket || SUPABASE_STORAGE_BUCKET,
+    timezone: account.timezone || 'Asia/Tashkent',
+    last_seen_at: new Date().toISOString(),
     updated_at: new Date().toISOString()
   }, { onConflict: 'account_key' });
   if (error) console.error('bindBusinessConnectionToAccount bot_accounts:', error.message);
   return { ...account, business_connection_id: String(businessConnectionId) };
+}
+
+const ACCOUNT_MUTABLE_FIELDS = new Set([
+  'label',
+  'project_name',
+  'owner_user_id',
+  'owner_username',
+  'owner_first_name',
+  'admin_chat_id',
+  'business_connection_id',
+  'flow_key',
+  'timezone',
+  'daily_report_time',
+  'storage_bucket'
+]);
+
+const ACCOUNT_BOOLEAN_FIELDS = new Set([
+  'bot_enabled',
+  'auto_reply_enabled',
+  'archive_enabled',
+  'archive_notify_enabled',
+  'reports_enabled',
+  'media_archive_enabled',
+  'media_archive_download'
+]);
+
+const ACCOUNT_NUMBER_FIELDS = new Set(['media_archive_max_bytes']);
+
+function parseSettingValue(value = '') {
+  const raw = String(value).trim();
+  const low = raw.toLowerCase();
+  if (['true', 'on', '1', 'yes', 'ha'].includes(low)) return true;
+  if (['false', 'off', '0', 'no', 'yoq', 'yo‘q'].includes(low)) return false;
+  if (/^-?\d+(\.\d+)?$/.test(raw)) return Number(raw);
+  return raw;
+}
+
+async function upsertAccountPatch(accountOrKey, patch = {}) {
+  const requestedKey = accountKey(accountOrKey);
+  const existing = await getAccount(requestedKey);
+  const account = normalizeAccount(existing?.account_key === requestedKey ? existing : { account_key: requestedKey, label: requestedKey });
+  const payload = {
+    account_key: account.account_key,
+    label: account.label || account.account_key,
+    project_name: account.project_name || account.label || account.account_key,
+    business_owner_id: account.business_owner_id || account.owner_user_id || null,
+    ...patch,
+    updated_at: new Date().toISOString()
+  };
+  if (payload.owner_user_id && !payload.business_owner_id) payload.business_owner_id = payload.owner_user_id;
+  const { data, error } = await supabase.from('bot_accounts').upsert(payload, { onConflict: 'account_key' }).select().maybeSingle();
+  if (error) throw error;
+  return normalizeAccount(data || { ...account, ...patch });
+}
+
+async function setAccountField(accountOrKey, field, rawValue) {
+  if (!ACCOUNT_MUTABLE_FIELDS.has(field) && !ACCOUNT_BOOLEAN_FIELDS.has(field) && !ACCOUNT_NUMBER_FIELDS.has(field)) {
+    throw new Error(`Ruxsat etilmagan field: ${field}`);
+  }
+  let value = rawValue;
+  if (ACCOUNT_BOOLEAN_FIELDS.has(field)) value = Boolean(parseSettingValue(rawValue));
+  if (ACCOUNT_NUMBER_FIELDS.has(field)) value = Number(rawValue);
+  return upsertAccountPatch(accountOrKey, { [field]: value });
 }
 
 async function handleBusinessConnectionUpdate(connection = {}) {
@@ -291,21 +416,45 @@ async function handleBusinessConnectionUpdate(connection = {}) {
   const userId = user.id || connection.user_chat_id || connection.user_id || '';
   if (!businessConnectionId) return;
   const accounts = await getAccounts();
-  const account = findAccountByUserId(accounts, userId);
+  let account = findAccountByUserId(accounts, userId);
   if (!account) {
-    await logEvent('business_connection', 'business_connection_account_unresolved', JSON.stringify({
+    const label = user.username || user.first_name || String(userId || businessConnectionId);
+    account = normalizeAccount({
+      account_key: userId ? `tg_${userId}` : `tg_${String(businessConnectionId).replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 40)}`,
+      label,
+      project_name: label,
+      owner_user_id: userId ? String(userId) : '',
+      business_owner_id: userId ? String(userId) : '',
+      owner_username: user.username || '',
+      owner_first_name: user.first_name || '',
+      admin_chat_id: userId ? String(userId) : '',
       business_connection_id: businessConnectionId,
-      user_id: userId || null,
-      username: user.username || null,
-      first_name: user.first_name || null
-    }).slice(0, 1200));
-    return;
+      flow_key: 'info_only',
+      bot_enabled: true,
+      auto_reply_enabled: true,
+      archive_enabled: true,
+      archive_notify_enabled: true,
+      reports_enabled: true
+    });
   }
   await bindBusinessConnectionToAccount(account, businessConnectionId, {
     id: userId,
     username: user.username,
     first_name: user.first_name
   });
+  if (userId) {
+    await tg('sendMessage', {
+      chat_id: userId,
+      text:
+        '✅ Bot akkauntingizga ulandi.\n\n' +
+        'Sozlash menyusi:\n' +
+        '• Auto javob\n' +
+        '• Arxiv\n' +
+        '• Hisobotlar\n' +
+        '• Shablonlar\n' +
+        '• Diagnostika'
+    }).catch(err => console.error('business_connection notify:', err.message));
+  }
   await logEvent('business_connection', 'business_connection_account_bound', JSON.stringify({
     business_connection_id: businessConnectionId,
     account_key: account.account_key,
@@ -352,8 +501,14 @@ async function findAccountForBusinessMessage(msg) {
     const { data } = await q;
     const learnedKey = data?.[0]?.account_key;
     if (learnedKey) return accounts.find(a => a.account_key === learnedKey) || { ...DEFAULT_ACCOUNT, account_key: learnedKey };
+    await logEvent(chatId || 'unknown', 'UNMAPPED_BUSINESS_CONNECTION', JSON.stringify({
+      business_connection_id: businessConnectionId,
+      chat_id: chatId || null,
+      from_id: fromId || null
+    }).slice(0, 1200), UNKNOWN_ACCOUNT_KEY);
+    return unknownAccount(businessConnectionId);
   }
-  return DEFAULT_ACCOUNT;
+  return normalizeAccount(DEFAULT_ACCOUNT);
 }
 
 async function findAccountByBusinessConnectionId(businessConnectionId) {
@@ -423,7 +578,16 @@ async function resolveArchiveAccount(update = {}, messageId = null, mode = 'dele
     chat_id: chatId || null,
     message_id: messageId || null
   }).slice(0, 1200));
-  return { account: DEFAULT_ACCOUNT, archived: null, reason: 'fallback_default' };
+  if (businessConnectionId) {
+    await logEvent(chatId || 'unknown', 'UNMAPPED_BUSINESS_CONNECTION', JSON.stringify({
+      mode,
+      business_connection_id: businessConnectionId,
+      chat_id: chatId || null,
+      message_id: messageId || null
+    }).slice(0, 1200), UNKNOWN_ACCOUNT_KEY);
+    return { account: unknownAccount(businessConnectionId), archived: null, reason: 'unknown_business_connection' };
+  }
+  return { account: normalizeAccount(DEFAULT_ACCOUNT), archived: null, reason: 'fallback_default' };
 }
 
 async function rememberAccountBusinessConnection(account, businessConnectionId) {
@@ -1212,6 +1376,7 @@ async function runSchedulerTick(source = 'interval') {
       await maybeStartDailyAuto(account.account_key);
       await maybeWarnNoOutreach(account.account_key);
       await maybeFinishAutoReport(account.account_key);
+      await maybeSendScheduledDailyReport(account);
     }
   } catch (err) {
     console.error('scheduler tick error:', err);
@@ -1219,6 +1384,23 @@ async function runSchedulerTick(source = 'interval') {
   } finally {
     schedulerBusy = false;
   }
+}
+
+async function maybeSendScheduledDailyReport(account) {
+  const normalized = normalizeAccount(account);
+  if (normalized.account_key === UNKNOWN_ACCOUNT_KEY || normalized.reports_enabled === false) return;
+  const adminChatId = await getAdminChatIdForAccount(normalized.account_key);
+  if (!adminChatId) return;
+  const reportTime = normalized.daily_report_time || '18:00';
+  const nowMin = localMinuteNow();
+  const reportMin = minutesOf(reportTime);
+  if (nowMin < reportMin || nowMin > reportMin + 10) return;
+  const today = localDateKey();
+  const stateKey = settingKey('daily_report_state', normalized.account_key);
+  const state = await getSetting(stateKey, {});
+  if (state?.last_sent_date === today) return;
+  await sendArchiveReport(adminChatId, normalized.account_key, '📊 Kunlik hisobot');
+  await setSetting(stateKey, { last_sent_date: today, sent_at: Date.now(), account_key: normalized.account_key });
 }
 
 async function maybeStartDailyAuto(accountOrKey = DEFAULT_ACCOUNT_KEY) {
@@ -1403,8 +1585,11 @@ function archiveStoragePath(payload, filePath = '') {
 }
 
 async function maybeArchiveMediaFile(payload) {
-  if (!MEDIA_ARCHIVE_DOWNLOAD || !SUPABASE_STORAGE_BUCKET || !payload.file_id) return {};
-  if (payload.file_size && Number(payload.file_size) > MEDIA_ARCHIVE_MAX_BYTES) {
+  const downloadEnabled = payload.media_archive_download ?? MEDIA_ARCHIVE_DOWNLOAD;
+  const bucket = payload.storage_bucket || SUPABASE_STORAGE_BUCKET;
+  const maxBytes = Number(payload.media_archive_max_bytes || MEDIA_ARCHIVE_MAX_BYTES);
+  if (!downloadEnabled || !bucket || !payload.file_id) return {};
+  if (payload.file_size && Number(payload.file_size) > maxBytes) {
     await logEvent(payload.chat_id, 'media_archive_download_skipped_large', `${payload.message_id}:${payload.file_size}`, payload.account_key);
     return {};
   }
@@ -1414,17 +1599,17 @@ async function maybeArchiveMediaFile(payload) {
     const fileRes = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
     if (!fileRes.ok) throw new Error(`download failed ${fileRes.status}`);
     const bytes = Buffer.from(await fileRes.arrayBuffer());
-    if (bytes.byteLength > MEDIA_ARCHIVE_MAX_BYTES) {
+    if (bytes.byteLength > maxBytes) {
       await logEvent(payload.chat_id, 'media_archive_download_skipped_large', `${payload.message_id}:${bytes.byteLength}`, payload.account_key);
       return {};
     }
     const storagePath = archiveStoragePath(payload, file.file_path);
-    const { error } = await supabase.storage.from(SUPABASE_STORAGE_BUCKET).upload(storagePath, bytes, {
+    const { error } = await supabase.storage.from(bucket).upload(storagePath, bytes, {
       contentType: payload.mime_type || 'application/octet-stream',
       upsert: true
     });
     if (error) throw error;
-    const { data } = supabase.storage.from(SUPABASE_STORAGE_BUCKET).getPublicUrl(storagePath);
+    const { data } = supabase.storage.from(bucket).getPublicUrl(storagePath);
     return { storage_path: storagePath, public_url: data?.publicUrl || null, storage_url: data?.publicUrl || null };
   } catch (err) {
     console.error('maybeArchiveMediaFile:', err.message);
@@ -1434,10 +1619,15 @@ async function maybeArchiveMediaFile(payload) {
 }
 
 async function archiveBusinessMessage(msg, account, direction = 'unknown') {
-  if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false) return null;
+  if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false || account?.media_archive_enabled === false) return null;
   const payload = messageArchivePayload(msg, account, direction, 'created');
   if (!payload.chat_id || !payload.message_id) return null;
-  const storage = await maybeArchiveMediaFile(payload);
+  const storage = await maybeArchiveMediaFile({
+    ...payload,
+    media_archive_download: account?.media_archive_download,
+    media_archive_max_bytes: account?.media_archive_max_bytes,
+    storage_bucket: account?.storage_bucket
+  });
   const { data, error } = await supabase.from('message_archive').upsert({
     ...payload,
     ...storage,
@@ -1454,7 +1644,7 @@ async function archiveBusinessMessage(msg, account, direction = 'unknown') {
 async function archiveEditedBusinessMessage(msg) {
   const resolved = await resolveArchiveAccount(msg, msg.message_id, 'edited');
   const account = resolved.account;
-  if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false) return;
+  if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false || account?.media_archive_enabled === false) return;
   const direction = isOwnerMessage(msg) ? 'outgoing' : 'incoming';
   const payload = messageArchivePayload(msg, account, direction, 'edited');
   if (!payload.chat_id || !payload.message_id) return;
@@ -1508,7 +1698,7 @@ async function handleDeletedBusinessMessages(update = {}) {
     if (!messageId) continue;
     const resolved = await resolveArchiveAccount(update, messageId, 'deleted');
     const account = resolved.account;
-    if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false) continue;
+    if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false || account?.media_archive_enabled === false) continue;
     const ak = account.account_key;
     let oldRow = resolved.archived || await findArchivedMessage({
       businessConnectionId,
@@ -1717,6 +1907,17 @@ function isOwnerMessage(msg) {
   return ENV_ACCOUNTS.some(a => String(a.business_owner_id || '') === fromId) || fromId === String(BUSINESS_OWNER_ID) || fromId === String(OWNER_TELEGRAM_ID);
 }
 
+function isAccountOwnerMessage(msg, account = {}) {
+  const fromId = String(msg?.from?.id || '');
+  if (!fromId) return false;
+  return Boolean(
+    isOwnerMessage(msg) ||
+    (account.owner_user_id && String(account.owner_user_id) === fromId) ||
+    (account.business_owner_id && String(account.business_owner_id) === fromId) ||
+    (account.admin_chat_id && String(account.admin_chat_id) === fromId)
+  );
+}
+
 function isBotMessage(msg) {
   return Boolean(msg?.from?.is_bot);
 }
@@ -1728,6 +1929,7 @@ async function isKnownAdminMessage(msg) {
   const accounts = await getAccounts();
   return accounts.some(a => (
     (a.admin_chat_id && (String(a.admin_chat_id) === chatId || String(a.admin_chat_id) === fromId)) ||
+    (a.owner_user_id && String(a.owner_user_id) === fromId) ||
     (a.business_owner_id && String(a.business_owner_id) === fromId)
   ));
 }
@@ -1741,12 +1943,14 @@ async function whoamiText(msg, messageType = 'message') {
     ? await findAccountForBusinessMessage(msg)
     : accounts.find(a => (
       (a.admin_chat_id && (String(a.admin_chat_id) === chatId || String(a.admin_chat_id) === fromId)) ||
+      (a.owner_user_id && String(a.owner_user_id) === fromId) ||
       (a.business_owner_id && String(a.business_owner_id) === fromId)
     ));
   const isAdmin = await isKnownAdminMessage(msg);
   const accountMatches = accounts
     .filter(a => (
       (a.admin_chat_id && (String(a.admin_chat_id) === chatId || String(a.admin_chat_id) === fromId)) ||
+      (a.owner_user_id && String(a.owner_user_id) === fromId) ||
       (a.business_owner_id && String(a.business_owner_id) === fromId) ||
       (a.business_connection_id && businessConnectionId && String(a.business_connection_id) === String(businessConnectionId))
     ))
@@ -1796,14 +2000,23 @@ async function handleBusinessMessage(msg) {
   const account = await findAccountForBusinessMessage(msg);
   const ak = account.account_key;
   const text = getMessageText(msg).trim();
-  if (text.toLowerCase() === '/whoami') {
+  if (normalizeCommandWord(text.split(/\s+/)[0]) === '/whoami') {
     await replyWhoami(msg, 'business_message');
     return;
   }
   const key = `business:${ak}:${chatId}:${msg.message_id || msg.date || Date.now()}`;
-  const direction = isOwnerMessage(msg) ? 'outgoing' : 'incoming';
+  const direction = isAccountOwnerMessage(msg, account) ? 'outgoing' : 'incoming';
   if (direction === 'outgoing') await rememberAccountBusinessConnection(account, businessConnectionId);
   await archiveBusinessMessage(msg, account, direction);
+
+  if (ak === UNKNOWN_ACCOUNT_KEY) {
+    await logIgnore(chatId, 'unmapped_business_connection_no_flow', businessConnectionId || '', ak);
+    return;
+  }
+  if (account.bot_enabled === false || account.auto_reply_enabled === false) {
+    await logIgnore(chatId, 'auto_reply_off', businessConnectionId || '', ak);
+    return;
+  }
 
   const firstTime = await markProcessed(key, chatId, ak);
   if (!firstTime) {
@@ -1812,7 +2025,7 @@ async function handleBusinessMessage(msg) {
   }
   if (isBotMessage(msg)) return;
 
-  if (text.toLowerCase().trim() === '/resetme') {
+  if (normalizeCommandWord(text.trim().split(/\s+/)[0]) === '/resetme') {
     await resetMeChat({ chatId, businessConnectionId, from: msg.from, accountKey: ak });
     await tg('sendMessage', {
       chat_id: chatId,
@@ -1823,7 +2036,7 @@ async function handleBusinessMessage(msg) {
   }
 
   // Owner/admin outgoing message: remember outreach/context. Do not respond to the admin message itself.
-  if (isOwnerMessage(msg)) {
+  if (isAccountOwnerMessage(msg, account)) {
     if (text) await markOutreach({ chatId, businessConnectionId, from: msg.from, text, accountKey: ak });
     await syncAdminContext({ chatId, businessConnectionId, from: msg.from, text: text || '[media]', accountKey: ak });
     return;
@@ -2168,20 +2381,17 @@ async function archiveRowsText(title, rows) {
 }
 
 function archiveMenuKeyboard() {
-  return {
-    inline_keyboard: [
-      [{ text: 'UZLYE', callback_data: 'archa:uzlye' }],
-      [{ text: 'Ikkinchi akkaunt', callback_data: 'archa:second' }],
-      [{ text: '⬅️ Menyu', callback_data: 'menu' }]
-    ]
-  };
+  return { inline_keyboard: [[{ text: 'UZLYE', callback_data: 'archa:uzlye' }], [{ text: 'Ikkinchi akkaunt', callback_data: 'archa:second' }], [{ text: '⬅️ Menyu', callback_data: 'menu' }]] };
 }
 
 async function sendArchiveMenu(chatId) {
+  const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY);
+  const rows = accounts.map(a => ([{ text: a.label || a.account_key, callback_data: `archa:${a.account_key}` }]));
+  rows.push([{ text: '⬅️ Menyu', callback_data: 'menu' }]);
   return tg('sendMessage', {
     chat_id: chatId,
     text: '🕵️ Arxiv\n\nAkkauntni tanlang.',
-    reply_markup: archiveMenuKeyboard()
+    reply_markup: { inline_keyboard: rows }
   });
 }
 
@@ -2584,10 +2794,97 @@ async function sendOutreachMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   });
 }
 
+const COMMAND_ALIASES_UZ = new Map(Object.entries({
+  '/menyu': '/menu',
+  '/boshlash': '/start',
+  '/bekor': '/cancel',
+  '/kimman': '/whoami',
+  '/menireset': '/resetme',
+  '/akkauntlar': '/accounts',
+  '/akkaunt': '/account',
+  '/akkauntholati': '/accountstatus',
+  '/ulanishlar': '/connections',
+  '/ulanishbiriktir': '/bindconnection',
+  '/akkauntsozla': '/setaccount',
+  '/sozlamasozla': '/setsetting',
+  '/akkauntadmin': '/accountadmin',
+  '/akkauntniyoq': '/accounton',
+  '/akkauntochir': '/accountoff',
+  '/sozlamalar': '/settings',
+  '/suniyintellekt': '/ai',
+  '/aiholati': '/aistatus',
+  '/qoidatest': '/testrule',
+  '/aitest': '/testai',
+  '/aishablon': '/aitemplate',
+  '/ketmaketlik': '/flow',
+  '/ketmaketliktest': '/flowtest',
+  '/ketmaketliksozla': '/setflow',
+  '/avtoyoq': '/autoon',
+  '/avtoochir': '/autooff',
+  '/avtoholat': '/autostatus',
+  '/avto': '/auto',
+  '/kunliksozla': '/setdaily',
+  '/kunlikochir': '/dailyoff',
+  '/kunlikholat': '/dailystatus',
+  '/hisobot': '/report',
+  '/kunlikhisobot': '/dailyreport',
+  '/haftalikhisobot': '/weeklyreport',
+  '/barchahisobot': '/reportall',
+  '/malumot': '/info',
+  '/oqilganlar': '/read',
+  '/tanishdim': '/read',
+  '/tolov': '/payment',
+  '/eslatmalar': '/reminders',
+  '/kutilayotgan': '/pending',
+  '/shablonholati': '/healthtemplates',
+  '/diagnostika': '/diagnostics',
+  '/tekshir': '/tick',
+  '/arxiv': '/archive',
+  '/ochirilgan': '/deleted',
+  '/tahrirlangan': '/edited',
+  '/mediaarxiv': '/media',
+  '/chatarxiv': '/archivechat',
+  '/arxivdebug': '/archive_debug',
+  '/arxivyo_debug': '/archive_route_debug',
+  '/arxivyoldebug': '/archive_route_debug',
+  '/testxabar': '/testnotify',
+  '/shablonol': '/gettemplate',
+  '/shablonsozla': '/settemplate',
+  '/lidochir': '/leadsoff',
+  '/lidyoq': '/leadson',
+  '/qaytaboshla': '/reset',
+  '/holat': '/status'
+}));
+
+function normalizeCommandWord(word = '') {
+  const lower = String(word || '').toLowerCase();
+  return COMMAND_ALIASES_UZ.get(lower) || lower;
+}
+
+function normalizeCommandArg(arg = '') {
+  const value = String(arg || '').toLowerCase();
+  if (['yoq', 'yoqish', 'yoqildi', 'ha', 'on'].includes(value)) return 'on';
+  if (['ochir', 'ochirish', "o'chir", 'o‘chir', 'off'].includes(value)) return 'off';
+  if (['bugun', 'today'].includes(value)) return 'today';
+  return arg;
+}
+
+function normalizeAdminCommand(rawText = '') {
+  const trimmed = String(rawText || '').trim();
+  if (!trimmed.startsWith('/')) return trimmed;
+  const [first, ...rest] = trimmed.split(/\s+/);
+  const command = normalizeCommandWord(first);
+  const normalizedRest = [...rest];
+  if (['/ai', '/auto'].includes(command) && normalizedRest[0]) {
+    normalizedRest[0] = normalizeCommandArg(normalizedRest[0]);
+  }
+  return [command, ...normalizedRest].join(' ').trim();
+}
+
 // -------------------- Admin commands --------------------
 async function handleAdminMessage(msg) {
   const chatId = String(msg.chat?.id || '');
-  const text = String(msg.text || '').trim();
+  const text = normalizeAdminCommand(msg.text || '');
   if (!text) return;
   const selectedAccountKey = await getSelectedAccountKey(chatId);
   const session = await getAdminSession(chatId);
@@ -2631,6 +2928,48 @@ async function handleAdminMessage(msg) {
     if (account.account_key !== ak) return tg('sendMessage', { chat_id: chatId, text: `Akkaunt topilmadi: ${ak}` });
     await bindBusinessConnectionToAccount(account, businessConnectionId);
     return tg('sendMessage', { chat_id: chatId, text: `✅ Bog‘landi: ${businessConnectionId} → ${ak}` });
+  }
+  if (text.startsWith('/setaccount ')) {
+    const [, ak, field, ...rest] = text.split(/\s+/);
+    const value = rest.join(' ');
+    if (!ak || !field || !value) return tg('sendMessage', { chat_id: chatId, text: 'Format: /setaccount ACCOUNT_KEY FIELD VALUE' });
+    try {
+      const account = await setAccountField(ak, field, value);
+      return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: ${account.account_key}.${field} = ${value}` });
+    } catch (err) {
+      return tg('sendMessage', { chat_id: chatId, text: `⚠️ ${err.message}` });
+    }
+  }
+  if (text.startsWith('/setsetting ')) {
+    const [, ak, key, ...rest] = text.split(/\s+/);
+    const value = rest.join(' ');
+    if (!ak || !key || !value) return tg('sendMessage', { chat_id: chatId, text: 'Format: /setsetting ACCOUNT_KEY KEY VALUE' });
+    if (key === 'ai_intent_enabled') {
+      await setAccountAiEnabled(ak, Boolean(parseSettingValue(value)));
+      return tg('sendMessage', { chat_id: chatId, text: `✅ ${ak}.${key} = ${value}` });
+    }
+    try {
+      const account = await setAccountField(ak, key, value);
+      return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: ${account.account_key}.${key} = ${value}` });
+    } catch (err) {
+      return tg('sendMessage', { chat_id: chatId, text: `⚠️ ${err.message}` });
+    }
+  }
+  if (text.startsWith('/accountadmin ')) {
+    const [, ak, telegramId] = text.split(/\s+/);
+    if (!ak || !telegramId) return tg('sendMessage', { chat_id: chatId, text: 'Format: /accountadmin ACCOUNT_KEY TELEGRAM_ID' });
+    await upsertAccountPatch(ak, { admin_chat_id: String(telegramId) });
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Admin belgilandi: ${ak} → ${telegramId}` });
+  }
+  if (text.startsWith('/accounton ')) {
+    const ak = text.split(/\s+/)[1];
+    await upsertAccountPatch(ak, { bot_enabled: true, auto_reply_enabled: true });
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Akkaunt yoqildi: ${ak}` });
+  }
+  if (text.startsWith('/accountoff ')) {
+    const ak = text.split(/\s+/)[1];
+    await upsertAccountPatch(ak, { bot_enabled: false, auto_reply_enabled: false });
+    return tg('sendMessage', { chat_id: chatId, text: `⛔ Akkaunt o‘chirildi: ${ak}` });
   }
   if (text === '/accountstatus') return sendAccountStatus(chatId, selectedAccountKey);
   if (text.startsWith('/ai ')) {
@@ -2726,7 +3065,13 @@ async function handleAdminMessage(msg) {
     return autoOn(chatId, hours, parsed.accountKey);
   }
 
+  if (text === '/settings') return sendSettings(chatId, selectedAccountKey);
+  if (text.startsWith('/settings ')) return sendSettings(chatId, text.split(/\s+/)[1]);
   if (text === '/report') return sendReport(chatId, selectedAccountKey);
+  if (text.startsWith('/report ')) return sendArchiveReport(chatId, text.split(/\s+/)[1], '📊 Hisobot');
+  if (text === '/dailyreport' || text.startsWith('/dailyreport ')) return sendArchiveReport(chatId, text.split(/\s+/)[1] || selectedAccountKey, '📊 Kunlik hisobot');
+  if (text === '/weeklyreport' || text.startsWith('/weeklyreport ')) return sendArchiveReport(chatId, text.split(/\s+/)[1] || selectedAccountKey, '📊 Haftalik hisobot');
+  if (text === '/reportall') return sendReportAll(chatId);
   if (text === '/info') return sendList(chatId, 'info_sent', selectedAccountKey);
   if (text === '/read') return sendList(chatId, 'read', selectedAccountKey);
   if (text === '/payment') return sendList(chatId, 'payment', selectedAccountKey);
@@ -2739,6 +3084,7 @@ async function handleAdminMessage(msg) {
   if (text === '/deleted' || text.startsWith('/deleted ')) return sendArchiveList(chatId, 'deleted', text.split(/\s+/)[1] || selectedAccountKey);
   if (text === '/edited' || text.startsWith('/edited ')) return sendArchiveList(chatId, 'edited', text.split(/\s+/)[1] || selectedAccountKey);
   if (text === '/media' || text.startsWith('/media ')) return sendArchiveList(chatId, 'media', text.split(/\s+/)[1] || selectedAccountKey);
+  if (text === '/archive_route_debug') return sendArchiveDebug(chatId, ['/archive_debug', selectedAccountKey], selectedAccountKey);
   if (text.startsWith('/archive_debug ')) return sendArchiveDebug(chatId, text.split(/\s+/), selectedAccountKey);
   if (text.startsWith('/archivechat ')) {
     const parts = text.split(/\s+/);
@@ -2883,6 +3229,98 @@ async function sendReport(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
     parts.push(`${st}: ${await countLeads(q => q.eq('stage', st), accountOrKey)}`);
   }
   return tg('sendMessage', { chat_id: chatId, text: `📊 Hisobot\n\n${parts.join('\n')}` });
+}
+
+async function countArchive(apply, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  let q = supabase.from('message_archive').select('*', { count: 'exact', head: true });
+  q = archiveAccountFilter(q, accountOrKey);
+  if (apply) q = apply(q);
+  const { count, error } = await q;
+  if (error) {
+    console.error('countArchive:', error.message);
+    return 0;
+  }
+  return count || 0;
+}
+
+async function countUniqueArchiveChats(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  let q = supabase.from('message_archive').select('chat_id').limit(10000);
+  q = archiveAccountFilter(q, accountOrKey);
+  const { data, error } = await q;
+  if (error) {
+    console.error('countUniqueArchiveChats:', error.message);
+    return 0;
+  }
+  return new Set((data || []).map(r => String(r.chat_id))).size;
+}
+
+async function sendArchiveReport(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, title = '📊 Kunlik hisobot') {
+  const account = await getAccount(accountOrKey);
+  const total = await countArchive(null, account.account_key);
+  const incoming = await countArchive(q => q.eq('direction', 'incoming'), account.account_key);
+  const outgoing = await countArchive(q => q.eq('direction', 'outgoing'), account.account_key);
+  const edited = await countArchive(q => q.gt('edit_count', 0), account.account_key);
+  const deleted = await countArchive(q => q.eq('delete_detected', true), account.account_key);
+  const deletedPhotos = await countArchive(q => q.eq('delete_detected', true).eq('message_type', 'photo'), account.account_key);
+  const deletedVoice = await countArchive(q => q.eq('delete_detected', true).eq('message_type', 'voice'), account.account_key);
+  const deletedVideoNotes = await countArchive(q => q.eq('delete_detected', true).eq('message_type', 'video_note'), account.account_key);
+  const deletedDocs = await countArchive(q => q.eq('delete_detected', true).eq('message_type', 'document'), account.account_key);
+  const uniqueChats = await countUniqueArchiveChats(account.account_key);
+  const autoStarted = await countLeads(q => q.eq('outreach_sent', true), account.account_key);
+  const humanNeeded = await countLeads(q => q.in('status', ['needs_admin', 'pending_approval']), account.account_key);
+
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `${title}\n\n` +
+      `Akkaunt: ${account.label || account.account_key}\n` +
+      `Jami arxiv xabarlar: ${total}\n` +
+      `Incoming: ${incoming}\n` +
+      `Outgoing: ${outgoing}\n` +
+      `Tahrirlangan: ${edited}\n` +
+      `O‘chirilgan: ${deleted}\n` +
+      `O‘chirilgan rasm: ${deletedPhotos}\n` +
+      `O‘chirilgan ovozli: ${deletedVoice}\n` +
+      `O‘chirilgan dumaloq video: ${deletedVideoNotes}\n` +
+      `O‘chirilgan fayl: ${deletedDocs}\n` +
+      `Unique chatlar: ${uniqueChats}\n` +
+      `Active chatlar: ${await countLeads(q => q.eq('status', 'active'), account.account_key)}\n` +
+      `Auto reply started: ${autoStarted}\n` +
+      `Human needed: ${humanNeeded}`
+  });
+}
+
+async function sendReportAll(chatId) {
+  const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY);
+  const lines = [];
+  for (const account of accounts) {
+    lines.push(`${account.label || account.account_key}: ${await countArchive(null, account.account_key)} arxiv, ${await countLeads(null, account.account_key)} lead`);
+  }
+  return tg('sendMessage', { chat_id: chatId, text: `📊 Barcha akkauntlar\n\n${lines.join('\n') || 'Akkaunt yo‘q.'}` });
+}
+
+async function sendSettings(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = await getAccount(accountOrKey);
+  const ai = await getAccountAiEnabled(account.account_key);
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `⚙️ Sozlamalar\n\n` +
+      `Akkaunt: ${account.label || account.account_key}\n` +
+      `bot_enabled: ${account.bot_enabled ? 'ON' : 'OFF'}\n` +
+      `auto_reply_enabled: ${account.auto_reply_enabled ? 'ON' : 'OFF'}\n` +
+      `archive_enabled: ${account.archive_enabled ? 'ON' : 'OFF'}\n` +
+      `archive_notify_enabled: ${account.archive_notify_enabled ? 'ON' : 'OFF'}\n` +
+      `reports_enabled: ${account.reports_enabled ? 'ON' : 'OFF'}\n` +
+      `media_archive_enabled: ${account.media_archive_enabled ? 'ON' : 'OFF'}\n` +
+      `media_archive_download: ${account.media_archive_download ? 'ON' : 'OFF'}\n` +
+      `media_archive_max_bytes: ${account.media_archive_max_bytes}\n` +
+      `storage_bucket: ${account.storage_bucket || '-'}\n` +
+      `timezone: ${account.timezone || '-'}\n` +
+      `daily_report_time: ${account.daily_report_time || '18:00'}\n` +
+      `AI intent: ${ai ? 'ON' : 'OFF'}\n\n` +
+      `O‘zgartirish: /setsetting ${account.account_key} KEY VALUE`
+  });
 }
 
 async function healthTemplates(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
@@ -3125,7 +3563,7 @@ app.post('/webhook', async (req, res) => {
     const update = req.body || {};
     if (update.callback_query) await handleCallback(update.callback_query);
     if (update.message) {
-      const text = String(update.message.text || '').trim().toLowerCase();
+      const text = normalizeCommandWord(String(update.message.text || '').trim().split(/\s+/)[0]);
       if (text === '/whoami') {
         await replyWhoami(update.message, 'message');
       } else if (await isKnownAdminMessage(update.message)) {

@@ -29,15 +29,27 @@ create table if not exists business_leads (
 create table if not exists bot_accounts (
   account_key text primary key,
   label text,
+  owner_user_id text,
+  owner_username text,
+  owner_first_name text,
   business_owner_id text,
   admin_chat_id text,
   business_connection_id text,
   project_name text,
+  bot_enabled boolean default true,
   auto_reply_enabled boolean default false,
   archive_enabled boolean default true,
   archive_notify_enabled boolean default true,
+  reports_enabled boolean default true,
+  media_archive_enabled boolean default true,
+  media_archive_download boolean default false,
+  media_archive_max_bytes bigint default 20000000,
+  storage_bucket text default 'business-media-archive',
   daily_auto jsonb default '{}'::jsonb,
+  daily_report_time text default '18:00',
   flow_key text default 'info_only',
+  timezone text default 'Asia/Tashkent',
+  last_seen_at timestamptz,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
@@ -53,15 +65,27 @@ create table if not exists business_connection_accounts (
 );
 
 alter table bot_accounts add column if not exists label text;
+alter table bot_accounts add column if not exists owner_user_id text;
+alter table bot_accounts add column if not exists owner_username text;
+alter table bot_accounts add column if not exists owner_first_name text;
 alter table bot_accounts add column if not exists business_owner_id text;
 alter table bot_accounts add column if not exists admin_chat_id text;
 alter table bot_accounts add column if not exists business_connection_id text;
 alter table bot_accounts add column if not exists project_name text;
+alter table bot_accounts add column if not exists bot_enabled boolean default true;
 alter table bot_accounts add column if not exists auto_reply_enabled boolean default false;
 alter table bot_accounts add column if not exists archive_enabled boolean default true;
 alter table bot_accounts add column if not exists archive_notify_enabled boolean default true;
+alter table bot_accounts add column if not exists reports_enabled boolean default true;
+alter table bot_accounts add column if not exists media_archive_enabled boolean default true;
+alter table bot_accounts add column if not exists media_archive_download boolean default false;
+alter table bot_accounts add column if not exists media_archive_max_bytes bigint default 20000000;
+alter table bot_accounts add column if not exists storage_bucket text default 'business-media-archive';
 alter table bot_accounts add column if not exists daily_auto jsonb default '{}'::jsonb;
+alter table bot_accounts add column if not exists daily_report_time text default '18:00';
 alter table bot_accounts add column if not exists flow_key text default 'info_only';
+alter table bot_accounts add column if not exists timezone text default 'Asia/Tashkent';
+alter table bot_accounts add column if not exists last_seen_at timestamptz;
 alter table bot_accounts add column if not exists created_at timestamptz default now();
 alter table bot_accounts add column if not exists updated_at timestamptz default now();
 
