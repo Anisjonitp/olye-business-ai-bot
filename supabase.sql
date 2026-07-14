@@ -34,6 +34,8 @@ create table if not exists bot_accounts (
   business_connection_id text,
   project_name text,
   auto_reply_enabled boolean default false,
+  archive_enabled boolean default true,
+  archive_notify_enabled boolean default true,
   daily_auto jsonb default '{}'::jsonb,
   flow_key text default 'info_only',
   created_at timestamptz default now(),
@@ -46,6 +48,8 @@ alter table bot_accounts add column if not exists admin_chat_id text;
 alter table bot_accounts add column if not exists business_connection_id text;
 alter table bot_accounts add column if not exists project_name text;
 alter table bot_accounts add column if not exists auto_reply_enabled boolean default false;
+alter table bot_accounts add column if not exists archive_enabled boolean default true;
+alter table bot_accounts add column if not exists archive_notify_enabled boolean default true;
 alter table bot_accounts add column if not exists daily_auto jsonb default '{}'::jsonb;
 alter table bot_accounts add column if not exists flow_key text default 'info_only';
 alter table bot_accounts add column if not exists created_at timestamptz default now();
@@ -94,18 +98,24 @@ alter table lead_events add column if not exists account_key text;
 
 create table if not exists processed_messages (
   message_key text primary key,
+  account_key text,
   chat_id text,
   created_at timestamptz default now()
 );
 
+alter table processed_messages add column if not exists account_key text;
+
 create table if not exists sent_actions (
   action_key text primary key,
   chat_id text not null,
+  account_key text,
   action_name text not null,
   stage text,
   message text,
   created_at timestamptz default now()
 );
+
+alter table sent_actions add column if not exists account_key text;
 
 create table if not exists bot_settings (
   key text primary key,
@@ -164,6 +174,37 @@ create table if not exists message_edit_history (
   edited_at timestamptz default now()
 );
 
+create table if not exists account_flow_steps (
+  id bigserial primary key,
+  account_key text not null,
+  flow_key text not null,
+  step_key text not null,
+  template_key text not null,
+  next_step_yes text,
+  next_step_no text,
+  next_step_partial text,
+  next_step_unknown text,
+  stop_after_send boolean default false,
+  sort_order integer default 0,
+  is_active boolean default true,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+alter table account_flow_steps add column if not exists account_key text;
+alter table account_flow_steps add column if not exists flow_key text;
+alter table account_flow_steps add column if not exists step_key text;
+alter table account_flow_steps add column if not exists template_key text;
+alter table account_flow_steps add column if not exists next_step_yes text;
+alter table account_flow_steps add column if not exists next_step_no text;
+alter table account_flow_steps add column if not exists next_step_partial text;
+alter table account_flow_steps add column if not exists next_step_unknown text;
+alter table account_flow_steps add column if not exists stop_after_send boolean default false;
+alter table account_flow_steps add column if not exists sort_order integer default 0;
+alter table account_flow_steps add column if not exists is_active boolean default true;
+alter table account_flow_steps add column if not exists created_at timestamptz default now();
+alter table account_flow_steps add column if not exists updated_at timestamptz default now();
+
 alter table message_archive add column if not exists account_key text;
 alter table message_archive add column if not exists business_connection_id text;
 alter table message_archive add column if not exists chat_id text;
@@ -208,6 +249,8 @@ create index if not exists business_leads_account_status_idx on business_leads(a
 create index if not exists business_leads_account_outreach_idx on business_leads(account_key, outreach_session_id);
 create index if not exists reply_templates_account_idx on reply_templates(account_key);
 create index if not exists lead_events_account_idx on lead_events(account_key, created_at desc);
+create index if not exists processed_messages_account_idx on processed_messages(account_key);
+create index if not exists sent_actions_account_idx on sent_actions(account_key);
 create unique index if not exists message_archive_account_chat_message_idx on message_archive(account_key, chat_id, message_id);
 create index if not exists message_archive_chat_idx on message_archive(chat_id);
 create index if not exists message_archive_message_idx on message_archive(message_id);
@@ -219,6 +262,21 @@ create index if not exists message_edit_history_chat_idx on message_edit_history
 create index if not exists message_edit_history_message_idx on message_edit_history(message_id);
 create index if not exists message_edit_history_account_idx on message_edit_history(account_key);
 create index if not exists message_edit_history_edited_idx on message_edit_history(edited_at);
+create unique index if not exists account_flow_steps_unique_idx on account_flow_steps(account_key, flow_key, step_key);
+create index if not exists account_flow_steps_account_idx on account_flow_steps(account_key, flow_key, sort_order);
+
+insert into bot_accounts (account_key, label, project_name, business_owner_id, admin_chat_id, flow_key, archive_enabled, archive_notify_enabled)
+values ('uzlye', 'UZLYE', 'O‘zbekiston Lider Yoshlari Ensiklopediyasi', null, null, 'uzlye_info_only', true, true)
+on conflict (account_key) do nothing;
+
+insert into account_flow_steps (account_key, flow_key, step_key, template_key, next_step_yes, next_step_no, next_step_partial, next_step_unknown, stop_after_send, sort_order, is_active)
+values
+('uzlye', 'uzlye_info_only', 'ask_application', 'ask_application', 'ask_info', 'application_link', 'ask_info', null, false, 10, true),
+('uzlye', 'uzlye_info_only', 'ask_info', 'ask_info', 'has_info', 'no_info', 'has_info', 'no_info', false, 20, true),
+('uzlye', 'uzlye_info_only', 'has_info', 'known_info_preface,short_intro,offer_end', null, null, null, null, true, 30, true),
+('uzlye', 'uzlye_info_only', 'no_info', 'unknown_info_preface,full_intro,offer_end', null, null, null, null, true, 40, true),
+('uzlye', 'uzlye_info_only', 'application_link', 'application_link_reply', null, null, null, null, true, 50, true)
+on conflict (account_key, flow_key, step_key) do nothing;
 
 -- IMPORTANT: on conflict do nothing = your edited templates will NOT be overwritten.
 insert into reply_templates (key, title, body) values

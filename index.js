@@ -13,7 +13,8 @@ const BUSINESS_OWNER_ID = process.env.BUSINESS_OWNER_ID || OWNER_TELEGRAM_ID || 
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 const APPLICATION_LINK = process.env.APPLICATION_LINK || 'https://liderlar.uz/ariza_qoldirish';
-const DEFAULT_ACCOUNT_KEY = 'default';
+const DEFAULT_ACCOUNT_KEY = 'uzlye';
+const LEGACY_DEFAULT_ACCOUNT_KEY = 'default';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || process.env.SUPABASE_ANON_KEY;
@@ -75,7 +76,9 @@ function parseAccountsFromEnv() {
     admin_chat_id: ADMIN_CHAT_ID || '',
     business_connection_id: '',
     project_name: 'O‘zbekiston Lider Yoshlari Ensiklopediyasi',
-    flow_key: 'info_only'
+    flow_key: 'uzlye_info_only',
+    archive_enabled: true,
+    archive_notify_enabled: true
   }];
 
   if (!process.env.BUSINESS_ACCOUNTS_JSON) return fallback;
@@ -89,7 +92,9 @@ function parseAccountsFromEnv() {
       admin_chat_id: String(a.admin_chat_id || ADMIN_CHAT_ID || ''),
       business_connection_id: String(a.business_connection_id || ''),
       project_name: String(a.project_name || a.label || a.account_key || `Account ${i + 1}`),
-      flow_key: String(a.flow_key || 'info_only')
+      flow_key: String(a.flow_key || 'info_only'),
+      archive_enabled: a.archive_enabled !== false,
+      archive_notify_enabled: a.archive_notify_enabled !== false
     }));
   } catch (err) {
     console.error('BUSINESS_ACCOUNTS_JSON parse error:', err.message);
@@ -105,7 +110,9 @@ const DEFAULT_ACCOUNT = ENV_ACCOUNTS[0] || {
   admin_chat_id: ADMIN_CHAT_ID || '',
   business_connection_id: '',
   project_name: 'O‘zbekiston Lider Yoshlari Ensiklopediyasi',
-  flow_key: 'info_only'
+  flow_key: 'uzlye_info_only',
+  archive_enabled: true,
+  archive_notify_enabled: true
 };
 
 function accountKey(accountOrKey = DEFAULT_ACCOUNT_KEY) {
@@ -165,12 +172,12 @@ async function findAccountForBusinessMessage(msg) {
 }
 
 function isDefaultAccountKey(ak) {
-  return !ak || ak === DEFAULT_ACCOUNT_KEY;
+  return !ak || ak === DEFAULT_ACCOUNT_KEY || ak === LEGACY_DEFAULT_ACCOUNT_KEY;
 }
 
 function accountLeadFilter(q, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const ak = accountKey(accountOrKey);
-  if (isDefaultAccountKey(ak)) return q.or(`account_key.is.null,account_key.eq.${DEFAULT_ACCOUNT_KEY}`);
+  if (isDefaultAccountKey(ak)) return q.or(`account_key.is.null,account_key.eq.${DEFAULT_ACCOUNT_KEY},account_key.eq.${LEGACY_DEFAULT_ACCOUNT_KEY}`);
   return q.eq('account_key', ak);
 }
 
@@ -295,8 +302,12 @@ async function upsertLeadBase({ chatId, businessConnectionId, from, text, accoun
   return createLead({ chatId, businessConnectionId, from, text, stage: STAGE.NEW, accountKey });
 }
 
-async function markProcessed(messageKey, chatId) {
-  const { error } = await supabase.from('processed_messages').insert({ message_key: messageKey, chat_id: String(chatId) });
+async function markProcessed(messageKey, chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const { error } = await supabase.from('processed_messages').insert({
+    message_key: messageKey,
+    chat_id: String(chatId),
+    account_key: accountKey(accountOrKey)
+  });
   if (!error) return true;
   if (error.code === '23505') return false;
   console.error('markProcessed:', error.message);
@@ -309,6 +320,7 @@ async function reserveAction(chatId, stage, actionName, accountOrKey = DEFAULT_A
   const { error } = await supabase.from('sent_actions').insert({
     action_key: actionKey,
     chat_id: String(chatId),
+    account_key: ak,
     action_name: actionName,
     stage
   });
@@ -353,6 +365,51 @@ async function setTemplate(key, body, accountOrKey = null) {
     body,
     updated_at: new Date().toISOString()
   });
+  if (error) throw error;
+}
+
+async function getFlowSteps(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = await getAccount(accountOrKey);
+  let q = supabase.from('account_flow_steps')
+    .select('*')
+    .eq('account_key', account.account_key)
+    .eq('flow_key', account.flow_key || 'info_only')
+    .eq('is_active', true)
+    .order('sort_order', { ascending: true });
+  const { data, error } = await q;
+  if (error) {
+    console.error('getFlowSteps:', error.message);
+    return [];
+  }
+  return data || [];
+}
+
+async function getFlowStep(accountOrKey, stepKey) {
+  const steps = await getFlowSteps(accountOrKey);
+  return steps.find(s => s.step_key === stepKey) || null;
+}
+
+async function flowTemplateKeys(accountOrKey, stepKey, fallbackKeys) {
+  const step = await getFlowStep(accountOrKey, stepKey);
+  if (!step?.template_key) return fallbackKeys;
+  return String(step.template_key).split(/[,\s]+/).map(x => x.trim()).filter(Boolean);
+}
+
+async function upsertFlowStep({ accountKey: ak, stepKey, templateKey, nextYes, nextNo, nextPartial, nextUnknown, stopAfterSend }) {
+  const account = await getAccount(ak);
+  const { error } = await supabase.from('account_flow_steps').upsert({
+    account_key: account.account_key,
+    flow_key: account.flow_key || 'info_only',
+    step_key: stepKey,
+    template_key: templateKey,
+    next_step_yes: nextYes || null,
+    next_step_no: nextNo || null,
+    next_step_partial: nextPartial || null,
+    next_step_unknown: nextUnknown || null,
+    stop_after_send: String(stopAfterSend) === 'true',
+    is_active: true,
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'account_key,flow_key,step_key' });
   if (error) throw error;
 }
 
@@ -415,9 +472,9 @@ async function resetMeChat({ chatId, businessConnectionId = null, from = null, a
 
   // Faqat shu chatning test holatini tozalaydi. Boshqa lidlarga tegmaydi.
   // business_leads yozuvini o‘chirmaymiz, chunki business_connection_id kerak bo‘lib qoladi.
-  await supabase.from('sent_actions').delete().eq('chat_id', id);
-  await supabase.from('processed_messages').delete().eq('chat_id', id);
-  await supabase.from('lead_events').delete().eq('chat_id', id);
+  await accountLeadFilter(supabase.from('sent_actions').delete().eq('chat_id', id), accountKey);
+  await accountLeadFilter(supabase.from('processed_messages').delete().eq('chat_id', id), accountKey);
+  await accountLeadFilter(supabase.from('lead_events').delete().eq('chat_id', id), accountKey);
 
   const existing = await getLead(id, accountKey);
   const patch = {
@@ -660,11 +717,13 @@ async function tryResumeFromContext(lead, text) {
   if (assumedStage === STAGE.ASKED_APPLICATION) {
     const intent = forcedIntent || classify(text, STAGE.ASKED_APPLICATION);
     if (intent === 'application_confirmed' || intent === 'application_submitted') {
-      current = await sendPackage(current, 'ask_info_context_resume', ['ask_info'], { stage: STAGE.ASKED_INFO, status: 'active', bot_enabled: true }) || current;
+      const keys = await flowTemplateKeys(current.account_key, 'ask_info', ['ask_info']);
+      current = await sendPackage(current, 'ask_info_context_resume', keys, { stage: STAGE.ASKED_INFO, status: 'active', bot_enabled: true }) || current;
       return { handled: true, lead: current };
     }
     if (intent === 'application_not_submitted') {
-      current = await sendPackage(current, 'application_link_context_resume', ['application_link_reply'], {
+      const keys = await flowTemplateKeys(current.account_key, 'application_link', ['application_link_reply']);
+      current = await sendPackage(current, 'application_link_context_resume', keys, {
         stage: STAGE.INFO_SENT_FINISHED,
         status: 'application_link_sent',
         bot_enabled: false,
@@ -681,12 +740,14 @@ Context resume orqali.`, {}, current.account_key);
   if (assumedStage === STAGE.ASKED_INFO) {
     const intent = classify(text, STAGE.ASKED_INFO);
     if (intent === 'has_info') {
-      const after = await sendPackage(current, 'known_info_context_resume', ['known_info_preface', 'short_intro', 'offer_end'], {});
+      const keys = await flowTemplateKeys(current.account_key, 'has_info', ['known_info_preface', 'short_intro', 'offer_end']);
+      const after = await sendPackage(current, 'known_info_context_resume', keys, {});
       await finishAfterInfo(after || current);
       return { handled: true, lead: after || current };
     }
     if (intent === 'no_info' || intent === 'unclear' || intent === 'payment_near' || intent === 'read_offer') {
-      const after = await sendPackage(current, 'unknown_info_context_resume', ['unknown_info_preface', 'full_intro', 'offer_end'], {});
+      const keys = await flowTemplateKeys(current.account_key, 'no_info', ['unknown_info_preface', 'full_intro', 'offer_end']);
+      const after = await sendPackage(current, 'unknown_info_context_resume', keys, {});
       await finishAfterInfo(after || current);
       return { handled: true, lead: after || current };
     }
@@ -967,7 +1028,7 @@ async function maybeArchiveMediaFile(payload) {
 }
 
 async function archiveBusinessMessage(msg, account, direction = 'unknown') {
-  if (!MEDIA_ARCHIVE_ENABLED) return null;
+  if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false) return null;
   const payload = messageArchivePayload(msg, account, direction, 'created');
   if (!payload.chat_id || !payload.message_id) return null;
   const storage = await maybeArchiveMediaFile(payload);
@@ -985,8 +1046,8 @@ async function archiveBusinessMessage(msg, account, direction = 'unknown') {
 }
 
 async function archiveEditedBusinessMessage(msg) {
-  if (!MEDIA_ARCHIVE_ENABLED) return;
   const account = await findAccountForBusinessMessage(msg);
+  if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false) return;
   const direction = isOwnerMessage(msg) ? 'outgoing' : 'incoming';
   const payload = messageArchivePayload(msg, account, direction, 'edited');
   if (!payload.chat_id || !payload.message_id) return;
@@ -1024,7 +1085,7 @@ async function archiveEditedBusinessMessage(msg) {
   }, { onConflict: 'account_key,chat_id,message_id' });
   if (error) console.error('archiveEditedBusinessMessage:', error.message);
 
-  await notifyEditedMessage(account, oldRow, payload);
+  if (account.archive_notify_enabled !== false) await notifyEditedMessage(account, oldRow, payload);
 }
 
 function deletedMessageIds(update = {}) {
@@ -1033,8 +1094,8 @@ function deletedMessageIds(update = {}) {
 }
 
 async function handleDeletedBusinessMessages(update = {}) {
-  if (!MEDIA_ARCHIVE_ENABLED) return;
   const account = await findAccountForBusinessMessage(update);
+  if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false) return;
   const ak = account.account_key;
   const businessConnectionId = update.business_connection_id || update.business_connection?.id || account.business_connection_id || null;
   const chatId = String(update.chat?.id || update.chat_id || '');
@@ -1062,7 +1123,7 @@ async function handleDeletedBusinessMessages(update = {}) {
       id: oldRow?.id
     }, { onConflict: 'account_key,chat_id,message_id' });
     if (error) console.error('handleDeletedBusinessMessages:', error.message);
-    await notifyDeletedMessage(account, oldRow || patch);
+    if (account.archive_notify_enabled !== false) await notifyDeletedMessage(account, oldRow || patch);
   }
 }
 
@@ -1127,7 +1188,7 @@ async function handleBusinessMessage(msg) {
   const direction = isOwnerMessage(msg) ? 'outgoing' : 'incoming';
   await archiveBusinessMessage(msg, account, direction);
 
-  const firstTime = await markProcessed(key, chatId);
+  const firstTime = await markProcessed(key, chatId, ak);
   if (!firstTime) {
     await logIgnore(chatId, 'duplicate_message', key, ak);
     return;
@@ -1260,17 +1321,20 @@ async function processLeadBatch(initialLead, texts) {
 
   // Main info-only flow.
   if (lead.stage === STAGE.OUTREACH_SENT || lead.stage === STAGE.NEW || lead.stage === STAGE.PENDING_APPROVAL) {
-    await sendPackage(lead, 'ask_application', ['ask_application'], { stage: STAGE.ASKED_APPLICATION, status: 'active', bot_enabled: true });
+    const keys = await flowTemplateKeys(lead.account_key, 'ask_application', ['ask_application']);
+    await sendPackage(lead, 'ask_application', keys, { stage: STAGE.ASKED_APPLICATION, status: 'active', bot_enabled: true });
     return;
   }
 
   if (lead.stage === STAGE.ASKED_APPLICATION) {
     if (intent === 'application_confirmed' || intent === 'application_submitted') {
-      await sendPackage(lead, 'ask_info', ['ask_info'], { stage: STAGE.ASKED_INFO });
+      const keys = await flowTemplateKeys(lead.account_key, 'ask_info', ['ask_info']);
+      await sendPackage(lead, 'ask_info', keys, { stage: STAGE.ASKED_INFO });
       return;
     }
     if (intent === 'application_not_submitted') {
-      const after = await sendPackage(lead, 'application_link_reply', ['application_link_reply'], {
+      const keys = await flowTemplateKeys(lead.account_key, 'application_link', ['application_link_reply']);
+      const after = await sendPackage(lead, 'application_link_reply', keys, {
         stage: STAGE.INFO_SENT_FINISHED,
         status: 'application_link_sent',
         bot_enabled: false,
@@ -1291,11 +1355,13 @@ async function processLeadBatch(initialLead, texts) {
 
   if (lead.stage === STAGE.ASKED_INFO) {
     if (intent === 'has_info') {
-      const after = await sendPackage(lead, 'known_info_package', ['known_info_preface', 'short_intro', 'offer_end'], {});
+      const keys = await flowTemplateKeys(lead.account_key, 'has_info', ['known_info_preface', 'short_intro', 'offer_end']);
+      const after = await sendPackage(lead, 'known_info_package', keys, {});
       await finishAfterInfo(after || lead);
       return;
     }
-    const after = await sendPackage(lead, 'unknown_info_package', ['unknown_info_preface', 'full_intro', 'offer_end'], {});
+    const keys = await flowTemplateKeys(lead.account_key, 'no_info', ['unknown_info_preface', 'full_intro', 'offer_end']);
+    const after = await sendPackage(lead, 'unknown_info_package', keys, {});
     await finishAfterInfo(after || lead);
     return;
   }
@@ -1377,7 +1443,7 @@ function listText(title, rows) {
 }
 
 function archiveAccountFilter(q, accountOrKey = DEFAULT_ACCOUNT_KEY) {
-  return q.eq('account_key', accountKey(accountOrKey));
+  return accountLeadFilter(q, accountOrKey);
 }
 
 async function getArchiveRows(type, accountOrKey = DEFAULT_ACCOUNT_KEY, chatId = null, limit = 10) {
@@ -1551,9 +1617,45 @@ async function sendAccountStatus(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
       `Business owner: ${account.business_owner_id || '-'}\n` +
       `Business connection: ${account.business_connection_id || '-'}\n` +
       `Auto Reply: ${isAutoActive(auto) ? 'ON' : 'OFF'}\n` +
+      `Archive: ${account.archive_enabled === false ? 'OFF' : 'ON'}\n` +
+      `Archive notify: ${account.archive_notify_enabled === false ? 'OFF' : 'ON'}\n` +
       `Active session: ${auto?.session_id || '-'}\n` +
       `Daily auto: ${daily.enabled ? `${daily.start_time}, ${daily.duration_hours}h` : 'OFF'}`
   });
+}
+
+async function sendFlow(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = await getAccount(accountOrKey);
+  const steps = await getFlowSteps(account.account_key);
+  if (!steps.length) {
+    return tg('sendMessage', { chat_id: chatId, text: `Flow: ${account.account_key}/${account.flow_key || 'info_only'}\n\nDB flow steps yo‘q. Bot UZLYE fallback ketma-ketligidan foydalanadi.` });
+  }
+  const text = `Flow: ${account.account_key}/${account.flow_key || 'info_only'}\n\n` + steps.map((s, i) => (
+    `${i + 1}. ${s.step_key} -> ${s.template_key}\n` +
+    `   yes:${s.next_step_yes || '-'} no:${s.next_step_no || '-'} partial:${s.next_step_partial || '-'} unknown:${s.next_step_unknown || '-'} stop:${s.stop_after_send ? 'true' : 'false'}`
+  )).join('\n\n');
+  return tg('sendMessage', { chat_id: chatId, text });
+}
+
+async function sendFlowTest(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = await getAccount(accountOrKey);
+  const defaults = [
+    ['ask_application', ['ask_application']],
+    ['ask_info', ['ask_info']],
+    ['has_info', ['known_info_preface', 'short_intro', 'offer_end']],
+    ['no_info', ['unknown_info_preface', 'full_intro', 'offer_end']],
+    ['application_link', ['application_link_reply']]
+  ];
+  const lines = [];
+  for (const [stepKey, fallback] of defaults) {
+    const keys = await flowTemplateKeys(account.account_key, stepKey, fallback);
+    const missing = [];
+    for (const key of keys) {
+      if (!(await getTemplate(key, account.account_key))) missing.push(key);
+    }
+    lines.push(`${stepKey}: ${keys.join(', ')}${missing.length ? `\n   missing: ${missing.join(', ')}` : ''}`);
+  }
+  return tg('sendMessage', { chat_id: chatId, text: `Flow test: ${account.account_key}/${account.flow_key || 'info_only'}\n\n${lines.join('\n\n')}` });
 }
 
 async function sendDashboard(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
@@ -1653,6 +1755,25 @@ async function handleAdminMessage(msg) {
     return tg('sendMessage', { chat_id: chatId, text: `✅ Akkaunt tanlandi: ${account.label || account.account_key}` });
   }
   if (text === '/accountstatus') return sendAccountStatus(chatId, selectedAccountKey);
+  if (text.startsWith('/flow ')) return sendFlow(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/flowtest ')) return sendFlowTest(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/setflow ')) {
+    const [, ak, stepKey, templateKey, nextYes, nextNo, nextPartial, nextUnknown, stopAfterSend] = text.split(/\s+/);
+    if (!ak || !stepKey || !templateKey) {
+      return tg('sendMessage', { chat_id: chatId, text: 'Format: /setflow ACCOUNT_KEY STEP_KEY TEMPLATE_KEY NEXT_YES NEXT_NO NEXT_PARTIAL NEXT_UNKNOWN STOP_TRUE_FALSE' });
+    }
+    await upsertFlowStep({
+      accountKey: ak,
+      stepKey,
+      templateKey,
+      nextYes,
+      nextNo,
+      nextPartial,
+      nextUnknown,
+      stopAfterSend
+    });
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Flow step saqlandi: ${ak}/${stepKey}` });
+  }
 
   if (text === '/autoon') return autoOn(chatId, AUTO_OUTREACH_DEFAULT_HOURS, selectedAccountKey);
   if (text === '/autooff') return autoOff(chatId, selectedAccountKey);
@@ -1681,10 +1802,15 @@ async function handleAdminMessage(msg) {
   if (text === '/healthtemplates') return healthTemplates(chatId, selectedAccountKey);
   if (text === '/diagnostics') return diagnostics(chatId, selectedAccountKey);
   if (text === '/archive') return sendArchiveMenu(chatId);
-  if (text === '/deleted') return sendArchiveList(chatId, 'deleted', selectedAccountKey);
-  if (text === '/edited') return sendArchiveList(chatId, 'edited', selectedAccountKey);
-  if (text === '/media') return sendArchiveList(chatId, 'media', selectedAccountKey);
-  if (text.startsWith('/archivechat ')) return sendArchiveList(chatId, 'chat', selectedAccountKey, text.split(/\s+/)[1]);
+  if (text === '/deleted' || text.startsWith('/deleted ')) return sendArchiveList(chatId, 'deleted', text.split(/\s+/)[1] || selectedAccountKey);
+  if (text === '/edited' || text.startsWith('/edited ')) return sendArchiveList(chatId, 'edited', text.split(/\s+/)[1] || selectedAccountKey);
+  if (text === '/media' || text.startsWith('/media ')) return sendArchiveList(chatId, 'media', text.split(/\s+/)[1] || selectedAccountKey);
+  if (text.startsWith('/archivechat ')) {
+    const parts = text.split(/\s+/);
+    const accounts = await getAccounts();
+    const maybeAccount = accounts.find(a => a.account_key === parts[1]);
+    return sendArchiveList(chatId, 'chat', maybeAccount ? parts[1] : selectedAccountKey, maybeAccount ? parts[2] : parts[1]);
+  }
   if (text === '/tick') return manualTick(chatId);
 
   if (text.startsWith('/setdaily ')) {
@@ -1718,7 +1844,7 @@ async function handleAdminMessage(msg) {
     const prefix = maybeAccount ? `${first} ${second}` : first;
     const body = rest.slice(prefix.length).trim();
     if (!key || !body) return tg('sendMessage', { chat_id: chatId, text: 'Format: /settemplate key yangi matn yoki /settemplate account_key key yangi matn' });
-    await setTemplate(key, body, maybeAccount ? templateAccountKey : null);
+    await setTemplate(key, body, templateAccountKey);
     return tg('sendMessage', { chat_id: chatId, text: `✅ ${templateAccountKey}/${key} yangilandi.` });
   }
 
@@ -1734,7 +1860,7 @@ async function handleAdminMessage(msg) {
   }
   if (text.startsWith('/reset ')) {
     const id = text.split(/\s+/)[1];
-    await supabase.from('sent_actions').delete().eq('chat_id', String(id));
+    await accountLeadFilter(supabase.from('sent_actions').delete().eq('chat_id', String(id)), selectedAccountKey);
     await updateLead(id, { stage: STAGE.OUTREACH_SENT, status: 'active', bot_enabled: true, finished_at: null }, selectedAccountKey);
     return tg('sendMessage', { chat_id: chatId, text: `🔁 ${id} reset qilindi. Keyingi xabarida bot ask_application’dan boshlaydi.` });
   }
@@ -1808,7 +1934,7 @@ async function diagnostics(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
     ? await countLeads(q => q.eq('outreach_session_id', auto.session_id), account.account_key)
     : 0;
   const missing = [];
-  for (const k of ['ask_application', 'ask_info', 'full_intro', 'offer_end', 'offer_followup']) if (!(await getTemplate(k))) missing.push(k);
+  for (const k of ['ask_application', 'ask_info', 'full_intro', 'offer_end', 'offer_followup']) if (!(await getTemplate(k, account.account_key))) missing.push(k);
   return tg('sendMessage', {
     chat_id: chatId,
     text:
