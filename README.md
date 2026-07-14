@@ -83,6 +83,9 @@ https://YOUR-RENDER-APP.onrender.com/tick
 /accounts
 /account ACCOUNT_KEY
 /accountstatus
+/flow ACCOUNT_KEY
+/setflow ACCOUNT_KEY STEP_KEY TEMPLATE_KEY NEXT_YES NEXT_NO NEXT_PARTIAL NEXT_UNKNOWN STOP_TRUE_FALSE
+/flowtest ACCOUNT_KEY
 /archive
 /deleted
 /edited
@@ -114,20 +117,20 @@ Bir nechta akkaunt uchun optional `BUSINESS_ACCOUNTS_JSON` ishlatiladi:
 ```json
 [
   {
-    "account_key": "default",
+    "account_key": "uzlye",
     "label": "UZLYE",
+    "project_name": "O‘zbekiston Lider Yoshlari Ensiklopediyasi",
     "business_owner_id": "123456789",
     "admin_chat_id": "123456789",
-    "project_name": "O‘zbekiston Lider Yoshlari Ensiklopediyasi",
-    "flow_key": "info_only"
+    "flow_key": "uzlye_info_only"
   },
   {
     "account_key": "second",
-    "label": "Second Project",
+    "label": "Second Account",
+    "project_name": "Second Project",
     "business_owner_id": "987654321",
     "admin_chat_id": "987654321",
-    "project_name": "Second Project",
-    "flow_key": "info_only_second"
+    "flow_key": "second_info_only"
   }
 ]
 ```
@@ -144,6 +147,14 @@ Account-specific format:
 ```text
 /gettemplate account_key key
 /settemplate account_key key yangi matn
+```
+
+Flow komandalar:
+
+```text
+/flow ACCOUNT_KEY
+/setflow ACCOUNT_KEY STEP_KEY TEMPLATE_KEY NEXT_YES NEXT_NO NEXT_PARTIAL NEXT_UNKNOWN STOP_TRUE_FALSE
+/flowtest ACCOUNT_KEY
 ```
 
 ## Muhim
