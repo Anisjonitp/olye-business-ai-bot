@@ -2802,13 +2802,17 @@ function archiveMenuKeyboard() {
   return { inline_keyboard: [[{ text: 'UZLYE', callback_data: 'archa:uzlye' }], [{ text: 'Ikkinchi akkaunt', callback_data: 'archa:second' }], [{ text: '⬅️ Menyu', callback_data: 'menu' }]] };
 }
 
-async function sendArchiveMenu(chatId) {
-  const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY);
+async function sendArchiveMenu(chatId, accountKeys = null) {
+  const allowed = accountKeys ? new Set([...accountKeys].map(String)) : null;
+  const accounts = (await getAccounts()).filter(a => (
+    a.account_key !== UNKNOWN_ACCOUNT_KEY &&
+    (!allowed || allowed.has(a.account_key))
+  ));
   const rows = accounts.map(a => ([{ text: a.label || a.account_key, callback_data: `archa:${a.account_key}` }]));
   rows.push([{ text: '⬅️ Menyu', callback_data: 'menu' }]);
   return tg('sendMessage', {
     chat_id: chatId,
-    text: '🕵️ Arxiv\n\nAkkauntni tanlang.',
+    text: accounts.length ? '🕵️ Arxiv\n\nAkkauntni tanlang.' : '🕵️ Arxiv\n\nSizga biriktirilgan akkaunt yo‘q.',
     reply_markup: { inline_keyboard: rows }
   });
 }
@@ -2839,8 +2843,14 @@ async function getBusinessConnectionRows(accountOrKey = null) {
   return data || [];
 }
 
-async function sendConnections(chatId) {
-  const rows = await getBusinessConnectionRows();
+async function sendConnections(chatId, accountKeys = null) {
+  let rows = [];
+  if (accountKeys) {
+    const allowed = new Set([...accountKeys].map(String));
+    for (const ak of allowed) rows.push(...await getBusinessConnectionRows(ak));
+  } else {
+    rows = await getBusinessConnectionRows();
+  }
   const body = rows.length
     ? rows.map((r, i) => `${i + 1}. ${r.business_connection_id} → ${r.account_key}\n   user_id: ${r.user_id || '-'} ${r.username ? '@' + r.username : ''}\n   updated_at: ${r.updated_at || '-'}`).join('\n\n')
     : 'Hozircha business connection mapping yo‘q.';
@@ -2876,10 +2886,13 @@ async function sendArchiveDebug(chatId, parts, selectedAccountKey) {
   return sendArchiveList(chatId, 'chat', accountKeyForQuery, targetChatId);
 }
 
-async function parseOptionalAccountArg(parts, selectedAccountKey, startIndex = 1) {
+async function parseOptionalAccountArg(parts, selectedAccountKey, startIndex = 1, allowedAccountKeys = null) {
   const accounts = await getAccounts();
   const maybe = parts[startIndex];
   const account = accounts.find(a => a.account_key === maybe);
+  if (account && allowedAccountKeys && !allowedAccountKeys.has(account.account_key)) {
+    return { accountKey: null, nextIndex: startIndex + 1, denied: true };
+  }
   return {
     accountKey: account?.account_key || selectedAccountKey,
     nextIndex: account ? startIndex + 1 : startIndex
@@ -2962,6 +2975,51 @@ async function getSelectedAccountKey(adminChatId) {
   return DEFAULT_ACCOUNT.account_key;
 }
 
+async function getPublicOwnedAccounts(chatId, fromId = '') {
+  const chat = String(chatId || '');
+  const from = String(fromId || chat || '');
+  const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY);
+  const byKey = new Map();
+  for (const account of accounts) {
+    if (
+      (account.admin_chat_id && (String(account.admin_chat_id) === chat || String(account.admin_chat_id) === from)) ||
+      (account.owner_user_id && String(account.owner_user_id) === from) ||
+      (account.business_owner_id && String(account.business_owner_id) === from)
+    ) {
+      byKey.set(account.account_key, account);
+    }
+  }
+  const ids = [...new Set([chat, from].filter(Boolean))];
+  if (ids.length) {
+    const { data, error } = await supabase.from('account_admins')
+      .select('account_key')
+      .in('telegram_user_id', ids)
+      .eq('is_active', true);
+    if (!error) {
+      for (const row of data || []) {
+        const account = accounts.find(a => a.account_key === row.account_key);
+        if (account) byKey.set(account.account_key, account);
+      }
+    } else if (!String(error.message || '').includes('does not exist')) {
+      console.error('getPublicOwnedAccounts:', error.message);
+    }
+  }
+  return [...byKey.values()];
+}
+
+async function getPublicSelectedAccountKey(chatId, fromId = '') {
+  const owned = await getPublicOwnedAccounts(chatId, fromId);
+  const selected = await getSelectedAccountKey(chatId);
+  if (owned.some(a => a.account_key === selected)) return selected;
+  return owned[0]?.account_key || selected;
+}
+
+async function requirePublicAccountAccess(chatId, fromId, requestedAccountKey) {
+  const owned = await getPublicOwnedAccounts(chatId, fromId);
+  const requested = accountKey(requestedAccountKey);
+  return owned.some(a => a.account_key === requested) ? requested : null;
+}
+
 async function setSelectedAccountKey(adminChatId, selectedAccountKey) {
   const { error } = await supabase.from('admin_sessions').upsert({
     chat_id: String(adminChatId),
@@ -2996,12 +3054,13 @@ async function setAdminSession(chatId, mode, payload = {}) {
 }
 
 async function sendAccountsMenu(chatId) {
-  const accounts = await getAccounts();
-  const selected = await getSelectedAccountKey(chatId);
+  const accounts = await getPublicOwnedAccounts(chatId, chatId);
+  const selected = await getPublicSelectedAccountKey(chatId, chatId);
   const rows = accounts.map(a => ([{
     text: `${a.account_key === selected ? '✅ ' : ''}${a.label || a.account_key}`,
     callback_data: `account:${a.account_key}`
   }]));
+  if (!rows.length) rows.push([{ text: 'Sizga biriktirilgan akkaunt yo‘q', callback_data: 'noop' }]);
   rows.push([{ text: '⬅️ Menyu', callback_data: 'menu' }]);
   return tg('sendMessage', {
     chat_id: chatId,
@@ -4025,8 +4084,21 @@ async function handleAdminMessage(msg) {
   const from = msg.from || {};
   const text = normalizeAdminCommand(msg.text || '');
   if (!text) return;
-  const selectedAccountKey = await getSelectedAccountKey(chatId);
+  const selectedAccountKey = await getPublicSelectedAccountKey(chatId, from.id);
   const session = await getAdminSession(chatId);
+  const ownedAccountKeys = new Set((await getPublicOwnedAccounts(chatId, from.id)).map(a => a.account_key));
+  const denyAccount = () => tg('sendMessage', { chat_id: chatId, text: '⛔ Bu akkaunt sizga tegishli emas.' });
+  const publicAccountArg = async (maybeAccountKey, fallback = selectedAccountKey) => {
+    if (!maybeAccountKey) return fallback;
+    const accounts = await getAccounts();
+    const account = accounts.find(a => a.account_key === maybeAccountKey);
+    if (!account) return fallback;
+    return ownedAccountKeys.has(account.account_key) ? account.account_key : null;
+  };
+
+  if (!ownedAccountKeys.size && !['/start', '/menu', '/accounts', '/whoami', '/cancel'].includes(text)) {
+    return denyAccount();
+  }
 
   if (text === '/cancel') {
     await setAdminSession(chatId, 'account_selected', { selected_account_key: selectedAccountKey });
@@ -4035,12 +4107,16 @@ async function handleAdminMessage(msg) {
 
   if (session?.mode === 'template_edit_input' && !text.startsWith('/')) {
     const payload = session.payload || {};
-    return showTemplateEditPreview(chatId, payload.selected_account_key || selectedAccountKey, payload.template_key, text);
+    const targetAccountKey = payload.selected_account_key || selectedAccountKey;
+    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    return showTemplateEditPreview(chatId, targetAccountKey, payload.template_key, text);
   }
 
   if (session?.mode === 'ai_template_input' && !text.startsWith('/')) {
     const payload = session.payload || {};
-    return showAiTemplatePreview(chatId, payload.selected_account_key || selectedAccountKey, payload.template_key, text);
+    const targetAccountKey = payload.selected_account_key || selectedAccountKey;
+    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    return showAiTemplatePreview(chatId, targetAccountKey, payload.template_key, text);
   }
 
   if (session?.mode === 'custom_command_key_input' && !text.startsWith('/')) {
@@ -4073,16 +4149,19 @@ async function handleAdminMessage(msg) {
 
   if (session?.mode === 'custom_command_edit_response' && !text.startsWith('/')) {
     const payload = session.payload || {};
-    const command = await getCustomCommand(payload.selected_account_key || selectedAccountKey, payload.command_key, true);
+    const targetAccountKey = payload.selected_account_key || selectedAccountKey;
+    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    const command = await getCustomCommand(targetAccountKey, payload.command_key, true);
     if (!command) return tg('sendMessage', { chat_id: chatId, text: 'Buyruq topilmadi.' });
-    await upsertCustomCommand(payload.selected_account_key || selectedAccountKey, { ...command, response_text: text, response_type: 'text' }, from.id);
-    await setAdminSession(chatId, 'account_selected', { selected_account_key: payload.selected_account_key || selectedAccountKey });
+    await upsertCustomCommand(targetAccountKey, { ...command, response_text: text, response_type: 'text' }, from.id);
+    await setAdminSession(chatId, 'account_selected', { selected_account_key: targetAccountKey });
     return tg('sendMessage', { chat_id: chatId, text: `✅ /${command.command_key} javobi yangilandi.` });
   }
 
   if (session?.mode === 'custom_command_test_input' && !text.startsWith('/')) {
     const payload = session.payload || {};
     const accountKeyForTest = payload.selected_account_key || selectedAccountKey;
+    if (!ownedAccountKeys.has(accountKeyForTest)) return denyAccount();
     const command = payload.command_key
       ? await getCustomCommand(accountKeyForTest, payload.command_key, true)
       : await findMatchingCustomCommand(accountKeyForTest, text);
@@ -4102,6 +4181,7 @@ async function handleAdminMessage(msg) {
   if (session?.mode === 'ai_rule_test_input' && !text.startsWith('/')) {
     const payload = session.payload || {};
     const fakeLead = { account_key: payload.selected_account_key || selectedAccountKey, chat_id: 'test', stage: payload.step_key || STAGE.ASKED_APPLICATION, last_bot_message: '', last_admin_message: '' };
+    if (!ownedAccountKeys.has(fakeLead.account_key)) return denyAccount();
     const decision = await classifyWithAI(fakeLead, text, classify(text, fakeLead.stage));
     await setAdminSession(chatId, 'account_selected', { selected_account_key: fakeLead.account_key });
     return tg('sendMessage', {
@@ -4124,19 +4204,22 @@ async function handleAdminMessage(msg) {
   }
 
   if (text === '/accounts') return sendAccountsMenu(chatId);
-  if (text === '/connections') return sendConnections(chatId);
+  if (text === '/connections') return sendConnections(chatId, ownedAccountKeys);
   if (text.startsWith('/account ')) {
     const key = text.split(/\s+/)[1];
-    const accounts = await getAccounts();
-    const account = accounts.find(a => a.account_key === key);
+    const allowedKey = await requirePublicAccountAccess(chatId, from.id, key);
+    if (!allowedKey) return tg('sendMessage', { chat_id: chatId, text: '⛔ Bu akkaunt sizga tegishli emas.' });
+    const account = await getAccount(allowedKey);
     if (!account) return tg('sendMessage', { chat_id: chatId, text: `Topilmadi: ${key}` });
-    await setSelectedAccountKey(chatId, key);
+    await setSelectedAccountKey(chatId, allowedKey);
     return tg('sendMessage', { chat_id: chatId, text: `✅ Akkaunt tanlandi: ${account.label || account.account_key}` });
   }
   if (text.startsWith('/bindconnection ')) {
     const [, ak, businessConnectionId] = text.split(/\s+/);
     if (!ak || !businessConnectionId) return tg('sendMessage', { chat_id: chatId, text: 'Format: /bindconnection ACCOUNT_KEY BUSINESS_CONNECTION_ID' });
-    const account = await getAccount(ak);
+    const targetAk = await publicAccountArg(ak);
+    if (!targetAk) return denyAccount();
+    const account = await getAccount(targetAk);
     if (account.account_key !== ak) return tg('sendMessage', { chat_id: chatId, text: `Akkaunt topilmadi: ${ak}` });
     await bindBusinessConnectionToAccount(account, businessConnectionId);
     return tg('sendMessage', { chat_id: chatId, text: `✅ Bog‘landi: ${businessConnectionId} → ${ak}` });
@@ -4146,7 +4229,9 @@ async function handleAdminMessage(msg) {
     const value = rest.join(' ');
     if (!ak || !field || !value) return tg('sendMessage', { chat_id: chatId, text: 'Format: /setaccount ACCOUNT_KEY FIELD VALUE' });
     try {
-      const account = await setAccountField(ak, field, value);
+      const targetAk = await publicAccountArg(ak);
+      if (!targetAk) return denyAccount();
+      const account = await setAccountField(targetAk, field, value);
       return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: ${account.account_key}.${field} = ${value}` });
     } catch (err) {
       return tg('sendMessage', { chat_id: chatId, text: `⚠️ ${err.message}` });
@@ -4156,12 +4241,14 @@ async function handleAdminMessage(msg) {
     const [, ak, key, ...rest] = text.split(/\s+/);
     const value = rest.join(' ');
     if (!ak || !key || !value) return tg('sendMessage', { chat_id: chatId, text: 'Format: /setsetting ACCOUNT_KEY KEY VALUE' });
+    const targetAk = await publicAccountArg(ak);
+    if (!targetAk) return denyAccount();
     if (key === 'ai_intent_enabled') {
-      await setAccountAiEnabled(ak, Boolean(parseSettingValue(value)));
-      return tg('sendMessage', { chat_id: chatId, text: `✅ ${ak}.${key} = ${value}` });
+      await setAccountAiEnabled(targetAk, Boolean(parseSettingValue(value)));
+      return tg('sendMessage', { chat_id: chatId, text: `✅ ${targetAk}.${key} = ${value}` });
     }
     try {
-      const account = await setAccountField(ak, key, value);
+      const account = await setAccountField(targetAk, key, value);
       return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: ${account.account_key}.${key} = ${value}` });
     } catch (err) {
       return tg('sendMessage', { chat_id: chatId, text: `⚠️ ${err.message}` });
@@ -4170,16 +4257,20 @@ async function handleAdminMessage(msg) {
   if (text.startsWith('/accountadmin ')) {
     const [, ak, telegramId] = text.split(/\s+/);
     if (!ak || !telegramId) return tg('sendMessage', { chat_id: chatId, text: 'Format: /accountadmin ACCOUNT_KEY TELEGRAM_ID' });
-    await upsertAccountPatch(ak, { admin_chat_id: String(telegramId) });
-    return tg('sendMessage', { chat_id: chatId, text: `✅ Admin belgilandi: ${ak} → ${telegramId}` });
+    const targetAk = await publicAccountArg(ak);
+    if (!targetAk) return denyAccount();
+    await upsertAccountPatch(targetAk, { admin_chat_id: String(telegramId) });
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Admin belgilandi: ${targetAk} → ${telegramId}` });
   }
   if (text.startsWith('/accounton ')) {
-    const ak = text.split(/\s+/)[1];
+    const ak = await publicAccountArg(text.split(/\s+/)[1]);
+    if (!ak) return denyAccount();
     await upsertAccountPatch(ak, { bot_enabled: true, auto_reply_enabled: true });
     return tg('sendMessage', { chat_id: chatId, text: `✅ Akkaunt yoqildi: ${ak}` });
   }
   if (text.startsWith('/accountoff ')) {
-    const ak = text.split(/\s+/)[1];
+    const ak = await publicAccountArg(text.split(/\s+/)[1]);
+    if (!ak) return denyAccount();
     await upsertAccountPatch(ak, { bot_enabled: false, auto_reply_enabled: false });
     return tg('sendMessage', { chat_id: chatId, text: `⛔ Akkaunt o‘chirildi: ${ak}` });
   }
@@ -4190,6 +4281,7 @@ async function handleAdminMessage(msg) {
     const maybeAccount = accounts.find(a => a.account_key === parts[1]);
     const targetAccount = maybeAccount ? parts[1] : selectedAccountKey;
     const mode = maybeAccount ? parts[2] : parts[1];
+    if (maybeAccount && !ownedAccountKeys.has(targetAccount)) return denyAccount();
     if (mode === 'on') {
       await setAccountAiEnabled(targetAccount, true);
       return tg('sendMessage', { chat_id: chatId, text: `✅ AI intent yoqildi: ${targetAccount}` });
@@ -4200,26 +4292,33 @@ async function handleAdminMessage(msg) {
     }
   }
   if (text === '/aistatus' || text.startsWith('/aistatus ')) {
-    const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey);
+    const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return denyAccount();
     const enabled = await getAccountAiEnabled(parsed.accountKey);
     return tg('sendMessage', { chat_id: chatId, text: `AI status\nAkkaunt: ${parsed.accountKey}\nEnv enabled: ${AI_INTENT_ENABLED ? 'true' : 'false'}\nOPENAI_API_KEY: ${OPENAI_API_KEY ? 'bor' : 'yo‘q'}\nAccount AI: ${enabled ? 'ON' : 'OFF'}\nModel: ${OPENAI_MODEL}` });
   }
   if (text.startsWith('/testrule ')) {
     const [, ak, stepKey, ...rest] = text.split(/\s+/);
+    const targetAk = await publicAccountArg(ak);
+    if (!targetAk) return denyAccount();
     const sample = rest.join(' ');
-    return tg('sendMessage', { chat_id: chatId, text: `Rule test\nAkkaunt: ${ak}\nStep: ${stepKey}\nText: ${sample}\nIntent: ${classify(sample, stepKey)}` });
+    return tg('sendMessage', { chat_id: chatId, text: `Rule test\nAkkaunt: ${targetAk}\nStep: ${stepKey}\nText: ${sample}\nIntent: ${classify(sample, stepKey)}` });
   }
   if (text.startsWith('/testai ')) {
     const [, ak, stepKey, ...rest] = text.split(/\s+/);
+    const targetAk = await publicAccountArg(ak);
+    if (!targetAk) return denyAccount();
     const sample = rest.join(' ');
-    const fakeLead = { account_key: ak, chat_id: 'test', stage: stepKey, last_bot_message: '', last_admin_message: '' };
+    const fakeLead = { account_key: targetAk, chat_id: 'test', stage: stepKey, last_bot_message: '', last_admin_message: '' };
     const decision = await classifyWithAI(fakeLead, sample, classify(sample, stepKey));
     return tg('sendMessage', { chat_id: chatId, text: `AI test\n${JSON.stringify(decision || { ok: false, reason: 'AI unavailable' }, null, 2)}` });
   }
   if (text.startsWith('/setairule ')) {
     const [, ak, ruleKey, stepKey, intent, action] = text.split(/\s+/);
     if (!ak || !ruleKey || !stepKey || !intent || !action) return tg('sendMessage', { chat_id: chatId, text: 'Format: /setairule ACCOUNT_KEY RULE_KEY STEP_KEY INTENT ACTION' });
-    const saved = await upsertAccountAiRule(ak, { rule_key: ruleKey, step_key: stepKey, target_intent: intent, action }, from.id);
+    const targetAk = await publicAccountArg(ak);
+    if (!targetAk) return denyAccount();
+    const saved = await upsertAccountAiRule(targetAk, { rule_key: ruleKey, step_key: stepKey, target_intent: intent, action }, from.id);
     return tg('sendMessage', { chat_id: chatId, text: `✅ AI rule saqlandi: ${saved.account_key}/${saved.rule_key}` });
   }
   if (text.startsWith('/aitemplate ')) {
@@ -4228,6 +4327,7 @@ async function handleAdminMessage(msg) {
     const [first, second] = rest.split(/\s+/, 2);
     const maybeAccount = accounts.find(a => a.account_key === first);
     const templateAccountKey = maybeAccount ? first : selectedAccountKey;
+    if (maybeAccount && !ownedAccountKeys.has(templateAccountKey)) return denyAccount();
     const templateKey = maybeAccount ? second : first;
     const prefix = maybeAccount ? `${first} ${second}` : first;
     const rough = rest.slice(prefix.length).trim();
@@ -4235,15 +4335,25 @@ async function handleAdminMessage(msg) {
     return showAiTemplatePreview(chatId, templateAccountKey, templateKey, rough);
   }
   if (text === '/flow') return sendFlow(chatId, selectedAccountKey);
-  if (text.startsWith('/flow ')) return sendFlow(chatId, text.split(/\s+/)[1]);
-  if (text.startsWith('/flowtest ')) return sendFlowTest(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/flow ')) {
+    const ak = await publicAccountArg(text.split(/\s+/)[1]);
+    if (!ak) return denyAccount();
+    return sendFlow(chatId, ak);
+  }
+  if (text.startsWith('/flowtest ')) {
+    const ak = await publicAccountArg(text.split(/\s+/)[1]);
+    if (!ak) return denyAccount();
+    return sendFlowTest(chatId, ak);
+  }
   if (text.startsWith('/setflow ')) {
     const [, ak, stepKey, templateKey, nextYes, nextNo, nextPartial, nextUnknown, stopAfterSend] = text.split(/\s+/);
     if (!ak || !stepKey || !templateKey) {
       return tg('sendMessage', { chat_id: chatId, text: 'Format: /setflow ACCOUNT_KEY STEP_KEY TEMPLATE_KEY NEXT_YES NEXT_NO NEXT_PARTIAL NEXT_UNKNOWN STOP_TRUE_FALSE' });
     }
+    const targetAk = await publicAccountArg(ak);
+    if (!targetAk) return denyAccount();
     await upsertFlowStep({
-      accountKey: ak,
+      accountKey: targetAk,
       stepKey,
       templateKey,
       nextYes,
@@ -4252,24 +4362,27 @@ async function handleAdminMessage(msg) {
       nextUnknown,
       stopAfterSend
     });
-    return tg('sendMessage', { chat_id: chatId, text: `✅ Flow step saqlandi: ${ak}/${stepKey}` });
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Flow step saqlandi: ${targetAk}/${stepKey}` });
   }
 
   if (text === '/autoon') return autoOn(chatId, AUTO_OUTREACH_DEFAULT_HOURS, selectedAccountKey);
   if (text === '/autooff' || text.startsWith('/autooff ')) {
     const parts = text.split(/\s+/);
-    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return denyAccount();
     return autoOff(chatId, parsed.accountKey);
   }
   if (text === '/autostatus' || text.startsWith('/autostatus ')) {
     const parts = text.split(/\s+/);
-    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return denyAccount();
     return autoStatus(chatId, parsed.accountKey);
   }
 
   if (text === '/auto' || text.startsWith('/auto ')) {
     const parts = text.split(/\s+/);
-    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return denyAccount();
     const arg = parts[parsed.nextIndex] || `${AUTO_OUTREACH_DEFAULT_HOURS}h`;
     if (arg === 'off') return autoOff(chatId, parsed.accountKey);
     if (arg === 'today') {
@@ -4284,15 +4397,31 @@ async function handleAdminMessage(msg) {
   }
 
   if (text === '/settings') return sendSettings(chatId, selectedAccountKey);
-  if (text.startsWith('/settings ')) return sendSettings(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/settings ')) {
+    const ak = await publicAccountArg(text.split(/\s+/)[1]);
+    if (!ak) return denyAccount();
+    return sendSettings(chatId, ak);
+  }
   if (text === '/commands') return sendCommandsMenu(chatId, selectedAccountKey);
   if (text === '/archivesettings') return sendArchiveSettingsMenu(chatId, selectedAccountKey);
   if (text === '/airules') return sendAiRulesMenu(chatId, selectedAccountKey);
   if (text === '/report') return sendReport(chatId, selectedAccountKey);
-  if (text.startsWith('/report ')) return sendArchiveReport(chatId, text.split(/\s+/)[1], '📊 Hisobot');
-  if (text === '/dailyreport' || text.startsWith('/dailyreport ')) return sendArchiveReport(chatId, text.split(/\s+/)[1] || selectedAccountKey, '📊 Kunlik hisobot');
-  if (text === '/weeklyreport' || text.startsWith('/weeklyreport ')) return sendArchiveReport(chatId, text.split(/\s+/)[1] || selectedAccountKey, '📊 Haftalik hisobot');
-  if (text === '/reportall') return sendReportAll(chatId);
+  if (text.startsWith('/report ')) {
+    const ak = await publicAccountArg(text.split(/\s+/)[1]);
+    if (!ak) return denyAccount();
+    return sendArchiveReport(chatId, ak, '📊 Hisobot');
+  }
+  if (text === '/dailyreport' || text.startsWith('/dailyreport ')) {
+    const ak = await publicAccountArg(text.split(/\s+/)[1], selectedAccountKey);
+    if (!ak) return denyAccount();
+    return sendArchiveReport(chatId, ak, '📊 Kunlik hisobot');
+  }
+  if (text === '/weeklyreport' || text.startsWith('/weeklyreport ')) {
+    const ak = await publicAccountArg(text.split(/\s+/)[1], selectedAccountKey);
+    if (!ak) return denyAccount();
+    return sendArchiveReport(chatId, ak, '📊 Haftalik hisobot');
+  }
+  if (text === '/reportall') return sendReportAll(chatId, ownedAccountKeys);
   if (text === '/info') return sendList(chatId, 'info_sent', selectedAccountKey);
   if (text === '/read') return sendList(chatId, 'read', selectedAccountKey);
   if (text === '/payment') return sendList(chatId, 'payment', selectedAccountKey);
@@ -4300,22 +4429,47 @@ async function handleAdminMessage(msg) {
   if (text === '/pending') return sendList(chatId, 'pending', selectedAccountKey);
   if (text === '/healthtemplates') return healthTemplates(chatId, selectedAccountKey);
   if (text === '/diagnostics') return diagnostics(chatId, selectedAccountKey);
-  if (text === '/archive') return sendArchiveMenu(chatId);
-  if (text.startsWith('/archive ')) return sendArchivePeopleMenu(chatId, text.split(/\s+/)[1]);
-  if (text === '/deleted' || text.startsWith('/deleted ')) return sendArchiveList(chatId, 'deleted', text.split(/\s+/)[1] || selectedAccountKey);
-  if (text === '/edited' || text.startsWith('/edited ')) return sendArchiveList(chatId, 'edited', text.split(/\s+/)[1] || selectedAccountKey);
-  if (text === '/media' || text.startsWith('/media ')) return sendArchiveList(chatId, 'media', text.split(/\s+/)[1] || selectedAccountKey);
+  if (text === '/archive') return sendArchiveMenu(chatId, ownedAccountKeys);
+  if (text.startsWith('/archive ')) {
+    const ak = await publicAccountArg(text.split(/\s+/)[1]);
+    if (!ak) return denyAccount();
+    return sendArchivePeopleMenu(chatId, ak);
+  }
+  if (text === '/deleted' || text.startsWith('/deleted ')) {
+    const ak = await publicAccountArg(text.split(/\s+/)[1], selectedAccountKey);
+    if (!ak) return denyAccount();
+    return sendArchiveList(chatId, 'deleted', ak);
+  }
+  if (text === '/edited' || text.startsWith('/edited ')) {
+    const ak = await publicAccountArg(text.split(/\s+/)[1], selectedAccountKey);
+    if (!ak) return denyAccount();
+    return sendArchiveList(chatId, 'edited', ak);
+  }
+  if (text === '/media' || text.startsWith('/media ')) {
+    const ak = await publicAccountArg(text.split(/\s+/)[1], selectedAccountKey);
+    if (!ak) return denyAccount();
+    return sendArchiveList(chatId, 'media', ak);
+  }
   if (text === '/archive_route_debug') return sendArchiveDebug(chatId, ['/archive_debug', selectedAccountKey], selectedAccountKey);
-  if (text.startsWith('/archive_debug ')) return sendArchiveDebug(chatId, text.split(/\s+/), selectedAccountKey);
+  if (text.startsWith('/archive_debug ')) {
+    const parts = text.split(/\s+/);
+    const accounts = await getAccounts();
+    const maybeAccount = accounts.find(a => a.account_key === parts[1]);
+    if (maybeAccount && !ownedAccountKeys.has(maybeAccount.account_key)) return denyAccount();
+    return sendArchiveDebug(chatId, parts, selectedAccountKey);
+  }
   if (text.startsWith('/archivechat ')) {
     const parts = text.split(/\s+/);
     const accounts = await getAccounts();
     const maybeAccount = accounts.find(a => a.account_key === parts[1]);
-    return sendArchiveList(chatId, 'chat', maybeAccount ? parts[1] : selectedAccountKey, maybeAccount ? parts[2] : parts[1]);
+    if (maybeAccount && !ownedAccountKeys.has(maybeAccount.account_key)) return denyAccount();
+    return sendArchiveList(chatId, 'chat', maybeAccount ? maybeAccount.account_key : selectedAccountKey, maybeAccount ? parts[2] : parts[1]);
   }
   if (text.startsWith('/testnotify ')) {
     const [, ak, kind] = text.split(/\s+/);
-    const account = await getAccount(ak);
+    const targetAk = await publicAccountArg(ak);
+    if (!targetAk) return denyAccount();
+    const account = await getAccount(targetAk);
     if (account.account_key !== ak) return tg('sendMessage', { chat_id: chatId, text: `Akkaunt topilmadi: ${ak}` });
     const fakeBase = {
       account_key: account.account_key,
@@ -4342,7 +4496,8 @@ async function handleAdminMessage(msg) {
 
   if (text.startsWith('/setdaily ')) {
     const parts = text.split(/\s+/);
-    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return denyAccount();
     const start = parts[parsed.nextIndex];
     const durationRaw = parts[parsed.nextIndex + 1];
     const hours = Number(String(durationRaw || '').replace('h', '')) || DAILY_DEFAULT_DURATION_HOURS;
@@ -4350,12 +4505,14 @@ async function handleAdminMessage(msg) {
     return tg('sendMessage', { chat_id: chatId, text: `✅ Kunlik Auto Outreach sozlandi\n\nHar kuni: ${daily.start_time}\nDavomiylik: ${daily.duration_hours} soat` });
   }
   if (text === '/dailyoff' || text.startsWith('/dailyoff ')) {
-    const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey);
+    const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return denyAccount();
     await setDailyAuto({ enabled: false }, parsed.accountKey);
     return tg('sendMessage', { chat_id: chatId, text: '⛔ Kunlik Auto Outreach o‘chirildi.' });
   }
   if (text === '/dailystatus' || text.startsWith('/dailystatus ')) {
-    const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey);
+    const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return denyAccount();
     return dailyStatus(chatId, parsed.accountKey);
   }
 
@@ -4364,6 +4521,7 @@ async function handleAdminMessage(msg) {
     const accounts = await getAccounts();
     const maybeAccount = accounts.find(a => a.account_key === parts[1]);
     const templateAccountKey = maybeAccount ? parts[1] : selectedAccountKey;
+    if (maybeAccount && !ownedAccountKeys.has(templateAccountKey)) return denyAccount();
     const key = maybeAccount ? parts[2] : parts[1];
     const body = await getTemplate(key, templateAccountKey);
     return tg('sendMessage', { chat_id: chatId, text: body ? `Template: ${templateAccountKey}/${key}\n\n${body}` : `Topilmadi: ${templateAccountKey}/${key}` });
@@ -4374,6 +4532,7 @@ async function handleAdminMessage(msg) {
     const [first, second] = rest.split(/\s+/, 2);
     const maybeAccount = accounts.find(a => a.account_key === first);
     const templateAccountKey = maybeAccount ? first : selectedAccountKey;
+    if (maybeAccount && !ownedAccountKeys.has(templateAccountKey)) return denyAccount();
     const key = maybeAccount ? second : first;
     const prefix = maybeAccount ? `${first} ${second}` : first;
     const body = rest.slice(prefix.length).trim();
@@ -4523,8 +4682,12 @@ async function sendArchiveReport(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, tit
   });
 }
 
-async function sendReportAll(chatId) {
-  const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY);
+async function sendReportAll(chatId, accountKeys = null) {
+  const allowed = accountKeys ? new Set([...accountKeys].map(String)) : null;
+  const accounts = (await getAccounts()).filter(a => (
+    a.account_key !== UNKNOWN_ACCOUNT_KEY &&
+    (!allowed || allowed.has(a.account_key))
+  ));
   const lines = [];
   for (const account of accounts) {
     lines.push(`${account.label || account.account_key}: ${await countArchive(null, account.account_key)} arxiv, ${await countLeads(null, account.account_key)} lead`);
@@ -4601,9 +4764,16 @@ async function handleCallback(cb) {
   const chatId = cb.message?.chat?.id;
   await answerCallback(cb.id);
   if (!chatId) return;
-  const selectedAccountKey = await getSelectedAccountKey(chatId);
+  const selectedAccountKey = await getPublicSelectedAccountKey(chatId, cb.from?.id);
+  const ownedAccountKeys = new Set((await getPublicOwnedAccounts(chatId, cb.from?.id)).map(a => a.account_key));
+  const denyAccount = () => tg('sendMessage', { chat_id: chatId, text: '⛔ Bu akkaunt sizga tegishli emas.' });
 
   if (data.startsWith('platform_')) return tg('sendMessage', { chat_id: chatId, text: 'Platform Admin Bot uchun alohida admin botdan foydalaning.' });
+
+  if (!ownedAccountKeys.size) {
+    if (data === 'menu' || data === 'noop' || data === 'accounts') return sendAccountsMenu(chatId);
+    return denyAccount();
+  }
 
   if (data === 'menu' || data === 'noop') return sendDashboard(chatId, selectedAccountKey);
   if (data === 'accounts') return sendAccountsMenu(chatId);
@@ -4665,14 +4835,16 @@ async function handleCallback(cb) {
   if (data === 'cmd_save') {
     const session = await getAdminSession(chatId);
     const payload = session?.payload || {};
+    const targetAccountKey = payload.selected_account_key || selectedAccountKey;
+    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
     const command = {
       ...payload,
       template_sequence: payload.response_type === 'template_sequence' ? String(payload.response_text || '').split(/[,\s]+/).filter(Boolean) : payload.template_sequence,
       step_key: payload.response_type === 'flow_step' ? payload.response_text : payload.step_key,
       response_text: payload.response_type === 'text' ? payload.response_text : null
     };
-    const saved = await upsertCustomCommand(payload.selected_account_key || selectedAccountKey, command, cb.from?.id);
-    await setAdminSession(chatId, 'account_selected', { selected_account_key: payload.selected_account_key || selectedAccountKey });
+    const saved = await upsertCustomCommand(targetAccountKey, command, cb.from?.id);
+    await setAdminSession(chatId, 'account_selected', { selected_account_key: targetAccountKey });
     return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: /${saved.command_key}` });
   }
   if (data === 'cmd_retry') {
@@ -4705,7 +4877,7 @@ async function handleCallback(cb) {
     await setAdminSession(chatId, 'custom_command_test_input', { selected_account_key: selectedAccountKey, command_key: data.split(':')[1] });
     return tg('sendMessage', { chat_id: chatId, text: 'Test uchun sample lead xabarini yuboring.' });
   }
-  if (data === 'archive_menu') return sendArchiveMenu(chatId);
+  if (data === 'archive_menu') return sendArchiveMenu(chatId, ownedAccountKeys);
   if (data === 'archive_settings') return sendArchiveSettingsMenu(chatId, selectedAccountKey);
   if (data.startsWith('archive_toggle:')) {
     const field = data.split(':')[1];
@@ -4714,13 +4886,19 @@ async function handleCallback(cb) {
     await setAccountField(selectedAccountKey, field, account[field] === false ? 'true' : 'false');
     return sendArchiveSettingsMenu(chatId, selectedAccountKey);
   }
-  if (data.startsWith('archa:')) return sendArchivePeopleMenu(chatId, data.split(':')[1]);
+  if (data.startsWith('archa:')) {
+    const ak = data.split(':')[1];
+    if (!ownedAccountKeys.has(ak)) return denyAccount();
+    return sendArchivePeopleMenu(chatId, ak);
+  }
   if (data.startsWith('archp:')) {
     const [, ak, targetChatId] = data.split(':');
+    if (!ownedAccountKeys.has(ak)) return denyAccount();
     return sendArchivePersonEvents(chatId, ak, targetChatId);
   }
   if (data.startsWith('archv:')) {
     const [, ak, archiveId] = data.split(':');
+    if (!ownedAccountKeys.has(ak)) return denyAccount();
     return sendArchiveFullDetail(chatId, ak, archiveId);
   }
   if (data === 'archive:deleted') return sendArchiveList(chatId, 'deleted', selectedAccountKey);
@@ -4729,7 +4907,9 @@ async function handleCallback(cb) {
   if (data === 'archive:search_help') return tg('sendMessage', { chat_id: chatId, text: 'Chat bo‘yicha qidirish:\n/archivechat CHAT_ID' });
   if (data.startsWith('account:')) {
     const key = data.split(':')[1];
-    const account = await getAccount(key);
+    const allowedKey = await requirePublicAccountAccess(chatId, cb.from?.id, key);
+    if (!allowedKey) return tg('sendMessage', { chat_id: chatId, text: '⛔ Bu akkaunt sizga tegishli emas.' });
+    const account = await getAccount(allowedKey);
     await setSelectedAccountKey(chatId, account.account_key);
     return tg('sendMessage', { chat_id: chatId, text: `✅ Akkaunt tanlandi: ${account.label || account.account_key}` });
   }
@@ -4791,17 +4971,21 @@ async function handleCallback(cb) {
     const session = await getAdminSession(chatId);
     const payload = session?.payload || {};
     if (!payload.template_key || !payload.edited_text) return tg('sendMessage', { chat_id: chatId, text: 'Saqlanadigan AI preview topilmadi.' });
-    await setTemplate(payload.template_key, payload.edited_text, payload.selected_account_key);
-    await setAdminSession(chatId, 'account_selected', { selected_account_key: payload.selected_account_key });
-    return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: ${payload.selected_account_key}/${payload.template_key}` });
+    const targetAccountKey = payload.selected_account_key || selectedAccountKey;
+    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    await setTemplate(payload.template_key, payload.edited_text, targetAccountKey);
+    await setAdminSession(chatId, 'account_selected', { selected_account_key: targetAccountKey });
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: ${targetAccountKey}/${payload.template_key}` });
   }
   if (data === 'tpl_edit_save') {
     const session = await getAdminSession(chatId);
     const payload = session?.payload || {};
     if (!payload.template_key || !payload.edited_text) return tg('sendMessage', { chat_id: chatId, text: 'Saqlanadigan preview topilmadi.' });
-    await setTemplate(payload.template_key, payload.edited_text, payload.selected_account_key);
-    await setAdminSession(chatId, 'account_selected', { selected_account_key: payload.selected_account_key });
-    return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: ${payload.selected_account_key}/${payload.template_key}` });
+    const targetAccountKey = payload.selected_account_key || selectedAccountKey;
+    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    await setTemplate(payload.template_key, payload.edited_text, targetAccountKey);
+    await setAdminSession(chatId, 'account_selected', { selected_account_key: targetAccountKey });
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: ${targetAccountKey}/${payload.template_key}` });
   }
   if (data === 'tpl_edit_retry') {
     const session = await getAdminSession(chatId);
