@@ -64,6 +64,56 @@ create table if not exists business_connection_accounts (
   updated_at timestamptz default now()
 );
 
+create table if not exists business_accounts (
+  account_key text primary key,
+  label text,
+  project_name text,
+  owner_user_id text,
+  owner_username text,
+  admin_chat_id text,
+  business_connection_id text,
+  bot_enabled boolean default true,
+  auto_reply_enabled boolean default false,
+  archive_enabled boolean default true,
+  reports_enabled boolean default true,
+  ai_intent_enabled boolean default false,
+  timezone text default 'Asia/Tashkent',
+  last_seen_at timestamptz,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists account_admins (
+  id bigserial primary key,
+  account_key text not null,
+  telegram_user_id text not null,
+  username text,
+  role text default 'owner',
+  is_active boolean default true,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists platform_admins (
+  telegram_user_id text primary key,
+  username text,
+  role text default 'owner',
+  is_active boolean default true,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists platform_audit_logs (
+  id bigserial primary key,
+  admin_user_id text,
+  admin_username text,
+  action text not null,
+  target_account_key text,
+  before_json jsonb default '{}'::jsonb,
+  after_json jsonb default '{}'::jsonb,
+  created_at timestamptz default now()
+);
+
 alter table bot_accounts add column if not exists label text;
 alter table bot_accounts add column if not exists owner_user_id text;
 alter table bot_accounts add column if not exists owner_username text;
@@ -95,6 +145,44 @@ alter table business_connection_accounts add column if not exists username text;
 alter table business_connection_accounts add column if not exists first_name text;
 alter table business_connection_accounts add column if not exists created_at timestamptz default now();
 alter table business_connection_accounts add column if not exists updated_at timestamptz default now();
+
+alter table business_accounts add column if not exists label text;
+alter table business_accounts add column if not exists project_name text;
+alter table business_accounts add column if not exists owner_user_id text;
+alter table business_accounts add column if not exists owner_username text;
+alter table business_accounts add column if not exists admin_chat_id text;
+alter table business_accounts add column if not exists business_connection_id text;
+alter table business_accounts add column if not exists bot_enabled boolean default true;
+alter table business_accounts add column if not exists auto_reply_enabled boolean default false;
+alter table business_accounts add column if not exists archive_enabled boolean default true;
+alter table business_accounts add column if not exists reports_enabled boolean default true;
+alter table business_accounts add column if not exists ai_intent_enabled boolean default false;
+alter table business_accounts add column if not exists timezone text default 'Asia/Tashkent';
+alter table business_accounts add column if not exists last_seen_at timestamptz;
+alter table business_accounts add column if not exists created_at timestamptz default now();
+alter table business_accounts add column if not exists updated_at timestamptz default now();
+
+alter table account_admins add column if not exists account_key text;
+alter table account_admins add column if not exists telegram_user_id text;
+alter table account_admins add column if not exists username text;
+alter table account_admins add column if not exists role text default 'owner';
+alter table account_admins add column if not exists is_active boolean default true;
+alter table account_admins add column if not exists created_at timestamptz default now();
+alter table account_admins add column if not exists updated_at timestamptz default now();
+
+alter table platform_admins add column if not exists username text;
+alter table platform_admins add column if not exists role text default 'owner';
+alter table platform_admins add column if not exists is_active boolean default true;
+alter table platform_admins add column if not exists created_at timestamptz default now();
+alter table platform_admins add column if not exists updated_at timestamptz default now();
+
+alter table platform_audit_logs add column if not exists admin_user_id text;
+alter table platform_audit_logs add column if not exists admin_username text;
+alter table platform_audit_logs add column if not exists action text;
+alter table platform_audit_logs add column if not exists target_account_key text;
+alter table platform_audit_logs add column if not exists before_json jsonb default '{}'::jsonb;
+alter table platform_audit_logs add column if not exists after_json jsonb default '{}'::jsonb;
+alter table platform_audit_logs add column if not exists created_at timestamptz default now();
 
 alter table business_leads add column if not exists account_key text;
 alter table business_leads add column if not exists business_connection_id text;
@@ -272,11 +360,18 @@ create table if not exists account_reply_rules (
 alter table account_flow_steps add column if not exists account_key text;
 alter table account_flow_steps add column if not exists flow_key text;
 alter table account_flow_steps add column if not exists step_key text;
+alter table account_flow_steps add column if not exists display_name text;
 alter table account_flow_steps add column if not exists template_key text;
+alter table account_flow_steps add column if not exists wait_for_reply boolean default true;
 alter table account_flow_steps add column if not exists next_step_yes text;
 alter table account_flow_steps add column if not exists next_step_no text;
 alter table account_flow_steps add column if not exists next_step_partial text;
 alter table account_flow_steps add column if not exists next_step_unknown text;
+alter table account_flow_steps add column if not exists next_step_on_confirm text;
+alter table account_flow_steps add column if not exists next_step_on_reject text;
+alter table account_flow_steps add column if not exists next_step_on_needs_info text;
+alter table account_flow_steps add column if not exists next_step_on_unclear text;
+alter table account_flow_steps add column if not exists human_needed_on_unclear boolean default true;
 alter table account_flow_steps add column if not exists stop_after_send boolean default false;
 alter table account_flow_steps add column if not exists sort_order integer default 0;
 alter table account_flow_steps add column if not exists is_active boolean default true;
@@ -339,9 +434,16 @@ alter table ai_decisions add column if not exists created_at timestamptz default
 alter table account_reply_rules add column if not exists account_key text;
 alter table account_reply_rules add column if not exists flow_key text;
 alter table account_reply_rules add column if not exists step_key text;
+alter table account_reply_rules add column if not exists rule_name text;
+alter table account_reply_rules add column if not exists example_phrases text;
+alter table account_reply_rules add column if not exists target_intent text;
+alter table account_reply_rules add column if not exists confidence_threshold numeric default 0.7;
+alter table account_reply_rules add column if not exists action text;
 alter table account_reply_rules add column if not exists intent text;
 alter table account_reply_rules add column if not exists template_key text;
 alter table account_reply_rules add column if not exists next_step text;
+alter table account_reply_rules add column if not exists notify_admin boolean default false;
+alter table account_reply_rules add column if not exists stop_after_action boolean default false;
 alter table account_reply_rules add column if not exists should_stop boolean default false;
 alter table account_reply_rules add column if not exists is_active boolean default true;
 alter table account_reply_rules add column if not exists created_at timestamptz default now();
@@ -373,6 +475,10 @@ create unique index if not exists account_flow_steps_unique_idx on account_flow_
 create index if not exists account_flow_steps_account_idx on account_flow_steps(account_key, flow_key, sort_order);
 create index if not exists business_connection_accounts_account_idx on business_connection_accounts(account_key);
 create index if not exists business_connection_accounts_user_idx on business_connection_accounts(user_id);
+create unique index if not exists account_admins_unique_idx on account_admins(account_key, telegram_user_id);
+create index if not exists account_admins_user_idx on account_admins(telegram_user_id) where is_active = true;
+create index if not exists platform_audit_logs_created_idx on platform_audit_logs(created_at desc);
+create index if not exists platform_audit_logs_account_idx on platform_audit_logs(target_account_key, created_at desc);
 
 insert into bot_accounts (account_key, label, project_name, business_owner_id, admin_chat_id, flow_key, archive_enabled, archive_notify_enabled)
 values ('uzlye', 'UZLYE', 'O‘zbekiston Lider Yoshlari Ensiklopediyasi', null, null, 'uzlye_info_only', true, true)

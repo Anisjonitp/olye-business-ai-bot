@@ -12,6 +12,15 @@ const OWNER_TELEGRAM_ID = process.env.OWNER_TELEGRAM_ID || '';
 const BUSINESS_OWNER_ID = process.env.BUSINESS_OWNER_ID || OWNER_TELEGRAM_ID || '';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
+const ADMIN_BOT_TOKEN = process.env.ADMIN_BOT_TOKEN || '';
+const ADMIN_BOT_WEBHOOK_URL = process.env.ADMIN_BOT_WEBHOOK_URL || '';
+const PLATFORM_OWNER_IDS = (process.env.PLATFORM_OWNER_IDS || '')
+  .split(',')
+  .map(id => String(id).trim())
+  .filter(Boolean);
+const PLATFORM_ADMIN_ENABLED = String(process.env.PLATFORM_ADMIN_ENABLED || 'true') === 'true';
+const PLATFORM_NAME = process.env.PLATFORM_NAME || 'Telegram Business AI Platform';
+const PLATFORM_DEFAULT_TIMEZONE = process.env.PLATFORM_DEFAULT_TIMEZONE || 'Asia/Tashkent';
 const APPLICATION_LINK = process.env.APPLICATION_LINK || 'https://liderlar.uz/ariza_qoldirish';
 const DEFAULT_ACCOUNT_KEY = 'uzlye';
 const LEGACY_DEFAULT_ACCOUNT_KEY = 'default';
@@ -49,6 +58,7 @@ if (!SUPABASE_KEY) throw new Error('SUPABASE key missing');
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const ADMIN_TG_API = ADMIN_BOT_TOKEN ? `https://api.telegram.org/bot${ADMIN_BOT_TOKEN}` : '';
 
 const STAGE = {
   NEW: 'new',
@@ -197,8 +207,9 @@ function settingKey(key, accountOrKey = DEFAULT_ACCOUNT_KEY) {
 }
 
 // -------------------- Telegram helpers --------------------
-async function tg(method, payload = {}) {
-  const res = await fetch(`${TG_API}/${method}`, {
+async function tg(method, payload = {}, botToken = BOT_TOKEN) {
+  const base = botToken ? `https://api.telegram.org/bot${botToken}` : TG_API;
+  const res = await fetch(`${base}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -211,6 +222,11 @@ async function tg(method, payload = {}) {
     throw err;
   }
   return data.result;
+}
+
+async function adminTg(method, payload = {}) {
+  if (!ADMIN_BOT_TOKEN) throw new Error('ADMIN_BOT_TOKEN missing');
+  return tg(method, payload, ADMIN_BOT_TOKEN);
 }
 
 async function getAccounts() {
@@ -344,6 +360,25 @@ async function bindBusinessConnectionToAccount(accountOrKey, businessConnectionI
     updated_at: new Date().toISOString()
   }, { onConflict: 'account_key' });
   if (error) console.error('bindBusinessConnectionToAccount bot_accounts:', error.message);
+  const { error: businessAccountError } = await supabase.from('business_accounts').upsert({
+    account_key: account.account_key,
+    label: account.label || account.account_key,
+    project_name: account.project_name || account.label || account.account_key,
+    owner_user_id: account.owner_user_id || ownerUserId,
+    owner_username: user.username || account.owner_username || null,
+    admin_chat_id: account.admin_chat_id || ownerUserId || null,
+    business_connection_id: String(businessConnectionId),
+    bot_enabled: account.bot_enabled !== false,
+    auto_reply_enabled: account.auto_reply_enabled !== false,
+    archive_enabled: account.archive_enabled !== false,
+    reports_enabled: account.reports_enabled !== false,
+    timezone: account.timezone || PLATFORM_DEFAULT_TIMEZONE,
+    last_seen_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'account_key' });
+  if (businessAccountError && !String(businessAccountError.message || '').includes('does not exist')) {
+    console.error('bindBusinessConnectionToAccount business_accounts:', businessAccountError.message);
+  }
   return { ...account, business_connection_id: String(businessConnectionId) };
 }
 
@@ -443,16 +478,33 @@ async function handleBusinessConnectionUpdate(connection = {}) {
     first_name: user.first_name
   });
   if (userId) {
+    const { error: adminError } = await supabase.from('account_admins').upsert({
+      account_key: account.account_key,
+      telegram_user_id: String(userId),
+      username: user.username || null,
+      role: 'owner',
+      is_active: true,
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'account_key,telegram_user_id' });
+    if (adminError && !String(adminError.message || '').includes('does not exist')) {
+      console.error('account_admins upsert:', adminError.message);
+    }
+  }
+  if (userId) {
     await tg('sendMessage', {
       chat_id: userId,
       text:
-        '✅ Bot akkauntingizga ulandi.\n\n' +
-        'Sozlash menyusi:\n' +
-        '• Auto javob\n' +
-        '• Arxiv\n' +
-        '• Hisobotlar\n' +
-        '• Shablonlar\n' +
-        '• Diagnostika'
+        '✅ Bot biznes akkauntingizga ulandi.\n\n' +
+        'Sozlash menyusi:',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🚀 Boshlash', callback_data: 'outreach_menu' }],
+          [{ text: '✏️ Shablonlar', callback_data: 'templates' }, { text: '🔁 Ketma-ketlik', callback_data: 'flow_menu' }],
+          [{ text: '🧠 AI qoidalar', callback_data: 'rules_menu' }, { text: '⚙️ Sozlamalar', callback_data: 'settings' }],
+          [{ text: '🕵️ Arxiv', callback_data: 'archive_menu' }, { text: '📈 Hisobotlar', callback_data: 'report' }],
+          [{ text: '🩺 Diagnostika', callback_data: 'diagnostics' }]
+        ]
+      }
     }).catch(err => console.error('business_connection notify:', err.message));
   }
   await logEvent('business_connection', 'business_connection_account_bound', JSON.stringify({
@@ -621,6 +673,59 @@ async function rememberAccountBusinessConnection(account, businessConnectionId) 
 
 function isDefaultAccountKey(ak) {
   return !ak || ak === DEFAULT_ACCOUNT_KEY || ak === LEGACY_DEFAULT_ACCOUNT_KEY;
+}
+
+async function isPlatformOwner(telegramUserId) {
+  const raw = String(telegramUserId || '').trim();
+  if (!raw) return false;
+  if (PLATFORM_OWNER_IDS.includes(raw)) return true;
+  try {
+    const { data, error } = await supabase.from('platform_admins')
+      .select('telegram_user_id,is_active')
+      .eq('telegram_user_id', raw)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (error) {
+      if (!String(error.message || '').includes('does not exist')) console.error('isPlatformOwner:', error.message);
+      return false;
+    }
+    return Boolean(data);
+  } catch (err) {
+    console.error('isPlatformOwner:', err.message);
+  }
+  return false;
+}
+
+async function logPlatformAudit({ adminUserId, adminUsername, action, targetAccountKey, beforeJson, afterJson }) {
+  try {
+    await supabase.from('platform_audit_logs').insert({
+      admin_user_id: String(adminUserId || ''),
+      admin_username: String(adminUsername || ''),
+      action: String(action || ''),
+      target_account_key: targetAccountKey ? String(targetAccountKey) : null,
+      before_json: beforeJson || {},
+      after_json: afterJson || {},
+      created_at: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('logPlatformAudit:', err.message);
+  }
+}
+
+async function logPlatformUnauthorizedAttempt(telegramUserId, context = '', username = '') {
+  try {
+    await supabase.from('platform_audit_logs').insert({
+      admin_user_id: String(telegramUserId || ''),
+      admin_username: String(username || ''),
+      action: 'unauthorized_access',
+      target_account_key: null,
+      before_json: { context },
+      after_json: { allowed: false },
+      created_at: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('logPlatformUnauthorizedAttempt:', err.message);
+  }
 }
 
 function accountLeadFilter(q, accountOrKey = DEFAULT_ACCOUNT_KEY) {
@@ -1927,11 +2032,23 @@ async function isKnownAdminMessage(msg) {
   const fromId = String(msg?.from?.id || '');
   if (fromId === String(OWNER_TELEGRAM_ID) || fromId === String(ADMIN_CHAT_ID) || chatId === String(ADMIN_CHAT_ID)) return true;
   const accounts = await getAccounts();
-  return accounts.some(a => (
+  const envOrAccountAdmin = accounts.some(a => (
     (a.admin_chat_id && (String(a.admin_chat_id) === chatId || String(a.admin_chat_id) === fromId)) ||
     (a.owner_user_id && String(a.owner_user_id) === fromId) ||
     (a.business_owner_id && String(a.business_owner_id) === fromId)
   ));
+  if (envOrAccountAdmin) return true;
+  if (!fromId) return false;
+  const { data, error } = await supabase.from('account_admins')
+    .select('account_key')
+    .eq('telegram_user_id', fromId)
+    .eq('is_active', true)
+    .limit(1);
+  if (error) {
+    if (!String(error.message || '').includes('does not exist')) console.error('isKnownAdminMessage account_admins:', error.message);
+    return false;
+  }
+  return Boolean(data?.length);
 }
 
 async function whoamiText(msg, messageType = 'message') {
@@ -2534,7 +2651,14 @@ async function getSelectedAccountKey(adminChatId) {
   if (!error && data?.payload?.selected_account_key) return data.payload.selected_account_key;
   const accounts = await getAccounts();
   const direct = accounts.find(a => String(a.admin_chat_id || '') === String(adminChatId));
-  return direct?.account_key || DEFAULT_ACCOUNT.account_key;
+  if (direct?.account_key) return direct.account_key;
+  const { data: adminRows, error: adminError } = await supabase.from('account_admins')
+    .select('account_key')
+    .eq('telegram_user_id', String(adminChatId))
+    .eq('is_active', true)
+    .limit(1);
+  if (!adminError && adminRows?.[0]?.account_key) return adminRows[0].account_key;
+  return DEFAULT_ACCOUNT.account_key;
 }
 
 async function setSelectedAccountKey(adminChatId, selectedAccountKey) {
@@ -2749,6 +2873,256 @@ async function sendDashboard(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   });
 }
 
+async function sendPlatformDashboard(chatId) {
+  const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY);
+  const activeAccounts = accounts.filter(a => a.bot_enabled !== false).length;
+  const suspendedAccounts = accounts.filter(a => a.bot_enabled === false).length;
+  const archivedToday = await countArchive(q => q.gte('created_at', `${localDateKey()}T00:00:00+00:00`));
+  const editedToday = await countArchive(q => q.gt('edit_count', 0).gte('edited_at', `${localDateKey()}T00:00:00+00:00`));
+  const deletedToday = await countArchive(q => q.eq('delete_detected', true).gte('deleted_at', `${localDateKey()}T00:00:00+00:00`));
+  const mediaToday = await countArchive(q => q.not('file_id', 'is', null).gte('created_at', `${localDateKey()}T00:00:00+00:00`));
+  const activeChatsToday = await countLeads(q => q.gte('last_message_at', `${localDateKey()}T00:00:00+00:00`));
+  const accountsWithErrors = accounts.filter(a => a.bot_enabled === false).length;
+  const aiEnabledAccounts = accounts.filter(a => a.auto_reply_enabled !== false).length;
+  const archiveEnabledAccounts = accounts.filter(a => a.archive_enabled !== false).length;
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    parse_mode: 'HTML',
+    text:
+      `<b>🧭 Platform Admin Bot</b>\n\n` +
+      `<b>📊 Umumiy dashboard</b>\n\n` +
+      `Jami ulangan akkauntlar: ${accounts.length}\n` +
+      `Aktiv akkauntlar: ${activeAccounts}\n` +
+      `Bloklangan akkauntlar: ${suspendedAccounts}\n` +
+      `Bugun arxivlangan xabarlar: ${archivedToday}\n` +
+      `Bugun tahrirlanganlar: ${editedToday}\n` +
+      `Bugun o‘chirilganlar: ${deletedToday}\n` +
+      `Bugun media arxivlari: ${mediaToday}\n` +
+      `Bugun aktiv chatlar: ${activeChatsToday}\n` +
+      `Xatoliklar bilan akkauntlar: ${accountsWithErrors}\n` +
+      `AI yoqilgan akkauntlar: ${aiEnabledAccounts}\n` +
+      `Arxiv yoqilgan akkauntlar: ${archiveEnabledAccounts}`,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '👥 Akkauntlar', callback_data: 'platform_accounts' }],
+        [{ text: '📈 Bugungi hisobot', callback_data: 'platform_today_report' }],
+        [{ text: '🩺 Diagnostika', callback_data: 'platform_diagnostics' }]
+      ]
+    }
+  });
+}
+
+async function sendPlatformAccounts(chatId) {
+  const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY);
+  const rows = accounts.map(a => ([{ text: `${a.label || a.account_key} — ${a.bot_enabled === false ? 'suspended' : 'active'}`, callback_data: `platform_account:${a.account_key}` }]));
+  rows.push([{ text: '⬅️ Orqaga', callback_data: 'platform_main' }]);
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: '🧭 Platform Admin Bot\n\n👥 Akkauntlar',
+    reply_markup: { inline_keyboard: rows }
+  });
+}
+
+async function sendPlatformAccountDetail(chatId, accountKey) {
+  const account = await getAccount(accountKey);
+  const rows = [
+    [{ text: '🕵️ Arxiv', callback_data: `platform_archive:${account.account_key}` }],
+    [{ text: '📈 Hisobot', callback_data: `platform_report:${account.account_key}` }],
+    [{ text: '✏️ Shablonlar', callback_data: `platform_templates:${account.account_key}` }],
+    [{ text: '🔁 Flow', callback_data: `platform_flow:${account.account_key}` }],
+    [{ text: '🧠 AI rules', callback_data: `platform_ai:${account.account_key}` }],
+    [{ text: '⚙️ Sozlamalar', callback_data: `platform_settings:${account.account_key}` }],
+    [{ text: '🚫 Bloklash', callback_data: `platform_suspend:${account.account_key}` }],
+    [{ text: '✅ Yoqish', callback_data: `platform_unsuspend:${account.account_key}` }],
+    [{ text: '🧪 Test notification', callback_data: `platform_testnotify:${account.account_key}` }],
+    [{ text: '⬅️ Orqaga', callback_data: 'platform_accounts' }]
+  ];
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `🧭 Platform Admin Bot\n\n` +
+      `account_key: ${account.account_key}\n` +
+      `label: ${account.label || '-'}\n` +
+      `project_name: ${account.project_name || '-'}\n` +
+      `owner_user_id: ${account.owner_user_id || '-'}\n` +
+      `owner_username: ${account.owner_username || '-'}\n` +
+      `admin_chat_id: ${account.admin_chat_id || '-'}\n` +
+      `business_connection_id: ${account.business_connection_id ? String(account.business_connection_id).slice(0, 8) + '…' : '-'}\n` +
+      `bot_enabled: ${account.bot_enabled !== false ? 'true' : 'false'}\n` +
+      `auto_reply_enabled: ${account.auto_reply_enabled !== false ? 'true' : 'false'}\n` +
+      `archive_enabled: ${account.archive_enabled !== false ? 'true' : 'false'}\n` +
+      `reports_enabled: ${account.reports_enabled !== false ? 'true' : 'false'}\n` +
+      `ai_intent_enabled: ${await getAccountAiEnabled(account.account_key)}\n` +
+      `total chats: ${await countLeads(null, account.account_key)}\n` +
+      `messages today: ${await countArchive(q => q.gte('created_at', `${localDateKey()}T00:00:00+00:00`), account.account_key)}\n` +
+      `deleted today: ${await countArchive(q => q.eq('delete_detected', true).gte('deleted_at', `${localDateKey()}T00:00:00+00:00`), account.account_key)}\n` +
+      `edited today: ${await countArchive(q => q.gt('edit_count', 0).gte('edited_at', `${localDateKey()}T00:00:00+00:00`), account.account_key)}\n` +
+      `last_seen_at: ${account.last_seen_at || '-'}`,
+    reply_markup: { inline_keyboard: rows }
+  });
+}
+
+async function sendPlatformDiagnostics(chatId) {
+  const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY);
+  const lines = await Promise.all(accounts.map(async a => {
+    const aiEnabled = await getAccountAiEnabled(a.account_key);
+    return `${a.label || a.account_key}: bot=${a.bot_enabled !== false ? 'on' : 'off'}, archive=${a.archive_enabled !== false ? 'on' : 'off'}, ai=${aiEnabled ? 'on' : 'off'}`;
+  }));
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: '🧭 Platform Admin Bot\n\n🩺 Diagnostika\n\n' + (lines.join('\n') || 'No accounts')
+  });
+}
+
+async function sendPlatformMainMenu(chatId) {
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: '🧭 Platforma paneli\n\nPlatform Admin Bot',
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '📊 Umumiy dashboard', callback_data: 'platform_main' }],
+        [{ text: '👥 Akkauntlar', callback_data: 'platform_accounts' }],
+        [{ text: '🔎 Akkaunt qidirish', callback_data: 'platform_search' }],
+        [{ text: '🕵️ Arxivlar', callback_data: 'platform_archive' }],
+        [{ text: '📈 Hisobotlar', callback_data: 'platform_reports' }],
+        [{ text: '⚙️ Sozlamalar', callback_data: 'platform_settings' }],
+        [{ text: '🧠 AI boshqaruv', callback_data: 'platform_ai' }],
+        [{ text: '🚫 Bloklanganlar', callback_data: 'platform_suspended' }],
+        [{ text: '🧾 Audit log', callback_data: 'platform_audit' }],
+        [{ text: '🩺 Diagnostika', callback_data: 'platform_diagnostics' }]
+      ]
+    }
+  });
+}
+
+async function sendPlatformSuspendedAccounts(chatId) {
+  const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY && a.bot_enabled === false);
+  const text = accounts.length
+    ? accounts.map((a, i) => `${i + 1}. ${a.label || a.account_key} — ${a.account_key}`).join('\n')
+    : 'Bloklangan akkaunt yo‘q.';
+  return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\n🚫 Bloklanganlar\n\n${text}` });
+}
+
+async function sendPlatformAuditLog(chatId) {
+  const { data, error } = await supabase.from('platform_audit_logs')
+    .select('admin_user_id,admin_username,action,target_account_key,created_at')
+    .order('created_at', { ascending: false })
+    .limit(20);
+  if (error) {
+    return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\nAudit log o‘qilmadi: ${error.message}` });
+  }
+  const rows = data || [];
+  const text = rows.length
+    ? rows.map((r, i) => `${i + 1}. ${r.created_at || '-'} — ${r.action || '-'} — ${r.target_account_key || '-'} — ${r.admin_username ? '@' + r.admin_username : r.admin_user_id || '-'}`).join('\n')
+    : 'Audit log bo‘sh.';
+  return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\n🧾 Audit log\n\n${text}` });
+}
+
+async function sendPlatformAirules(chatId, accountOrKey) {
+  const account = await getAccount(accountOrKey);
+  const { data, error } = await supabase.from('account_reply_rules')
+    .select('flow_key,step_key,intent,template_key,next_step,should_stop,is_active')
+    .eq('account_key', account.account_key)
+    .order('step_key', { ascending: true })
+    .limit(30);
+  if (error) {
+    return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\nAI qoidalar o‘qilmadi: ${error.message}` });
+  }
+  const rows = data || [];
+  const text = rows.length
+    ? rows.map((r, i) => `${i + 1}. ${r.step_key || '-'} / ${r.intent || '-'} -> ${r.template_key || r.next_step || '-'} stop:${r.should_stop ? 'true' : 'false'} active:${r.is_active !== false ? 'true' : 'false'}`).join('\n')
+    : 'AI rule yozuvlari yo‘q.';
+  return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\n🧠 AI rules\nAkkaunt: ${account.label || account.account_key}\n\n${text}` });
+}
+
+async function sendPlatformTemplatesSummary(chatId, accountOrKey) {
+  const account = await getAccount(accountOrKey);
+  const rows = [];
+  for (const key of TEMPLATE_MENU_KEYS) {
+    rows.push(`${key}: ${await getTemplate(key, account.account_key) ? 'bor' : 'yo‘q'}`);
+  }
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: `🧭 Platform Admin Bot\n\n✏️ Shablonlar\nAkkaunt: ${account.label || account.account_key}\n\n${rows.join('\n')}`
+  });
+}
+
+async function sendPlatformReport(chatId, accountOrKey, title = '📈 Hisobot') {
+  const account = await getAccount(accountOrKey);
+  const total = await countArchive(null, account.account_key);
+  const edited = await countArchive(q => q.gt('edit_count', 0), account.account_key);
+  const deleted = await countArchive(q => q.eq('delete_detected', true), account.account_key);
+  const media = await countArchive(q => q.not('file_id', 'is', null), account.account_key);
+  const chats = await countUniqueArchiveChats(account.account_key);
+  const autoReplies = await countLeads(q => q.eq('stage', STAGE.INFO_SENT_FINISHED), account.account_key);
+  const humanNeeded = await countLeads(q => q.in('status', ['needs_admin', 'pending_approval']), account.account_key);
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `🧭 Platform Admin Bot\n\n${title}\n` +
+      `Akkaunt: ${account.label || account.account_key}\n\n` +
+      `messages: ${total}\n` +
+      `chats: ${chats}\n` +
+      `deleted: ${deleted}\n` +
+      `edited: ${edited}\n` +
+      `media: ${media}\n` +
+      `AI handled: ${await countAiDecisions(account.account_key)}\n` +
+      `human_needed: ${humanNeeded}\n` +
+      `auto replies: ${autoReplies}`
+  });
+}
+
+async function countAiDecisions(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  let q = supabase.from('ai_decisions').select('*', { count: 'exact', head: true });
+  q = accountLeadFilter(q, accountOrKey);
+  const { count, error } = await q;
+  if (error) {
+    console.error('countAiDecisions:', error.message);
+    return 0;
+  }
+  return count || 0;
+}
+
+async function setPlatformAccountSuspension({ chatId, adminUser, accountKey: ak, suspended }) {
+  const before = await getAccount(ak);
+  if (!before?.account_key || before.account_key !== ak) {
+    return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\nAkkaunt topilmadi: ${ak}` });
+  }
+  const patch = suspended
+    ? { bot_enabled: false, auto_reply_enabled: false, archive_enabled: false }
+    : { bot_enabled: true, auto_reply_enabled: true };
+  const after = await upsertAccountPatch(ak, patch);
+  await logPlatformAudit({
+    adminUserId: adminUser?.id,
+    adminUsername: adminUser?.username,
+    action: suspended ? 'suspend_account' : 'unsuspend_account',
+    targetAccountKey: ak,
+    beforeJson: before,
+    afterJson: after
+  });
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: `🧭 Platform Admin Bot\n\n${suspended ? '🚫 Bloklandi' : '✅ Yoqildi'}: ${after.label || after.account_key}`
+  });
+}
+
+async function sendPlatformTestNotification(chatId, accountKey, adminUser = {}) {
+  const account = await getAccount(accountKey);
+  const ok = await sendAdminForAccount(account.account_key, `🧪 Platform Admin Bot test notification\n\nAkkaunt: ${account.label || account.account_key}`);
+  await logPlatformAudit({
+    adminUserId: adminUser.id,
+    adminUsername: adminUser.username,
+    action: 'test_notification',
+    targetAccountKey: account.account_key,
+    beforeJson: {},
+    afterJson: { sent: ok }
+  });
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: `🧭 Platform Admin Bot\n\nTest notification: ${ok ? 'yuborildi' : 'admin_chat_id topilmadi'}`
+  });
+}
+
 function mainMenuKeyboard(showAccounts = false) {
   const rows = [
       ...(showAccounts ? [[{ text: '👤 Akkaunt tanlash', callback_data: 'accounts' }]] : []),
@@ -2882,8 +3256,161 @@ function normalizeAdminCommand(rawText = '') {
 }
 
 // -------------------- Admin commands --------------------
+async function requirePlatformOwnerForAdminBot(msgOrCallback, context) {
+  const from = msgOrCallback?.from || {};
+  if (!PLATFORM_ADMIN_ENABLED) return false;
+  if (await isPlatformOwner(from.id)) return true;
+  await logPlatformUnauthorizedAttempt(from.id, context, from.username || '');
+  const chatId = msgOrCallback?.message?.chat?.id || msgOrCallback?.chat?.id;
+  if (chatId) await adminTg('sendMessage', { chat_id: chatId, text: '⛔ Sizda platforma admin ruxsati yo‘q.' });
+  return false;
+}
+
+async function handlePlatformAdminMessage(msg) {
+  const chatId = String(msg.chat?.id || '');
+  const from = msg.from || {};
+  const text = normalizeAdminCommand(msg.text || '');
+  if (!chatId || !text) return;
+  if (!(await requirePlatformOwnerForAdminBot(msg, `message:${text}`))) return;
+
+  if (text === '/start' || text === '/menu') return sendPlatformMainMenu(chatId);
+  if (text === '/dashboard') return sendPlatformDashboard(chatId);
+  if (text === '/accounts') return sendPlatformAccounts(chatId);
+  if (text === '/diagnostics') return sendPlatformDiagnostics(chatId);
+  if (text === '/audit') return sendPlatformAuditLog(chatId);
+  if (text === '/reportall') return sendReportAllPlatform(chatId);
+  if (text === '/cancel') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nBekor qilindi.' });
+
+  if (text.startsWith('/account ')) return sendPlatformAccountDetail(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/archive ')) return sendPlatformArchivePeopleMenu(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/report ')) return sendPlatformReport(chatId, text.split(/\s+/)[1], '📈 Hisobot');
+  if (text.startsWith('/settings ')) return sendPlatformAccountDetail(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/templates ')) return sendPlatformTemplatesSummary(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/flow ')) return sendPlatformFlow(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/airules ')) return sendPlatformAirules(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/suspend ')) return setPlatformAccountSuspension({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], suspended: true });
+  if (text.startsWith('/unsuspend ')) return setPlatformAccountSuspension({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], suspended: false });
+  if (text.startsWith('/testnotify ')) return sendPlatformTestNotification(chatId, text.split(/\s+/)[1], from);
+
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: '🧭 Platform Admin Bot\n\nBuyruq topilmadi. /menu'
+  });
+}
+
+async function sendReportAllPlatform(chatId) {
+  const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY);
+  const lines = [];
+  for (const account of accounts) {
+    lines.push(`${account.label || account.account_key}: ${await countArchive(null, account.account_key)} arxiv, ${await countLeads(null, account.account_key)} lead`);
+  }
+  return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\n📊 Barcha akkauntlar\n\n${lines.join('\n') || 'Akkaunt yo‘q.'}` });
+}
+
+async function sendPlatformArchivePeopleMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = await getAccount(accountOrKey);
+  const people = await getArchivePeople(account.account_key);
+  const rows = people.map(p => ([{
+    text: p.from_username ? `@${p.from_username}` : (p.from_first_name || String(p.chat_id)),
+    callback_data: `platform_archp:${account.account_key}:${p.chat_id}`
+  }]));
+  if (!rows.length) rows.push([{ text: 'Hozircha arxiv yo‘q', callback_data: 'platform_noop' }]);
+  rows.push([{ text: '⬅️ Akkaunt', callback_data: `platform_account:${account.account_key}` }]);
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: `🧭 Platform Admin Bot\n\n🕵️ Arxiv\nAkkaunt: ${account.label || account.account_key}`,
+    reply_markup: { inline_keyboard: rows }
+  });
+}
+
+async function sendPlatformArchivePersonEvents(chatId, accountOrKey, targetChatId) {
+  const account = await getAccount(accountOrKey);
+  const rows = await getArchiveRows('recent', account.account_key, targetChatId, 20);
+  const buttons = rows.map(r => {
+    const d = new Date(r.deleted_at || r.edited_at || r.created_at || Date.now());
+    const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    return [{ text: `${time} — ${archiveEventLabel(r)}`, callback_data: `platform_archv:${account.account_key}:${r.id}` }];
+  });
+  if (!buttons.length) buttons.push([{ text: 'Bu chatda arxiv topilmadi', callback_data: 'platform_noop' }]);
+  buttons.push([{ text: '⬅️ Arxiv', callback_data: `platform_archive:${account.account_key}` }]);
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: `🧭 Platform Admin Bot\n\n${targetChatId}`,
+    reply_markup: { inline_keyboard: buttons }
+  });
+}
+
+async function sendPlatformArchiveFullDetail(chatId, accountOrKey, archiveId) {
+  const account = await getAccount(accountOrKey);
+  const row = await getArchiveRowById(account.account_key, archiveId);
+  if (!row) return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nArxiv yozuvi topilmadi.' });
+  const text =
+    `🧭 Platform Admin Bot\n\n` +
+    `🕵️ Arxiv detail\n` +
+    `Akkaunt: ${account.label || account.account_key}\n` +
+    `Chat: ${row.chat_id}\n` +
+    `Message: ${row.message_id}\n` +
+    `Type: ${row.message_type || '-'}\n` +
+    `Event: ${row.last_event_type || '-'}\n` +
+    `From: ${row.from_username ? '@' + row.from_username : row.from_first_name || row.from_id || '-'}\n` +
+    `Created: ${row.created_at || '-'}\n` +
+    `Edited: ${row.edited_at || '-'}\n` +
+    `Deleted: ${row.deleted_at || '-'}\n\n` +
+    `${row.text || row.caption || '-'}`;
+  return adminTg('sendMessage', { chat_id: chatId, text: short(text, 3500) });
+}
+
+async function sendPlatformFlow(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = await getAccount(accountOrKey);
+  const steps = await getFlowSteps(account.account_key);
+  const text = steps.length
+    ? steps.map((s, i) => `${i + 1}. ${s.step_key} -> ${s.template_key}\nyes:${s.next_step_yes || '-'} no:${s.next_step_no || '-'} partial:${s.next_step_partial || '-'} unknown:${s.next_step_unknown || '-'} stop:${s.stop_after_send ? 'true' : 'false'}`).join('\n\n')
+    : 'Flow steps yo‘q.';
+  return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\n🔁 Flow\nAkkaunt: ${account.label || account.account_key}\n\n${text}` });
+}
+
+async function handlePlatformCallback(cb) {
+  const data = cb.data || '';
+  const chatId = cb.message?.chat?.id;
+  const from = cb.from || {};
+  try { await adminTg('answerCallbackQuery', { callback_query_id: cb.id }); } catch {}
+  if (!chatId) return;
+  if (!(await requirePlatformOwnerForAdminBot(cb, `callback:${data}`))) return;
+
+  if (data === 'platform_noop') return;
+  if (data === 'platform_main') return sendPlatformDashboard(chatId);
+  if (data === 'platform_accounts') return sendPlatformAccounts(chatId);
+  if (data === 'platform_diagnostics') return sendPlatformDiagnostics(chatId);
+  if (data === 'platform_search') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nQidirish: /account ACCOUNT_KEY' });
+  if (data === 'platform_archive') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nArxiv: /archive ACCOUNT_KEY' });
+  if (data === 'platform_reports' || data === 'platform_today_report') return sendReportAllPlatform(chatId);
+  if (data === 'platform_settings') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nSozlamalar: /settings ACCOUNT_KEY' });
+  if (data === 'platform_ai') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nAI rules: /airules ACCOUNT_KEY' });
+  if (data === 'platform_suspended') return sendPlatformSuspendedAccounts(chatId);
+  if (data === 'platform_audit') return sendPlatformAuditLog(chatId);
+  if (data.startsWith('platform_account:')) return sendPlatformAccountDetail(chatId, data.split(':')[1]);
+  if (data.startsWith('platform_archive:')) return sendPlatformArchivePeopleMenu(chatId, data.split(':')[1]);
+  if (data.startsWith('platform_report:')) return sendPlatformReport(chatId, data.split(':')[1], '📈 Hisobot');
+  if (data.startsWith('platform_templates:')) return sendPlatformTemplatesSummary(chatId, data.split(':')[1]);
+  if (data.startsWith('platform_flow:')) return sendPlatformFlow(chatId, data.split(':')[1]);
+  if (data.startsWith('platform_ai:')) return sendPlatformAirules(chatId, data.split(':')[1]);
+  if (data.startsWith('platform_settings:')) return sendPlatformAccountDetail(chatId, data.split(':')[1]);
+  if (data.startsWith('platform_suspend:')) return setPlatformAccountSuspension({ chatId, adminUser: from, accountKey: data.split(':')[1], suspended: true });
+  if (data.startsWith('platform_unsuspend:')) return setPlatformAccountSuspension({ chatId, adminUser: from, accountKey: data.split(':')[1], suspended: false });
+  if (data.startsWith('platform_testnotify:')) return sendPlatformTestNotification(chatId, data.split(':')[1], from);
+  if (data.startsWith('platform_archp:')) {
+    const [, ak, targetChatId] = data.split(':');
+    return sendPlatformArchivePersonEvents(chatId, ak, targetChatId);
+  }
+  if (data.startsWith('platform_archv:')) {
+    const [, ak, archiveId] = data.split(':');
+    return sendPlatformArchiveFullDetail(chatId, ak, archiveId);
+  }
+}
+
 async function handleAdminMessage(msg) {
   const chatId = String(msg.chat?.id || '');
+  const from = msg.from || {};
   const text = normalizeAdminCommand(msg.text || '');
   if (!text) return;
   const selectedAccountKey = await getSelectedAccountKey(chatId);
@@ -3370,6 +3897,8 @@ async function handleCallback(cb) {
   if (!chatId) return;
   const selectedAccountKey = await getSelectedAccountKey(chatId);
 
+  if (data.startsWith('platform_')) return tg('sendMessage', { chat_id: chatId, text: 'Platform Admin Bot uchun alohida admin botdan foydalaning.' });
+
   if (data === 'menu' || data === 'noop') return sendDashboard(chatId, selectedAccountKey);
   if (data === 'accounts') return sendAccountsMenu(chatId);
   if (data === 'archive_menu') return sendArchiveMenu(chatId);
@@ -3393,6 +3922,7 @@ async function handleCallback(cb) {
     return tg('sendMessage', { chat_id: chatId, text: `✅ Akkaunt tanlandi: ${account.label || account.account_key}` });
   }
   if (data === 'outreach_menu') return sendOutreachMenu(chatId, selectedAccountKey);
+  if (data === 'settings') return sendSettings(chatId, selectedAccountKey);
   if (data === 'flow_menu') return sendFlow(chatId, selectedAccountKey);
   if (data === 'ai_menu') {
     const enabled = await getAccountAiEnabled(selectedAccountKey);
@@ -3494,6 +4024,7 @@ app.get('/tick', async (_, res) => {
 
 const BASIC_ALLOWED_UPDATES = ['message', 'callback_query', 'business_connection', 'business_message'];
 const FULL_ALLOWED_UPDATES = [...BASIC_ALLOWED_UPDATES, 'edited_business_message', 'deleted_business_messages'];
+const ADMIN_ALLOWED_UPDATES = ['message', 'callback_query'];
 
 async function setWebhookResponse(req, res, allowedUpdates) {
   try {
@@ -3524,7 +4055,10 @@ app.get('/webhook-debug', async (_, res) => {
     ok: true,
     bot_token_exists: Boolean(BOT_TOKEN),
     bot_token_length: BOT_TOKEN ? BOT_TOKEN.length : 0,
+    admin_bot_token_exists: Boolean(ADMIN_BOT_TOKEN),
+    admin_bot_token_length: ADMIN_BOT_TOKEN ? ADMIN_BOT_TOKEN.length : 0,
     webhook_url_exists: Boolean(WEBHOOK_URL),
+    admin_bot_webhook_url_exists: Boolean(ADMIN_BOT_WEBHOOK_URL),
     webhook_url_https: WEBHOOK_URL ? WEBHOOK_URL.startsWith('https://') : false,
     webhook_url_ends_with_webhook: WEBHOOK_URL ? WEBHOOK_URL.endsWith('/webhook') : false,
     webhook_secret_exists: Boolean(WEBHOOK_SECRET),
@@ -3550,6 +4084,42 @@ app.get('/webhook-info', async (_, res) => {
     res.json({ ok: true, result });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/set-admin-webhook', async (req, res) => {
+  try {
+    const url = ADMIN_BOT_WEBHOOK_URL || `${req.protocol}://${req.get('host')}/admin-webhook`;
+    const result = await adminTg('setWebhook', {
+      url,
+      allowed_updates: ADMIN_ALLOWED_UPDATES
+    });
+    res.json({ ok: true, url, allowed_updates: ADMIN_ALLOWED_UPDATES, result });
+  } catch (err) {
+    console.error('setAdminWebhook error:', err.telegram || err.message);
+    res.status(500).json({ ok: false, error: err.message, telegram: err.telegram || null });
+  }
+});
+
+app.get('/admin-webhook-debug', (_, res) => {
+  res.json({
+    ok: true,
+    admin_bot_token_exists: Boolean(ADMIN_BOT_TOKEN),
+    admin_bot_token_length: ADMIN_BOT_TOKEN ? ADMIN_BOT_TOKEN.length : 0,
+    admin_bot_webhook_url_exists: Boolean(ADMIN_BOT_WEBHOOK_URL),
+    platform_owner_ids_count: PLATFORM_OWNER_IDS.length
+  });
+});
+
+app.post('/admin-webhook', async (req, res) => {
+  res.json({ ok: true });
+  try {
+    if (!ADMIN_BOT_TOKEN || !PLATFORM_ADMIN_ENABLED) return;
+    const update = req.body || {};
+    if (update.callback_query) await handlePlatformCallback(update.callback_query);
+    if (update.message) await handlePlatformAdminMessage(update.message);
+  } catch (err) {
+    console.error('admin webhook processing error:', err);
   }
 });
 

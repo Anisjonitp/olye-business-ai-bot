@@ -68,6 +68,15 @@ https://YOUR-RENDER-APP.onrender.com/webhook-info
 https://YOUR-RENDER-APP.onrender.com/webhook-debug
 ```
 
+Platform Admin Bot alohida token bilan ulanadi:
+
+```text
+https://YOUR-RENDER-APP.onrender.com/set-admin-webhook
+https://YOUR-RENDER-APP.onrender.com/admin-webhook-debug
+```
+
+Admin bot webhooki `POST /admin-webhook` route’iga keladi va faqat `PLATFORM_OWNER_IDS` yoki `platform_admins` jadvalidagi aktiv owner/adminlarga javob beradi. Tokenlar debug javoblarda ko‘rsatilmaydi; faqat mavjudligi va uzunligi chiqadi.
+
 Scheduler uxlab qolmasligi uchun tashqi cron bilan `/tick` endpointni har 5 daqiqada chaqirish ham mumkin:
 
 ```text
@@ -216,6 +225,31 @@ Bir nechta akkaunt uchun optional `BUSINESS_ACCOUNTS_JSON` ishlatiladi:
 ```
 
 Telegram `business_connection` update kelganda bot avval `owner_user_id`/`business_owner_id` bo‘yicha mavjud accountni topadi. Mos account topilmasa `tg_<telegram_user_id>` ko‘rinishida yangi account yaratadi, connectionni shu accountga bog‘laydi va admin chat sifatida account egasining Telegram ID sini saqlaydi.
+
+Yangi Business connection ulanganida bot `business_accounts`, `bot_accounts`, `business_connection_accounts` va `account_admins` yozuvlarini xavfsiz upsert qiladi. Business owner faqat o‘z account’ini public bot orqali boshqaradi. Platform owner esa alohida Admin Bot orqali barcha ulangan accountlarni ko‘radi va har bir platform action `platform_audit_logs` jadvaliga yoziladi.
+
+Platform Admin Bot buyruqlari:
+
+```text
+/start
+/menu
+/dashboard
+/accounts
+/account ACCOUNT_KEY
+/archive ACCOUNT_KEY
+/report ACCOUNT_KEY
+/reportall
+/suspend ACCOUNT_KEY
+/unsuspend ACCOUNT_KEY
+/settings ACCOUNT_KEY
+/templates ACCOUNT_KEY
+/flow ACCOUNT_KEY
+/airules ACCOUNT_KEY
+/audit
+/diagnostics
+/testnotify ACCOUNT_KEY
+/cancel
+```
 
 Shablon komandalarining eski formati saqlangan:
 
