@@ -42,6 +42,16 @@ create table if not exists bot_accounts (
   updated_at timestamptz default now()
 );
 
+create table if not exists business_connection_accounts (
+  business_connection_id text primary key,
+  account_key text not null,
+  user_id text,
+  username text,
+  first_name text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
 alter table bot_accounts add column if not exists label text;
 alter table bot_accounts add column if not exists business_owner_id text;
 alter table bot_accounts add column if not exists admin_chat_id text;
@@ -54,6 +64,13 @@ alter table bot_accounts add column if not exists daily_auto jsonb default '{}':
 alter table bot_accounts add column if not exists flow_key text default 'info_only';
 alter table bot_accounts add column if not exists created_at timestamptz default now();
 alter table bot_accounts add column if not exists updated_at timestamptz default now();
+
+alter table business_connection_accounts add column if not exists account_key text;
+alter table business_connection_accounts add column if not exists user_id text;
+alter table business_connection_accounts add column if not exists username text;
+alter table business_connection_accounts add column if not exists first_name text;
+alter table business_connection_accounts add column if not exists created_at timestamptz default now();
+alter table business_connection_accounts add column if not exists updated_at timestamptz default now();
 
 alter table business_leads add column if not exists account_key text;
 alter table business_leads add column if not exists business_connection_id text;
@@ -330,6 +347,8 @@ create index if not exists ai_decisions_intent_idx on ai_decisions(account_key, 
 create index if not exists account_reply_rules_account_idx on account_reply_rules(account_key, flow_key, step_key, intent);
 create unique index if not exists account_flow_steps_unique_idx on account_flow_steps(account_key, flow_key, step_key);
 create index if not exists account_flow_steps_account_idx on account_flow_steps(account_key, flow_key, sort_order);
+create index if not exists business_connection_accounts_account_idx on business_connection_accounts(account_key);
+create index if not exists business_connection_accounts_user_idx on business_connection_accounts(user_id);
 
 insert into bot_accounts (account_key, label, project_name, business_owner_id, admin_chat_id, flow_key, archive_enabled, archive_notify_enabled)
 values ('uzlye', 'UZLYE', 'O‘zbekiston Lider Yoshlari Ensiklopediyasi', null, null, 'uzlye_info_only', true, true)
