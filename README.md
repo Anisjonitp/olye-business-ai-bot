@@ -49,10 +49,23 @@ Render deploy bo‘lgach:
 https://YOUR-RENDER-APP.onrender.com/set-webhook
 ```
 
+Basic webhook:
+
+```text
+https://YOUR-RENDER-APP.onrender.com/set-webhook-basic
+```
+
+Edit/delete arxiv update’lari uchun full webhook:
+
+```text
+https://YOUR-RENDER-APP.onrender.com/set-webhook-full
+```
+
 Tekshirish:
 
 ```text
 https://YOUR-RENDER-APP.onrender.com/webhook-info
+https://YOUR-RENDER-APP.onrender.com/webhook-debug
 ```
 
 Scheduler uxlab qolmasligi uchun tashqi cron bilan `/tick` endpointni har 5 daqiqada chaqirish ham mumkin:
@@ -111,6 +124,18 @@ SUPABASE_STORAGE_BUCKET=business-media-archive
 ## Multi-account sozlash
 
 Eski single-account sozlamalar ishlashda davom etadi: `OWNER_TELEGRAM_ID`, `BUSINESS_OWNER_ID`, `ADMIN_CHAT_ID`.
+
+Ikkinchi akkaunt uchun oddiy env sozlash:
+
+```text
+SECOND_ACCOUNT_ENABLED=true
+SECOND_ACCOUNT_KEY=second
+SECOND_ACCOUNT_LABEL=Second
+SECOND_ACCOUNT_PROJECT_NAME=Second Project
+SECOND_ACCOUNT_ADMIN_CHAT_ID=8304283149
+SECOND_ACCOUNT_BUSINESS_OWNER_ID=8304283149
+SECOND_ACCOUNT_FLOW_KEY=second_info_only
+```
 
 Bir nechta akkaunt uchun optional `BUSINESS_ACCOUNTS_JSON` ishlatiladi:
 
