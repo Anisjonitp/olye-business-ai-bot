@@ -41,6 +41,8 @@ create table if not exists bot_accounts (
   archive_enabled boolean default true,
   archive_notify_enabled boolean default true,
   reports_enabled boolean default true,
+  custom_commands_enabled boolean default true,
+  ai_rules_enabled boolean default true,
   media_archive_enabled boolean default true,
   media_archive_download boolean default false,
   media_archive_max_bytes bigint default 20000000,
@@ -77,6 +79,8 @@ create table if not exists business_accounts (
   archive_enabled boolean default true,
   reports_enabled boolean default true,
   ai_intent_enabled boolean default false,
+  custom_commands_enabled boolean default true,
+  ai_rules_enabled boolean default true,
   timezone text default 'Asia/Tashkent',
   last_seen_at timestamptz,
   created_at timestamptz default now(),
@@ -151,6 +155,15 @@ create table if not exists custom_command_executions (
   created_at timestamptz default now()
 );
 
+create table if not exists account_setup_sessions (
+  telegram_user_id text primary key,
+  account_key text,
+  mode text,
+  step text,
+  payload jsonb default '{}'::jsonb,
+  updated_at timestamptz default now()
+);
+
 create table if not exists account_ai_rules (
   id bigserial primary key,
   account_key text not null,
@@ -190,6 +203,8 @@ alter table bot_accounts add column if not exists track_deleted_enabled boolean 
 alter table bot_accounts add column if not exists track_edited_enabled boolean default true;
 alter table bot_accounts add column if not exists archive_notify_enabled boolean default true;
 alter table bot_accounts add column if not exists reports_enabled boolean default true;
+alter table bot_accounts add column if not exists custom_commands_enabled boolean default true;
+alter table bot_accounts add column if not exists ai_rules_enabled boolean default true;
 alter table bot_accounts add column if not exists media_archive_enabled boolean default true;
 alter table bot_accounts add column if not exists media_archive_download boolean default false;
 alter table bot_accounts add column if not exists media_archive_max_bytes bigint default 20000000;
@@ -225,6 +240,8 @@ alter table business_accounts add column if not exists media_archive_download bo
 alter table business_accounts add column if not exists archive_notify_enabled boolean default true;
 alter table business_accounts add column if not exists reports_enabled boolean default true;
 alter table business_accounts add column if not exists ai_intent_enabled boolean default false;
+alter table business_accounts add column if not exists custom_commands_enabled boolean default true;
+alter table business_accounts add column if not exists ai_rules_enabled boolean default true;
 alter table business_accounts add column if not exists timezone text default 'Asia/Tashkent';
 alter table business_accounts add column if not exists last_seen_at timestamptz;
 alter table business_accounts add column if not exists created_at timestamptz default now();
@@ -282,6 +299,13 @@ alter table custom_command_executions add column if not exists matched boolean d
 alter table custom_command_executions add column if not exists user_text text;
 alter table custom_command_executions add column if not exists response_type text;
 alter table custom_command_executions add column if not exists created_at timestamptz default now();
+
+alter table account_setup_sessions add column if not exists telegram_user_id text;
+alter table account_setup_sessions add column if not exists account_key text;
+alter table account_setup_sessions add column if not exists mode text;
+alter table account_setup_sessions add column if not exists step text;
+alter table account_setup_sessions add column if not exists payload jsonb default '{}'::jsonb;
+alter table account_setup_sessions add column if not exists updated_at timestamptz default now();
 
 alter table account_ai_rules add column if not exists account_key text;
 alter table account_ai_rules add column if not exists rule_key text;
@@ -377,12 +401,17 @@ create table if not exists admin_sessions (
   mode text not null,
   account_key text,
   template_key text,
+  step text,
   payload jsonb default '{}'::jsonb,
   updated_at timestamptz default now()
 );
 
 alter table admin_sessions add column if not exists account_key text;
 alter table admin_sessions add column if not exists template_key text;
+alter table admin_sessions add column if not exists step text;
+alter table admin_sessions add column if not exists mode text;
+alter table admin_sessions add column if not exists payload jsonb default '{}'::jsonb;
+alter table admin_sessions add column if not exists updated_at timestamptz default now();
 
 create table if not exists message_archive (
   id bigserial primary key,
@@ -603,6 +632,8 @@ create unique index if not exists account_custom_commands_unique_idx on account_
 create index if not exists account_custom_commands_enabled_idx on account_custom_commands(account_key, is_enabled, sort_order);
 create index if not exists custom_command_executions_account_idx on custom_command_executions(account_key, created_at desc);
 create index if not exists custom_command_executions_command_idx on custom_command_executions(account_key, command_key, created_at desc);
+create index if not exists admin_sessions_account_idx on admin_sessions(account_key, updated_at desc);
+create index if not exists account_setup_sessions_account_idx on account_setup_sessions(account_key, updated_at desc);
 create unique index if not exists account_ai_rules_unique_idx on account_ai_rules(account_key, rule_key);
 create index if not exists account_ai_rules_enabled_idx on account_ai_rules(account_key, is_enabled, step_key);
 
