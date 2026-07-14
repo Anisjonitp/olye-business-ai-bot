@@ -99,6 +99,14 @@ https://YOUR-RENDER-APP.onrender.com/tick
 /flow ACCOUNT_KEY
 /setflow ACCOUNT_KEY STEP_KEY TEMPLATE_KEY NEXT_YES NEXT_NO NEXT_PARTIAL NEXT_UNKNOWN STOP_TRUE_FALSE
 /flowtest ACCOUNT_KEY
+/ai on
+/ai off
+/aistatus
+/aistatus ACCOUNT_KEY
+/aitemplate TEMPLATE_KEY text
+/aitemplate ACCOUNT_KEY TEMPLATE_KEY text
+/testrule ACCOUNT_KEY STEP_KEY TEXT
+/testai ACCOUNT_KEY STEP_KEY TEXT
 /archive
 /deleted
 /edited
@@ -114,12 +122,25 @@ Media fayl metadata doim saqlanadi. Faylni Supabase Storage’ga yuklash optiona
 
 ```text
 MEDIA_ARCHIVE_ENABLED=true
-MEDIA_ARCHIVE_DOWNLOAD=false
+MEDIA_ARCHIVE_DOWNLOAD=true
 MEDIA_ARCHIVE_MAX_BYTES=20000000
 SUPABASE_STORAGE_BUCKET=business-media-archive
 ```
 
 `MEDIA_ARCHIVE_DOWNLOAD=false` bo‘lsa, bot faqat `file_id`, `file_unique_id` va metadata saqlaydi.
+
+## AI yordamchi funksiyalar
+
+AI intent klassifikatsiya mijozga erkin javob yozmaydi, faqat ichki JSON qaror chiqaradi. `OPENAI_API_KEY` bo‘lmasa yoki AI o‘chirilgan bo‘lsa, bot eski qoida-asosidagi logika bilan ishlaydi.
+
+```text
+AI_INTENT_ENABLED=true
+AI_TEMPLATE_EDITOR_ENABLED=true
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o-mini
+```
+
+AI shablon tahriri preview ko‘rsatadi va faqat admin `✅ Saqlash` tugmasini bosgandan keyin account-specific shablonga saqlaydi.
 
 ## Multi-account sozlash
 

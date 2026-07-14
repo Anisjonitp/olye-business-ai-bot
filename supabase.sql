@@ -126,9 +126,14 @@ create table if not exists bot_settings (
 create table if not exists admin_sessions (
   chat_id text primary key,
   mode text not null,
+  account_key text,
+  template_key text,
   payload jsonb default '{}'::jsonb,
   updated_at timestamptz default now()
 );
+
+alter table admin_sessions add column if not exists account_key text;
+alter table admin_sessions add column if not exists template_key text;
 
 create table if not exists message_archive (
   id bigserial primary key,
@@ -149,6 +154,7 @@ create table if not exists message_archive (
   mime_type text,
   file_size bigint,
   storage_path text,
+  storage_url text,
   public_url text,
   raw_json jsonb default '{}'::jsonb,
   created_at timestamptz default now(),
@@ -191,6 +197,37 @@ create table if not exists account_flow_steps (
   updated_at timestamptz default now()
 );
 
+create table if not exists ai_decisions (
+  id bigserial primary key,
+  account_key text,
+  chat_id text not null,
+  stage text,
+  step_key text,
+  user_text text,
+  intent text,
+  confidence numeric,
+  next_step text,
+  template_key text,
+  should_stop boolean default false,
+  reason text,
+  raw_json jsonb default '{}'::jsonb,
+  created_at timestamptz default now()
+);
+
+create table if not exists account_reply_rules (
+  id bigserial primary key,
+  account_key text,
+  flow_key text,
+  step_key text,
+  intent text,
+  template_key text,
+  next_step text,
+  should_stop boolean default false,
+  is_active boolean default true,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
 alter table account_flow_steps add column if not exists account_key text;
 alter table account_flow_steps add column if not exists flow_key text;
 alter table account_flow_steps add column if not exists step_key text;
@@ -222,6 +259,7 @@ alter table message_archive add column if not exists file_name text;
 alter table message_archive add column if not exists mime_type text;
 alter table message_archive add column if not exists file_size bigint;
 alter table message_archive add column if not exists storage_path text;
+alter table message_archive add column if not exists storage_url text;
 alter table message_archive add column if not exists public_url text;
 alter table message_archive add column if not exists raw_json jsonb default '{}'::jsonb;
 alter table message_archive add column if not exists created_at timestamptz default now();
@@ -243,6 +281,31 @@ alter table message_edit_history add column if not exists old_raw_json jsonb;
 alter table message_edit_history add column if not exists new_raw_json jsonb;
 alter table message_edit_history add column if not exists edited_at timestamptz default now();
 
+alter table ai_decisions add column if not exists account_key text;
+alter table ai_decisions add column if not exists chat_id text;
+alter table ai_decisions add column if not exists stage text;
+alter table ai_decisions add column if not exists step_key text;
+alter table ai_decisions add column if not exists user_text text;
+alter table ai_decisions add column if not exists intent text;
+alter table ai_decisions add column if not exists confidence numeric;
+alter table ai_decisions add column if not exists next_step text;
+alter table ai_decisions add column if not exists template_key text;
+alter table ai_decisions add column if not exists should_stop boolean default false;
+alter table ai_decisions add column if not exists reason text;
+alter table ai_decisions add column if not exists raw_json jsonb default '{}'::jsonb;
+alter table ai_decisions add column if not exists created_at timestamptz default now();
+
+alter table account_reply_rules add column if not exists account_key text;
+alter table account_reply_rules add column if not exists flow_key text;
+alter table account_reply_rules add column if not exists step_key text;
+alter table account_reply_rules add column if not exists intent text;
+alter table account_reply_rules add column if not exists template_key text;
+alter table account_reply_rules add column if not exists next_step text;
+alter table account_reply_rules add column if not exists should_stop boolean default false;
+alter table account_reply_rules add column if not exists is_active boolean default true;
+alter table account_reply_rules add column if not exists created_at timestamptz default now();
+alter table account_reply_rules add column if not exists updated_at timestamptz default now();
+
 create index if not exists business_leads_account_idx on business_leads(account_key);
 create index if not exists business_leads_account_stage_idx on business_leads(account_key, stage);
 create index if not exists business_leads_account_status_idx on business_leads(account_key, status);
@@ -262,6 +325,9 @@ create index if not exists message_edit_history_chat_idx on message_edit_history
 create index if not exists message_edit_history_message_idx on message_edit_history(message_id);
 create index if not exists message_edit_history_account_idx on message_edit_history(account_key);
 create index if not exists message_edit_history_edited_idx on message_edit_history(edited_at);
+create index if not exists ai_decisions_account_chat_idx on ai_decisions(account_key, chat_id, created_at desc);
+create index if not exists ai_decisions_intent_idx on ai_decisions(account_key, intent);
+create index if not exists account_reply_rules_account_idx on account_reply_rules(account_key, flow_key, step_key, intent);
 create unique index if not exists account_flow_steps_unique_idx on account_flow_steps(account_key, flow_key, step_key);
 create index if not exists account_flow_steps_account_idx on account_flow_steps(account_key, flow_key, sort_order);
 

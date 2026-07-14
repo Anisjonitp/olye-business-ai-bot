@@ -34,9 +34,13 @@ const DAILY_NO_OUTREACH_WARN_MIN = Number(process.env.DAILY_NO_OUTREACH_WARN_MIN
 const REMINDER_AFTER_MS = Number(process.env.REMINDER_AFTER_MS || 3600000);
 const SCHEDULER_TICK_MS = Number(process.env.SCHEDULER_TICK_MS || 60000);
 const MEDIA_ARCHIVE_ENABLED = String(process.env.MEDIA_ARCHIVE_ENABLED || 'true') === 'true';
-const MEDIA_ARCHIVE_DOWNLOAD = String(process.env.MEDIA_ARCHIVE_DOWNLOAD || 'false') === 'true';
+const MEDIA_ARCHIVE_DOWNLOAD = String(process.env.MEDIA_ARCHIVE_DOWNLOAD || 'true') === 'true';
 const MEDIA_ARCHIVE_MAX_BYTES = Number(process.env.MEDIA_ARCHIVE_MAX_BYTES || 20000000);
 const SUPABASE_STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'business-media-archive';
+const AI_INTENT_ENABLED = String(process.env.AI_INTENT_ENABLED || 'false') === 'true';
+const AI_TEMPLATE_EDITOR_ENABLED = String(process.env.AI_TEMPLATE_EDITOR_ENABLED || 'false') === 'true';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL missing');
@@ -381,20 +385,18 @@ async function reserveAction(chatId, stage, actionName, accountOrKey = DEFAULT_A
 
 function accountTemplateKey(accountOrKey, key) {
   const ak = accountKey(accountOrKey);
-  return isDefaultAccountKey(ak) ? key : `${ak}:${key}`;
+  return `${ak}:${key}`;
 }
 
 async function getTemplate(key, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const ak = accountKey(accountOrKey);
-  if (!isDefaultAccountKey(ak)) {
-    const scoped = await supabase.from('reply_templates')
-      .select('body')
-      .eq('key', accountTemplateKey(ak, key))
-      .eq('account_key', ak)
-      .maybeSingle();
-    if (!scoped.error && scoped.data?.body) return scoped.data.body;
-    if (scoped.error) console.error('getTemplate scoped:', key, scoped.error.message);
-  }
+  const scoped = await supabase.from('reply_templates')
+    .select('body')
+    .eq('key', accountTemplateKey(ak, key))
+    .eq('account_key', ak)
+    .maybeSingle();
+  if (!scoped.error && scoped.data?.body) return scoped.data.body;
+  if (scoped.error) console.error('getTemplate scoped:', key, scoped.error.message);
 
   const { data, error } = await supabase.from('reply_templates').select('body').eq('key', key).maybeSingle();
   if (error) {
@@ -406,7 +408,7 @@ async function getTemplate(key, accountOrKey = DEFAULT_ACCOUNT_KEY) {
 
 async function setTemplate(key, body, accountOrKey = null) {
   const ak = accountOrKey ? accountKey(accountOrKey) : null;
-  const storageKey = ak && !isDefaultAccountKey(ak) ? accountTemplateKey(ak, key) : key;
+  const storageKey = ak ? accountTemplateKey(ak, key) : key;
   const { error } = await supabase.from('reply_templates').upsert({
     key: storageKey,
     account_key: ak,
@@ -460,6 +462,127 @@ async function upsertFlowStep({ accountKey: ak, stepKey, templateKey, nextYes, n
     updated_at: new Date().toISOString()
   }, { onConflict: 'account_key,flow_key,step_key' });
   if (error) throw error;
+}
+
+async function getAccountAiEnabled(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  if (!AI_INTENT_ENABLED || !OPENAI_API_KEY) return false;
+  const value = await getSetting(settingKey('ai_intent_enabled', accountOrKey), null);
+  return value === null ? true : Boolean(value?.enabled ?? value);
+}
+
+async function setAccountAiEnabled(accountOrKey = DEFAULT_ACCOUNT_KEY, enabled = true) {
+  await setSetting(settingKey('ai_intent_enabled', accountOrKey), { enabled: Boolean(enabled), updated_at: Date.now() });
+}
+
+async function callOpenAIJson(messages, temperature = 0.1) {
+  if (!OPENAI_API_KEY) return null;
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        temperature,
+        response_format: { type: 'json_object' },
+        messages
+      })
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(data?.error?.message || `OpenAI error ${res.status}`);
+    const content = data?.choices?.[0]?.message?.content || '{}';
+    return JSON.parse(content);
+  } catch (err) {
+    console.error('callOpenAIJson:', err.message);
+    return null;
+  }
+}
+
+async function improveTemplateWithAI({ accountKey: ak, templateKey, roughText }) {
+  if (!AI_TEMPLATE_EDITOR_ENABLED || !OPENAI_API_KEY) return null;
+  return callOpenAIJson([
+    {
+      role: 'system',
+      content: 'You edit Uzbek Telegram business bot templates. Return strict JSON: {"text":"..."}. Preserve meaning. Fix spelling, punctuation, natural Uzbek style, and clarity. Do not invent false claims. Do not change price unless user explicitly wrote a new price. Do not add aggressive spammy wording.'
+    },
+    {
+      role: 'user',
+      content: JSON.stringify({ account_key: ak, template_key: templateKey, rough_text: roughText })
+    }
+  ], 0.2);
+}
+
+async function saveAiDecision({ accountKey: ak, chatId, stage, userText, decision }) {
+  const payload = {
+    account_key: ak,
+    chat_id: String(chatId),
+    stage,
+    step_key: stage,
+    user_text: userText,
+    intent: decision?.intent || 'unclear',
+    confidence: Number(decision?.confidence || 0),
+    next_step: decision?.next_step || null,
+    template_key: decision?.template_key || null,
+    should_stop: Boolean(decision?.should_stop),
+    reason: decision?.reason || '',
+    raw_json: decision || {},
+    created_at: new Date().toISOString()
+  };
+  const { error } = await supabase.from('ai_decisions').insert(payload);
+  if (error) console.error('saveAiDecision:', error.message);
+}
+
+async function classifyWithAI(lead, userText, ruleIntent) {
+  if (!(await getAccountAiEnabled(lead.account_key))) return null;
+  const steps = await getFlowSteps(lead.account_key);
+  const decision = await callOpenAIJson([
+    {
+      role: 'system',
+      content: 'Classify Telegram customer replies for an info-only business bot. Never write a reply to the customer. Return strict JSON only with keys: intent, confidence, next_step, template_key, should_stop, reason. Allowed intents: confirm,reject,thanks,interested,price_question,info_request,unclear,stop,complaint,payment_ready,other.'
+    },
+    {
+      role: 'user',
+      content: JSON.stringify({
+        account_key: lead.account_key,
+        stage: lead.stage,
+        last_bot_message: lead.last_bot_message || '',
+        last_admin_message: lead.last_admin_message || '',
+        customer_message: userText,
+        rule_intent: ruleIntent,
+        flow_steps: steps.map(s => ({
+          step_key: s.step_key,
+          template_key: s.template_key,
+          next_step_yes: s.next_step_yes,
+          next_step_no: s.next_step_no,
+          next_step_partial: s.next_step_partial,
+          next_step_unknown: s.next_step_unknown,
+          stop_after_send: s.stop_after_send
+        }))
+      })
+    }
+  ], 0);
+  if (!decision) return null;
+  await saveAiDecision({ accountKey: lead.account_key, chatId: lead.chat_id, stage: lead.stage, userText, decision });
+  return decision;
+}
+
+function mapAiIntentToRuleIntent(decision, stage, fallbackIntent) {
+  if (!decision || Number(decision.confidence || 0) < 0.65) return fallbackIntent;
+  const intent = String(decision.intent || '');
+  if (['stop', 'reject', 'complaint'].includes(intent)) return 'hard_reject';
+  if (intent === 'price_question' || intent === 'payment_ready') return 'payment_near';
+  if (stage === STAGE.ASKED_APPLICATION) {
+    if (['confirm', 'thanks', 'interested'].includes(intent)) return 'application_confirmed';
+    if (intent === 'info_request') return 'application_not_submitted';
+  }
+  if (stage === STAGE.ASKED_INFO) {
+    if (['confirm', 'thanks', 'interested'].includes(intent)) return 'has_info';
+    if (intent === 'info_request') return 'no_info';
+  }
+  if (intent === 'thanks' || intent === 'interested') return 'read_offer';
+  return fallbackIntent;
 }
 
 function renderTemplate(body = '') {
@@ -1068,7 +1191,7 @@ async function maybeArchiveMediaFile(payload) {
     });
     if (error) throw error;
     const { data } = supabase.storage.from(SUPABASE_STORAGE_BUCKET).getPublicUrl(storagePath);
-    return { storage_path: storagePath, public_url: data?.publicUrl || null };
+    return { storage_path: storagePath, public_url: data?.publicUrl || null, storage_url: data?.publicUrl || null };
   } catch (err) {
     console.error('maybeArchiveMediaFile:', err.message);
     await logEvent(payload.chat_id, 'media_archive_download_skipped', err.message || String(err), payload.account_key);
@@ -1178,8 +1301,10 @@ async function handleDeletedBusinessMessages(update = {}) {
 
 async function notifyDeletedMessage(account, row) {
   const archived = row?.storage_path || row?.file_id ? 'Ha' : 'Yo‘q';
+  const actor = row?.from_username ? `@${row.from_username}` : (row?.from_first_name || 'Foydalanuvchi');
+  const item = row?.message_type === 'photo' ? 'rasmni' : row?.file_id ? `${row.message_type || 'media'}ni` : 'xabarni';
   await sendAdmin(
-    `🗑 <b>Xabar o‘chirildi</b>\n\n` +
+    `🗑 <b>${html(actor)} ushbu ${html(item)} o‘chirdi</b>\n\n` +
     `Akkaunt: ${html(account.label || account.account_key)}\n` +
     `Project: ${html(account.project_name || '-')}\n` +
     `Chat ID: <code>${html(row.chat_id || '-')}</code>\n` +
@@ -1190,19 +1315,40 @@ async function notifyDeletedMessage(account, row) {
     {},
     account.account_key
   );
+  await sendArchivedMediaToAdmin(account, row, `O‘chirilgan ${row?.message_type === 'photo' ? 'rasm' : 'media'} arxivi`);
 }
 
 async function notifyEditedMessage(account, oldRow, payload) {
+  const actor = payload?.from_username ? `@${payload.from_username}` : (payload?.from_first_name || 'Foydalanuvchi');
   await sendAdmin(
-    `✏️ <b>Xabar tahrirlandi</b>\n\n` +
+    `✏️ <b>${html(actor)} ushbu xabarni tahrirladi</b>\n\n` +
     `Akkaunt: ${html(account.label || account.account_key)}\n` +
     `Chat ID: <code>${html(payload.chat_id || '-')}</code>\n` +
     `Message ID: <code>${html(payload.message_id || '-')}</code>\n` +
-    `Oldin: ${html(short(oldRow?.text || oldRow?.caption || '-', 500))}\n` +
-    `Yangi: ${html(short(payload.text || payload.caption || '-', 500))}`,
+    `Eski xabar:\n${html(short(oldRow?.text || oldRow?.caption || '-', 700))}\n\n` +
+    `Yangi xabar:\n${html(short(payload.text || payload.caption || '-', 700))}`,
     {},
     account.account_key
   );
+}
+
+async function sendArchivedMediaToAdmin(account, row, caption = 'Media arxiv') {
+  if (!row?.file_id) return;
+  const adminChatId = account.admin_chat_id || ADMIN_CHAT_ID;
+  if (!adminChatId) return;
+  const payload = { chat_id: adminChatId, caption };
+  try {
+    if (row.message_type === 'photo') return await tg('sendPhoto', { ...payload, photo: row.file_id });
+    if (row.message_type === 'voice') return await tg('sendVoice', { ...payload, voice: row.file_id });
+    if (row.message_type === 'video_note') return await tg('sendVideoNote', { chat_id: adminChatId, video_note: row.file_id });
+    if (row.message_type === 'video') return await tg('sendVideo', { ...payload, video: row.file_id });
+    if (row.message_type === 'document') return await tg('sendDocument', { ...payload, document: row.file_id });
+    if (row.message_type === 'audio') return await tg('sendAudio', { ...payload, audio: row.file_id });
+    if (row.message_type === 'sticker') return await tg('sendSticker', { chat_id: adminChatId, sticker: row.file_id });
+  } catch (err) {
+    console.error('sendArchivedMediaToAdmin:', err.message);
+    await logEvent(row.chat_id || 'unknown', 'send_archived_media_failed', err.message || String(err), account.account_key);
+  }
 }
 
 function isOwnerMessage(msg) {
@@ -1416,7 +1562,11 @@ async function processLeadBatch(initialLead, texts) {
     return;
   }
   const text = texts.join('\n').trim();
-  const intent = classify(text, lead.stage);
+  const ruleIntent = classify(text, lead.stage);
+  const aiDecision = ruleIntent === 'unclear' || ['rahmat', 'raxmat', 'qiziqdim', 'tushunarli', 'mayli', 'boladi', 'bo‘ladi', 'ok', 'ho‘p', "ho'p"].some(x => normalize(text).includes(x))
+    ? await classifyWithAI(lead, text, ruleIntent)
+    : null;
+  const intent = mapAiIntentToRuleIntent(aiDecision, lead.stage, ruleIntent);
   await updateLead(lead.chat_id, { last_user_message: text, last_message_at: new Date().toISOString() }, lead.account_key);
   await logEvent(lead.chat_id, `intent_${intent}_${lead.stage}`, text, lead.account_key);
 
@@ -1578,7 +1728,7 @@ async function getArchiveRows(type, accountOrKey = DEFAULT_ACCOUNT_KEY, chatId =
 function archiveRowsText(title, rows) {
   if (!rows.length) return `${title}\n\nHozircha ro‘yxat bo‘sh.`;
   return `${title}\n\n` + rows.map((r, i) => (
-    `${i + 1}. ${r.direction || 'unknown'} ${r.message_type || 'other'}\n` +
+    `${i + 1}. ${r.from_username ? '@' + r.from_username : (r.from_first_name || '-') } — ${r.direction || 'unknown'} ${r.message_type || 'other'}\n` +
     `   Chat ID: ${r.chat_id}\n` +
     `   Message ID: ${r.message_id}\n` +
     `   Text: ${short(r.text || r.caption || '-', 90)}\n` +
@@ -1701,10 +1851,33 @@ async function setSelectedAccountKey(adminChatId, selectedAccountKey) {
   const { error } = await supabase.from('admin_sessions').upsert({
     chat_id: String(adminChatId),
     mode: 'account_selected',
+    account_key: selectedAccountKey,
+    template_key: null,
     payload: { selected_account_key: selectedAccountKey },
     updated_at: new Date().toISOString()
   });
   if (error) console.error('setSelectedAccountKey:', error.message);
+}
+
+async function getAdminSession(chatId) {
+  const { data, error } = await supabase.from('admin_sessions').select('*').eq('chat_id', String(chatId)).maybeSingle();
+  if (error) {
+    console.error('getAdminSession:', error.message);
+    return null;
+  }
+  return data || null;
+}
+
+async function setAdminSession(chatId, mode, payload = {}) {
+  const { error } = await supabase.from('admin_sessions').upsert({
+    chat_id: String(chatId),
+    mode,
+    account_key: payload.selected_account_key || payload.account_key || null,
+    template_key: payload.template_key || null,
+    payload,
+    updated_at: new Date().toISOString()
+  });
+  if (error) console.error('setAdminSession:', error.message);
 }
 
 async function sendAccountsMenu(chatId) {
@@ -1742,6 +1915,56 @@ async function sendAccountStatus(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
       `Archive notify: ${account.archive_notify_enabled === false ? 'OFF' : 'ON'}\n` +
       `Active session: ${auto?.session_id || '-'}\n` +
       `Daily auto: ${daily.enabled ? `${daily.start_time}, ${daily.duration_hours}h` : 'OFF'}`
+  });
+}
+
+const TEMPLATE_MENU_KEYS = ['ask_application', 'ask_info', 'known_info_preface', 'unknown_info_preface', 'short_intro', 'full_intro', 'offer_end', 'application_link_reply', 'offer_followup'];
+
+async function sendTemplatesMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const rows = TEMPLATE_MENU_KEYS.map(k => ([{ text: k, callback_data: `tpl:${k}` }]));
+  rows.push([{ text: '⬅️ Menyu', callback_data: 'menu' }]);
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `✏️ Shablonlar\nAkkaunt: ${accountKey(accountOrKey)}`,
+    reply_markup: { inline_keyboard: rows }
+  });
+}
+
+async function sendTemplateActions(chatId, templateKey, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `Shablon: ${templateKey}`,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '👁 Ko‘rish', callback_data: `tpl_view:${templateKey}` }],
+        [{ text: '✏️ Oddiy tahrirlash', callback_data: `tpl_edit:${templateKey}` }],
+        [{ text: '🤖 AI bilan tahrirlash', callback_data: `tpl_ai:${templateKey}` }],
+        [{ text: '🧪 Test yuborish', callback_data: `tpl_test:${templateKey}` }],
+        [{ text: '⬅️ Orqaga', callback_data: 'templates' }]
+      ]
+    }
+  });
+}
+
+async function showAiTemplatePreview(chatId, accountOrKey, templateKey, roughText) {
+  const result = await improveTemplateWithAI({ accountKey: accountKey(accountOrKey), templateKey, roughText });
+  const edited = result?.text;
+  if (!edited) return tg('sendMessage', { chat_id: chatId, text: 'AI tahrir hozir ishlamadi. OPENAI_API_KEY va AI_TEMPLATE_EDITOR_ENABLED sozlamalarini tekshiring.' });
+  await setAdminSession(chatId, 'ai_template_preview', {
+    selected_account_key: accountKey(accountOrKey),
+    template_key: templateKey,
+    rough_text: roughText,
+    edited_text: edited
+  });
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `AI tahrirlangan matn:\n\n${edited}`,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '✅ Saqlash', callback_data: 'tpl_ai_save' }, { text: '✏️ Qayta tahrirlash', callback_data: 'tpl_ai_retry' }],
+        [{ text: '❌ Bekor qilish', callback_data: 'tpl_ai_cancel' }]
+      ]
+    }
   });
 }
 
@@ -1858,6 +2081,12 @@ async function handleAdminMessage(msg) {
   const text = String(msg.text || '').trim();
   if (!text) return;
   const selectedAccountKey = await getSelectedAccountKey(chatId);
+  const session = await getAdminSession(chatId);
+
+  if (session?.mode === 'ai_template_input' && !text.startsWith('/')) {
+    const payload = session.payload || {};
+    return showAiTemplatePreview(chatId, payload.selected_account_key || selectedAccountKey, payload.template_key, text);
+  }
 
   if (text === '/start' || text === '/menu') return sendDashboard(chatId, selectedAccountKey);
   if (text === '/whoami') return replyWhoami(msg, 'message');
@@ -1876,6 +2105,50 @@ async function handleAdminMessage(msg) {
     return tg('sendMessage', { chat_id: chatId, text: `✅ Akkaunt tanlandi: ${account.label || account.account_key}` });
   }
   if (text === '/accountstatus') return sendAccountStatus(chatId, selectedAccountKey);
+  if (text.startsWith('/ai ')) {
+    const parts = text.split(/\s+/);
+    const accounts = await getAccounts();
+    const maybeAccount = accounts.find(a => a.account_key === parts[1]);
+    const targetAccount = maybeAccount ? parts[1] : selectedAccountKey;
+    const mode = maybeAccount ? parts[2] : parts[1];
+    if (mode === 'on') {
+      await setAccountAiEnabled(targetAccount, true);
+      return tg('sendMessage', { chat_id: chatId, text: `✅ AI intent yoqildi: ${targetAccount}` });
+    }
+    if (mode === 'off') {
+      await setAccountAiEnabled(targetAccount, false);
+      return tg('sendMessage', { chat_id: chatId, text: `⛔ AI intent o‘chirildi: ${targetAccount}` });
+    }
+  }
+  if (text === '/aistatus' || text.startsWith('/aistatus ')) {
+    const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey);
+    const enabled = await getAccountAiEnabled(parsed.accountKey);
+    return tg('sendMessage', { chat_id: chatId, text: `AI status\nAkkaunt: ${parsed.accountKey}\nEnv enabled: ${AI_INTENT_ENABLED ? 'true' : 'false'}\nOPENAI_API_KEY: ${OPENAI_API_KEY ? 'bor' : 'yo‘q'}\nAccount AI: ${enabled ? 'ON' : 'OFF'}\nModel: ${OPENAI_MODEL}` });
+  }
+  if (text.startsWith('/testrule ')) {
+    const [, ak, stepKey, ...rest] = text.split(/\s+/);
+    const sample = rest.join(' ');
+    return tg('sendMessage', { chat_id: chatId, text: `Rule test\nAkkaunt: ${ak}\nStep: ${stepKey}\nText: ${sample}\nIntent: ${classify(sample, stepKey)}` });
+  }
+  if (text.startsWith('/testai ')) {
+    const [, ak, stepKey, ...rest] = text.split(/\s+/);
+    const sample = rest.join(' ');
+    const fakeLead = { account_key: ak, chat_id: 'test', stage: stepKey, last_bot_message: '', last_admin_message: '' };
+    const decision = await classifyWithAI(fakeLead, sample, classify(sample, stepKey));
+    return tg('sendMessage', { chat_id: chatId, text: `AI test\n${JSON.stringify(decision || { ok: false, reason: 'AI unavailable' }, null, 2)}` });
+  }
+  if (text.startsWith('/aitemplate ')) {
+    const rest = text.replace('/aitemplate ', '');
+    const accounts = await getAccounts();
+    const [first, second] = rest.split(/\s+/, 2);
+    const maybeAccount = accounts.find(a => a.account_key === first);
+    const templateAccountKey = maybeAccount ? first : selectedAccountKey;
+    const templateKey = maybeAccount ? second : first;
+    const prefix = maybeAccount ? `${first} ${second}` : first;
+    const rough = rest.slice(prefix.length).trim();
+    if (!templateKey || !rough) return tg('sendMessage', { chat_id: chatId, text: 'Format: /aitemplate TEMPLATE_KEY text yoki /aitemplate ACCOUNT_KEY TEMPLATE_KEY text' });
+    return showAiTemplatePreview(chatId, templateAccountKey, templateKey, rough);
+  }
   if (text === '/flow') return sendFlow(chatId, selectedAccountKey);
   if (text.startsWith('/flow ')) return sendFlow(chatId, text.split(/\s+/)[1]);
   if (text.startsWith('/flowtest ')) return sendFlowTest(chatId, text.split(/\s+/)[1]);
@@ -2139,7 +2412,45 @@ async function handleCallback(cb) {
   }
   if (data === 'report') return sendReport(chatId, selectedAccountKey);
   if (data === 'diagnostics') return diagnostics(chatId, selectedAccountKey);
-  if (data === 'templates') return tg('sendMessage', { chat_id: chatId, text: '✏️ Shablonlar uchun buyruqlar:\n/gettemplate key\n/settemplate key yangi matn\n\nMuhim: supabase.sql eski shablonlarni overwrite qilmaydi.' });
+  if (data === 'templates') return sendTemplatesMenu(chatId, selectedAccountKey);
+  if (data.startsWith('tpl:')) return sendTemplateActions(chatId, data.split(':')[1], selectedAccountKey);
+  if (data.startsWith('tpl_view:')) {
+    const key = data.split(':')[1];
+    const body = await getTemplate(key, selectedAccountKey);
+    return tg('sendMessage', { chat_id: chatId, text: body ? `Template: ${selectedAccountKey}/${key}\n\n${body}` : `Topilmadi: ${selectedAccountKey}/${key}` });
+  }
+  if (data.startsWith('tpl_edit:')) {
+    const key = data.split(':')[1];
+    return tg('sendMessage', { chat_id: chatId, text: `Oddiy tahrirlash:\n/settemplate ${selectedAccountKey} ${key} yangi matn` });
+  }
+  if (data.startsWith('tpl_ai:')) {
+    const key = data.split(':')[1];
+    await setAdminSession(chatId, 'ai_template_input', { selected_account_key: selectedAccountKey, template_key: key });
+    return tg('sendMessage', { chat_id: chatId, text: `🤖 AI bilan tahrirlash\n\n${key} uchun xomaki matn yuboring.` });
+  }
+  if (data.startsWith('tpl_test:')) {
+    const key = data.split(':')[1];
+    const body = await getTemplate(key, selectedAccountKey);
+    return tg('sendMessage', { chat_id: chatId, text: body ? `🧪 Test preview (${selectedAccountKey}/${key})\n\n${renderTemplate(body)}` : `Topilmadi: ${selectedAccountKey}/${key}` });
+  }
+  if (data === 'tpl_ai_save') {
+    const session = await getAdminSession(chatId);
+    const payload = session?.payload || {};
+    if (!payload.template_key || !payload.edited_text) return tg('sendMessage', { chat_id: chatId, text: 'Saqlanadigan AI preview topilmadi.' });
+    await setTemplate(payload.template_key, payload.edited_text, payload.selected_account_key);
+    await setAdminSession(chatId, 'account_selected', { selected_account_key: payload.selected_account_key });
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: ${payload.selected_account_key}/${payload.template_key}` });
+  }
+  if (data === 'tpl_ai_retry') {
+    const session = await getAdminSession(chatId);
+    const payload = session?.payload || {};
+    await setAdminSession(chatId, 'ai_template_input', payload);
+    return tg('sendMessage', { chat_id: chatId, text: 'Qayta tahrirlash uchun yangi xomaki matn yuboring.' });
+  }
+  if (data === 'tpl_ai_cancel') {
+    await setAdminSession(chatId, 'account_selected', { selected_account_key: selectedAccountKey });
+    return tg('sendMessage', { chat_id: chatId, text: 'Bekor qilindi.' });
+  }
   if (data.startsWith('list:')) return sendList(chatId, data.split(':')[1], selectedAccountKey);
   if (data === 'reminder_preview') return sendReminderPreview(chatId, selectedAccountKey);
   if (data === 'reminder_confirm') return sendReminderConfirm(chatId, selectedAccountKey);
