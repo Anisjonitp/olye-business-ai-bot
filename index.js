@@ -1177,6 +1177,50 @@ async function isKnownAdminMessage(msg) {
   ));
 }
 
+async function whoamiText(msg, messageType = 'message') {
+  const chatId = String(msg?.chat?.id || '');
+  const fromId = String(msg?.from?.id || '');
+  const businessConnectionId = msg?.business_connection_id || msg?.business_connection?.id || '';
+  const account = messageType === 'business_message'
+    ? await findAccountForBusinessMessage(msg)
+    : null;
+  const isAdmin = await isKnownAdminMessage(msg);
+  return (
+    `🪪 whoami\n\n` +
+    `message_type: ${messageType}\n` +
+    `chat.id: ${chatId || '-'}\n` +
+    `from.id: ${fromId || '-'}\n` +
+    `from.username: ${msg?.from?.username || '-'}\n` +
+    `from.first_name: ${msg?.from?.first_name || '-'}\n` +
+    `business_connection_id: ${businessConnectionId || '-'}\n` +
+    `detected account_key: ${account?.account_key || '-'}\n` +
+    `is_admin: ${isAdmin ? 'true' : 'false'}\n` +
+    `ADMIN_CHAT_ID match: ${chatId === String(ADMIN_CHAT_ID) || fromId === String(ADMIN_CHAT_ID) ? 'true' : 'false'}\n` +
+    `OWNER_TELEGRAM_ID match: ${fromId === String(OWNER_TELEGRAM_ID) ? 'true' : 'false'}\n` +
+    `BUSINESS_OWNER_ID match: ${fromId === String(BUSINESS_OWNER_ID) ? 'true' : 'false'}`
+  );
+}
+
+async function replyWhoami(msg, messageType = 'message') {
+  const chatId = String(msg?.chat?.id || '');
+  const businessConnectionId = msg?.business_connection_id || msg?.business_connection?.id || null;
+  if (!chatId) {
+    console.error('whoami cannot reply: missing chat.id', JSON.stringify(msg || {}).slice(0, 500));
+    return;
+  }
+  try {
+    const payload = { chat_id: chatId, text: await whoamiText(msg, messageType) };
+    if (messageType === 'business_message' && businessConnectionId) payload.business_connection_id = businessConnectionId;
+    await tg('sendMessage', payload);
+  } catch (err) {
+    console.error('whoami reply failed:', err.message);
+    try {
+      const account = messageType === 'business_message' ? await findAccountForBusinessMessage(msg) : DEFAULT_ACCOUNT;
+      await logEvent(chatId || 'unknown', 'whoami_reply_failed', err.message || String(err), account?.account_key);
+    } catch {}
+  }
+}
+
 async function handleBusinessMessage(msg) {
   const chatId = String(msg.chat?.id || '');
   if (!chatId) return;
@@ -1184,6 +1228,10 @@ async function handleBusinessMessage(msg) {
   const account = await findAccountForBusinessMessage(msg);
   const ak = account.account_key;
   const text = getMessageText(msg).trim();
+  if (text.toLowerCase() === '/whoami') {
+    await replyWhoami(msg, 'business_message');
+    return;
+  }
   const key = `business:${ak}:${chatId}:${msg.message_id || msg.date || Date.now()}`;
   const direction = isOwnerMessage(msg) ? 'outgoing' : 'incoming';
   await archiveBusinessMessage(msg, account, direction);
@@ -1739,7 +1787,7 @@ async function handleAdminMessage(msg) {
   const selectedAccountKey = await getSelectedAccountKey(chatId);
 
   if (text === '/start' || text === '/menu') return sendDashboard(chatId, selectedAccountKey);
-  if (text === '/whoami') return tg('sendMessage', { chat_id: chatId, text: `Sizning Telegram ID: ${msg.from.id}` });
+  if (text === '/whoami') return replyWhoami(msg, 'message');
   if (text === '/resetme') {
     await resetMeChat({ chatId, from: msg.from, accountKey: selectedAccountKey });
     return tg('sendMessage', { chat_id: chatId, text: '✅ Test profilingiz tozalandi. Endi qayta test qilishingiz mumkin.' });
@@ -2053,7 +2101,10 @@ app.post('/webhook', async (req, res) => {
     const update = req.body || {};
     if (update.callback_query) await handleCallback(update.callback_query);
     if (update.message) {
-      if (await isKnownAdminMessage(update.message)) {
+      const text = String(update.message.text || '').trim().toLowerCase();
+      if (text === '/whoami') {
+        await replyWhoami(update.message, 'message');
+      } else if (await isKnownAdminMessage(update.message)) {
         await handleAdminMessage(update.message);
       }
     }
