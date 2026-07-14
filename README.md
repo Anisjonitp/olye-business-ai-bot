@@ -236,20 +236,62 @@ Platform Admin Bot buyruqlari:
 /dashboard
 /accounts
 /account ACCOUNT_KEY
+/commands
+/commands ACCOUNT_KEY
+/command ACCOUNT_KEY COMMAND_KEY
+/commandon ACCOUNT_KEY COMMAND_KEY
+/commandoff ACCOUNT_KEY COMMAND_KEY
+/testcommand ACCOUNT_KEY TEXT
 /archive ACCOUNT_KEY
+/archivesettings ACCOUNT_KEY
+/archiveon ACCOUNT_KEY
+/archiveoff ACCOUNT_KEY
+/deletedon ACCOUNT_KEY
+/deletedoff ACCOUNT_KEY
+/editedon ACCOUNT_KEY
+/editedoff ACCOUNT_KEY
+/medianon ACCOUNT_KEY
+/mediaon ACCOUNT_KEY
+/mediaoff ACCOUNT_KEY
+/notifyon ACCOUNT_KEY
+/notifyoff ACCOUNT_KEY
 /report ACCOUNT_KEY
 /reportall
 /suspend ACCOUNT_KEY
 /unsuspend ACCOUNT_KEY
+/boton ACCOUNT_KEY
+/botoff ACCOUNT_KEY
 /settings ACCOUNT_KEY
 /templates ACCOUNT_KEY
 /flow ACCOUNT_KEY
 /airules ACCOUNT_KEY
+/testai ACCOUNT_KEY STEP_KEY TEXT
 /audit
 /diagnostics
 /testnotify ACCOUNT_KEY
 /cancel
 ```
+
+## Account-specific command builder
+
+Business owner menyusida `🧩 Buyruqlar` bo‘limi bor. Owner o‘z akkaunti uchun slash command, keyword, exact text yoki contains trigger yaratadi; javob sifatida oddiy matn, shablon, shablonlar ketma-ketligi, flow step yoki human-needed holatini tanlaydi. Global buyruqlar (`/menu`, `/whoami`, `/settings`, `/commands`, `/archive`, `/report` va boshqalar) override qilinmaydi.
+
+Custom commandlar faqat o‘z `account_key` doirasida ishlaydi. Mijoz biznes chatda mos xabar yuborsa, bot avval shu akkaunt commandlarini tekshiradi; mos command topilmasa eski info-only lead flow davom etadi. Test rejimida real mijozga xabar yuborilmaydi.
+
+## Archive settings
+
+Owner menyusida `🕵️ Arxiv sozlamalari` orqali quyidagilar account-specific ON/OFF qilinadi:
+
+```text
+archive_enabled
+track_deleted_enabled
+track_edited_enabled
+media_archive_enabled
+media_archive_download
+archive_notify_enabled
+```
+
+Platform Admin Bot shu sozlamalarni barcha akkauntlar uchun `/archivesettings ACCOUNT_KEY` va toggle commandlar orqali boshqaradi. Platform admin o‘zgarishlari audit logga yoziladi.
 
 Shablon komandalarining eski formati saqlangan:
 

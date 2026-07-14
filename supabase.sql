@@ -114,6 +114,67 @@ create table if not exists platform_audit_logs (
   created_at timestamptz default now()
 );
 
+create table if not exists account_custom_commands (
+  id bigserial primary key,
+  account_key text not null,
+  command_key text not null,
+  title text,
+  description text,
+  trigger_type text default 'slash_command',
+  trigger_patterns jsonb default '[]'::jsonb,
+  response_type text default 'text',
+  response_text text,
+  template_key text,
+  template_sequence jsonb default '[]'::jsonb,
+  flow_key text,
+  step_key text,
+  ai_rule_key text,
+  is_enabled boolean default true,
+  notify_admin boolean default false,
+  stop_after_response boolean default false,
+  sort_order integer default 100,
+  created_by text,
+  updated_by text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists custom_command_executions (
+  id bigserial primary key,
+  account_key text not null,
+  command_key text not null,
+  chat_id text,
+  business_connection_id text,
+  matched boolean default true,
+  user_text text,
+  response_type text,
+  created_at timestamptz default now()
+);
+
+create table if not exists account_ai_rules (
+  id bigserial primary key,
+  account_key text not null,
+  rule_key text not null,
+  display_name text,
+  flow_key text,
+  step_key text,
+  example_phrases jsonb default '[]'::jsonb,
+  target_intent text,
+  confidence_threshold numeric default 0.7,
+  action text default 'human_needed',
+  response_text text,
+  template_key text,
+  template_sequence jsonb default '[]'::jsonb,
+  next_step text,
+  notify_admin boolean default false,
+  stop_after_action boolean default false,
+  is_enabled boolean default true,
+  created_by text,
+  updated_by text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
 alter table bot_accounts add column if not exists label text;
 alter table bot_accounts add column if not exists owner_user_id text;
 alter table bot_accounts add column if not exists owner_username text;
@@ -125,6 +186,8 @@ alter table bot_accounts add column if not exists project_name text;
 alter table bot_accounts add column if not exists bot_enabled boolean default true;
 alter table bot_accounts add column if not exists auto_reply_enabled boolean default false;
 alter table bot_accounts add column if not exists archive_enabled boolean default true;
+alter table bot_accounts add column if not exists track_deleted_enabled boolean default true;
+alter table bot_accounts add column if not exists track_edited_enabled boolean default true;
 alter table bot_accounts add column if not exists archive_notify_enabled boolean default true;
 alter table bot_accounts add column if not exists reports_enabled boolean default true;
 alter table bot_accounts add column if not exists media_archive_enabled boolean default true;
@@ -155,6 +218,11 @@ alter table business_accounts add column if not exists business_connection_id te
 alter table business_accounts add column if not exists bot_enabled boolean default true;
 alter table business_accounts add column if not exists auto_reply_enabled boolean default false;
 alter table business_accounts add column if not exists archive_enabled boolean default true;
+alter table business_accounts add column if not exists track_deleted_enabled boolean default true;
+alter table business_accounts add column if not exists track_edited_enabled boolean default true;
+alter table business_accounts add column if not exists media_archive_enabled boolean default true;
+alter table business_accounts add column if not exists media_archive_download boolean default false;
+alter table business_accounts add column if not exists archive_notify_enabled boolean default true;
 alter table business_accounts add column if not exists reports_enabled boolean default true;
 alter table business_accounts add column if not exists ai_intent_enabled boolean default false;
 alter table business_accounts add column if not exists timezone text default 'Asia/Tashkent';
@@ -183,6 +251,58 @@ alter table platform_audit_logs add column if not exists target_account_key text
 alter table platform_audit_logs add column if not exists before_json jsonb default '{}'::jsonb;
 alter table platform_audit_logs add column if not exists after_json jsonb default '{}'::jsonb;
 alter table platform_audit_logs add column if not exists created_at timestamptz default now();
+
+alter table account_custom_commands add column if not exists account_key text;
+alter table account_custom_commands add column if not exists command_key text;
+alter table account_custom_commands add column if not exists title text;
+alter table account_custom_commands add column if not exists description text;
+alter table account_custom_commands add column if not exists trigger_type text default 'slash_command';
+alter table account_custom_commands add column if not exists trigger_patterns jsonb default '[]'::jsonb;
+alter table account_custom_commands add column if not exists response_type text default 'text';
+alter table account_custom_commands add column if not exists response_text text;
+alter table account_custom_commands add column if not exists template_key text;
+alter table account_custom_commands add column if not exists template_sequence jsonb default '[]'::jsonb;
+alter table account_custom_commands add column if not exists flow_key text;
+alter table account_custom_commands add column if not exists step_key text;
+alter table account_custom_commands add column if not exists ai_rule_key text;
+alter table account_custom_commands add column if not exists is_enabled boolean default true;
+alter table account_custom_commands add column if not exists notify_admin boolean default false;
+alter table account_custom_commands add column if not exists stop_after_response boolean default false;
+alter table account_custom_commands add column if not exists sort_order integer default 100;
+alter table account_custom_commands add column if not exists created_by text;
+alter table account_custom_commands add column if not exists updated_by text;
+alter table account_custom_commands add column if not exists created_at timestamptz default now();
+alter table account_custom_commands add column if not exists updated_at timestamptz default now();
+
+alter table custom_command_executions add column if not exists account_key text;
+alter table custom_command_executions add column if not exists command_key text;
+alter table custom_command_executions add column if not exists chat_id text;
+alter table custom_command_executions add column if not exists business_connection_id text;
+alter table custom_command_executions add column if not exists matched boolean default true;
+alter table custom_command_executions add column if not exists user_text text;
+alter table custom_command_executions add column if not exists response_type text;
+alter table custom_command_executions add column if not exists created_at timestamptz default now();
+
+alter table account_ai_rules add column if not exists account_key text;
+alter table account_ai_rules add column if not exists rule_key text;
+alter table account_ai_rules add column if not exists display_name text;
+alter table account_ai_rules add column if not exists flow_key text;
+alter table account_ai_rules add column if not exists step_key text;
+alter table account_ai_rules add column if not exists example_phrases jsonb default '[]'::jsonb;
+alter table account_ai_rules add column if not exists target_intent text;
+alter table account_ai_rules add column if not exists confidence_threshold numeric default 0.7;
+alter table account_ai_rules add column if not exists action text default 'human_needed';
+alter table account_ai_rules add column if not exists response_text text;
+alter table account_ai_rules add column if not exists template_key text;
+alter table account_ai_rules add column if not exists template_sequence jsonb default '[]'::jsonb;
+alter table account_ai_rules add column if not exists next_step text;
+alter table account_ai_rules add column if not exists notify_admin boolean default false;
+alter table account_ai_rules add column if not exists stop_after_action boolean default false;
+alter table account_ai_rules add column if not exists is_enabled boolean default true;
+alter table account_ai_rules add column if not exists created_by text;
+alter table account_ai_rules add column if not exists updated_by text;
+alter table account_ai_rules add column if not exists created_at timestamptz default now();
+alter table account_ai_rules add column if not exists updated_at timestamptz default now();
 
 alter table business_leads add column if not exists account_key text;
 alter table business_leads add column if not exists business_connection_id text;
@@ -479,6 +599,12 @@ create unique index if not exists account_admins_unique_idx on account_admins(ac
 create index if not exists account_admins_user_idx on account_admins(telegram_user_id) where is_active = true;
 create index if not exists platform_audit_logs_created_idx on platform_audit_logs(created_at desc);
 create index if not exists platform_audit_logs_account_idx on platform_audit_logs(target_account_key, created_at desc);
+create unique index if not exists account_custom_commands_unique_idx on account_custom_commands(account_key, command_key);
+create index if not exists account_custom_commands_enabled_idx on account_custom_commands(account_key, is_enabled, sort_order);
+create index if not exists custom_command_executions_account_idx on custom_command_executions(account_key, created_at desc);
+create index if not exists custom_command_executions_command_idx on custom_command_executions(account_key, command_key, created_at desc);
+create unique index if not exists account_ai_rules_unique_idx on account_ai_rules(account_key, rule_key);
+create index if not exists account_ai_rules_enabled_idx on account_ai_rules(account_key, is_enabled, step_key);
 
 insert into bot_accounts (account_key, label, project_name, business_owner_id, admin_chat_id, flow_key, archive_enabled, archive_notify_enabled)
 values ('uzlye', 'UZLYE', 'O‘zbekiston Lider Yoshlari Ensiklopediyasi', null, null, 'uzlye_info_only', true, true)

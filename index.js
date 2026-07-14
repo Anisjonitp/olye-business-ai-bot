@@ -162,6 +162,8 @@ function normalizeAccount(account = {}) {
     bot_enabled: account.bot_enabled !== false,
     auto_reply_enabled: account.auto_reply_enabled !== false,
     archive_enabled: account.archive_enabled !== false,
+    track_deleted_enabled: account.track_deleted_enabled !== false,
+    track_edited_enabled: account.track_edited_enabled !== false,
     archive_notify_enabled: account.archive_notify_enabled !== false,
     reports_enabled: account.reports_enabled !== false,
     media_archive_enabled: account.media_archive_enabled !== false,
@@ -349,6 +351,8 @@ async function bindBusinessConnectionToAccount(accountOrKey, businessConnectionI
     auto_reply_enabled: account.auto_reply_enabled !== false,
     flow_key: account.flow_key || 'info_only',
     archive_enabled: account.archive_enabled !== false,
+    track_deleted_enabled: account.track_deleted_enabled !== false,
+    track_edited_enabled: account.track_edited_enabled !== false,
     archive_notify_enabled: account.archive_notify_enabled !== false,
     reports_enabled: account.reports_enabled !== false,
     media_archive_enabled: account.media_archive_enabled !== false,
@@ -371,6 +375,8 @@ async function bindBusinessConnectionToAccount(accountOrKey, businessConnectionI
     bot_enabled: account.bot_enabled !== false,
     auto_reply_enabled: account.auto_reply_enabled !== false,
     archive_enabled: account.archive_enabled !== false,
+    track_deleted_enabled: account.track_deleted_enabled !== false,
+    track_edited_enabled: account.track_edited_enabled !== false,
     reports_enabled: account.reports_enabled !== false,
     timezone: account.timezone || PLATFORM_DEFAULT_TIMEZONE,
     last_seen_at: new Date().toISOString(),
@@ -400,6 +406,8 @@ const ACCOUNT_BOOLEAN_FIELDS = new Set([
   'bot_enabled',
   'auto_reply_enabled',
   'archive_enabled',
+  'track_deleted_enabled',
+  'track_edited_enabled',
   'archive_notify_enabled',
   'reports_enabled',
   'media_archive_enabled',
@@ -432,6 +440,32 @@ async function upsertAccountPatch(accountOrKey, patch = {}) {
   if (payload.owner_user_id && !payload.business_owner_id) payload.business_owner_id = payload.owner_user_id;
   const { data, error } = await supabase.from('bot_accounts').upsert(payload, { onConflict: 'account_key' }).select().maybeSingle();
   if (error) throw error;
+  const businessPayload = {};
+  for (const field of [
+    'account_key',
+    'label',
+    'project_name',
+    'owner_user_id',
+    'owner_username',
+    'admin_chat_id',
+    'business_connection_id',
+    'bot_enabled',
+    'auto_reply_enabled',
+    'archive_enabled',
+    'track_deleted_enabled',
+    'track_edited_enabled',
+    'media_archive_enabled',
+    'media_archive_download',
+    'archive_notify_enabled',
+    'reports_enabled',
+    'timezone',
+    'last_seen_at',
+    'updated_at'
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(payload, field)) businessPayload[field] = payload[field];
+  }
+  const { error: businessError } = await supabase.from('business_accounts').upsert(businessPayload, { onConflict: 'account_key' });
+  if (businessError && !String(businessError.message || '').includes('does not exist')) console.error('upsertAccountPatch business_accounts:', businessError.message);
   return normalizeAccount(data || { ...account, ...patch });
 }
 
@@ -919,6 +953,203 @@ async function setTemplate(key, body, accountOrKey = null) {
   if (error) throw error;
 }
 
+const RESERVED_CUSTOM_COMMANDS = new Set([
+  'start',
+  'menu',
+  'help',
+  'cancel',
+  'whoami',
+  'settings',
+  'accounts',
+  'commands',
+  'templates',
+  'flow',
+  'airules',
+  'archive',
+  'report',
+  'diagnostics'
+]);
+
+const CUSTOM_TRIGGER_TYPES = new Set(['slash_command', 'keyword', 'exact_text', 'contains_text', 'ai_intent']);
+const CUSTOM_RESPONSE_TYPES = new Set(['text', 'template', 'template_sequence', 'flow_step', 'ai_rule', 'silent', 'human_needed']);
+
+function sanitizeCommandKey(raw = '') {
+  const key = String(raw || '').trim().toLowerCase().replace(/^\//, '').replace(/[^a-z0-9_]/g, '').slice(0, 32);
+  if (!key) return { ok: false, error: 'Buyruq nomi bo‘sh.' };
+  if (RESERVED_CUSTOM_COMMANDS.has(key)) return { ok: false, error: `/${key} global buyruq, uni override qilib bo‘lmaydi.` };
+  return { ok: true, key };
+}
+
+function safeJsonArray(value, fallback = []) {
+  if (Array.isArray(value)) return value;
+  if (!value) return fallback;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : fallback;
+    } catch {
+      return value.split(/[,\n]/).map(x => x.trim()).filter(Boolean);
+    }
+  }
+  return fallback;
+}
+
+function normalizeForMatch(value = '') {
+  return normalize(value).replace(/^\//, '').trim();
+}
+
+async function getCustomCommands(accountOrKey = DEFAULT_ACCOUNT_KEY, includeDisabled = false) {
+  let q = supabase.from('account_custom_commands')
+    .select('*')
+    .eq('account_key', accountKey(accountOrKey))
+    .order('sort_order', { ascending: true })
+    .order('command_key', { ascending: true });
+  if (!includeDisabled) q = q.eq('is_enabled', true);
+  const { data, error } = await q;
+  if (error) {
+    if (!String(error.message || '').includes('does not exist')) console.error('getCustomCommands:', error.message);
+    return [];
+  }
+  return data || [];
+}
+
+async function getCustomCommand(accountOrKey, commandKey, includeDisabled = true) {
+  const sanitized = sanitizeCommandKey(commandKey);
+  if (!sanitized.ok) return null;
+  let q = supabase.from('account_custom_commands')
+    .select('*')
+    .eq('account_key', accountKey(accountOrKey))
+    .eq('command_key', sanitized.key);
+  if (!includeDisabled) q = q.eq('is_enabled', true);
+  const { data, error } = await q.maybeSingle();
+  if (error) {
+    if (!String(error.message || '').includes('does not exist')) console.error('getCustomCommand:', error.message);
+    return null;
+  }
+  return data || null;
+}
+
+async function upsertCustomCommand(accountOrKey, command = {}, actorId = '') {
+  const sanitized = sanitizeCommandKey(command.command_key);
+  if (!sanitized.ok) throw new Error(sanitized.error);
+  const triggerType = CUSTOM_TRIGGER_TYPES.has(command.trigger_type) ? command.trigger_type : 'slash_command';
+  const responseType = CUSTOM_RESPONSE_TYPES.has(command.response_type) ? command.response_type : 'text';
+  const responseText = String(command.response_text || '').slice(0, 3500);
+  const payload = {
+    account_key: accountKey(accountOrKey),
+    command_key: sanitized.key,
+    title: command.title || `/${sanitized.key}`,
+    description: command.description || null,
+    trigger_type: triggerType,
+    trigger_patterns: command.trigger_patterns || [triggerType === 'slash_command' ? `/${sanitized.key}` : sanitized.key],
+    response_type: responseType,
+    response_text: responseText || null,
+    template_key: command.template_key || null,
+    template_sequence: command.template_sequence || [],
+    flow_key: command.flow_key || null,
+    step_key: command.step_key || null,
+    ai_rule_key: command.ai_rule_key || null,
+    is_enabled: command.is_enabled !== false,
+    notify_admin: Boolean(command.notify_admin),
+    stop_after_response: Boolean(command.stop_after_response),
+    sort_order: Number(command.sort_order || 100),
+    updated_by: actorId ? String(actorId) : null,
+    updated_at: new Date().toISOString()
+  };
+  if (actorId) payload.created_by = String(actorId);
+  const { data, error } = await supabase.from('account_custom_commands')
+    .upsert(payload, { onConflict: 'account_key,command_key' })
+    .select()
+    .maybeSingle();
+  if (error) throw error;
+  return data || payload;
+}
+
+function customCommandMatches(command, text = '') {
+  const raw = String(text || '').trim();
+  if (!raw) return false;
+  const norm = normalizeForMatch(raw);
+  const firstWord = normalizeForMatch(raw.split(/\s+/)[0] || '');
+  const patterns = safeJsonArray(command.trigger_patterns, [command.command_key]).map(p => normalizeForMatch(p));
+  if (command.trigger_type === 'slash_command') return firstWord === command.command_key;
+  if (command.trigger_type === 'exact_text') return patterns.some(p => norm === p);
+  if (command.trigger_type === 'contains_text' || command.trigger_type === 'keyword') return patterns.some(p => p && norm.includes(p));
+  return false;
+}
+
+async function findMatchingCustomCommand(accountOrKey, text = '') {
+  const commands = await getCustomCommands(accountOrKey, false);
+  return commands.find(cmd => customCommandMatches(cmd, text)) || null;
+}
+
+function customCommandPreview(command = {}) {
+  const commandKey = command.command_key ? `/${command.command_key}` : '-';
+  const response = command.response_type === 'template'
+    ? `template: ${command.template_key || '-'}`
+    : command.response_type === 'template_sequence'
+      ? `templates: ${(safeJsonArray(command.template_sequence).length ? safeJsonArray(command.template_sequence) : String(command.response_text || '').split(/[,\s]+/).filter(Boolean)).join(', ') || '-'}`
+      : command.response_type === 'flow_step'
+        ? `flow step: ${command.step_key || command.response_text || '-'}`
+        : command.response_type === 'human_needed'
+          ? 'human_needed'
+          : command.response_type === 'silent'
+            ? 'silent'
+            : short(command.response_text || '-', 900);
+  return (
+    `Command: ${commandKey}\n` +
+    `Trigger: ${command.trigger_type || 'slash_command'}\n` +
+    `Response type: ${command.response_type || 'text'}\n` +
+    `Enabled: ${command.is_enabled !== false ? 'true' : 'false'}\n` +
+    `Notify admin: ${command.notify_admin ? 'true' : 'false'}\n` +
+    `Stop after response: ${command.stop_after_response ? 'true' : 'false'}\n\n` +
+    `Response:\n${response}`
+  );
+}
+
+async function logCustomCommandExecution({ command, lead, text, matched = true }) {
+  const { error } = await supabase.from('custom_command_executions').insert({
+    account_key: command.account_key,
+    command_key: command.command_key,
+    chat_id: String(lead.chat_id),
+    business_connection_id: lead.business_connection_id || null,
+    matched,
+    user_text: String(text || '').slice(0, 1200),
+    response_type: command.response_type || 'text',
+    created_at: new Date().toISOString()
+  });
+  if (error && !String(error.message || '').includes('does not exist')) console.error('logCustomCommandExecution:', error.message);
+}
+
+async function executeCustomCommand(command, lead, text) {
+  if (!command || command.is_enabled === false) return false;
+  await logCustomCommandExecution({ command, lead, text });
+  const responseType = command.response_type || 'text';
+  if (responseType === 'text' && command.response_text) {
+    await sendBusinessMessage(lead, command.response_text);
+  } else if (responseType === 'template' && command.template_key) {
+    await sendTemplate(lead, command.template_key);
+  } else if (responseType === 'template_sequence') {
+    for (const key of safeJsonArray(command.template_sequence)) await sendTemplate(lead, key);
+  } else if (responseType === 'flow_step' && command.step_key) {
+    const keys = await flowTemplateKeys(lead.account_key, command.step_key, []);
+    for (const key of keys) await sendTemplate(lead, key);
+  } else if (responseType === 'human_needed') {
+    await updateLead(lead.chat_id, { status: 'needs_admin', stage: STAGE.PAUSED, bot_enabled: false }, lead.account_key);
+  }
+  if (command.notify_admin) {
+    await sendAdmin(
+      `🧩 <b>Custom command ishladi</b>\nAkkaunt: ${html(accountDisplayLabel(lead.account_key))}\nCommand: /${html(command.command_key)}\nChat ID: <code>${html(lead.chat_id)}</code>\nXabar: ${html(short(text, 500))}`,
+      {},
+      lead.account_key
+    );
+  }
+  if (command.stop_after_response) {
+    await updateLead(lead.chat_id, { stage: STAGE.PAUSED, status: 'custom_command_stopped', bot_enabled: false }, lead.account_key);
+  }
+  await logEvent(lead.chat_id, 'custom_command_executed', command.command_key, lead.account_key);
+  return true;
+}
+
 async function getFlowSteps(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const account = await getAccount(accountOrKey);
   let q = supabase.from('account_flow_steps')
@@ -1034,13 +1265,57 @@ async function saveAiDecision({ accountKey: ak, chatId, stage, userText, decisio
   if (error) console.error('saveAiDecision:', error.message);
 }
 
+async function getAccountAiRules(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const { data, error } = await supabase.from('account_ai_rules')
+    .select('*')
+    .eq('account_key', accountKey(accountOrKey))
+    .eq('is_enabled', true)
+    .order('rule_key', { ascending: true })
+    .limit(50);
+  if (error) {
+    if (!String(error.message || '').includes('does not exist')) console.error('getAccountAiRules:', error.message);
+    return [];
+  }
+  return data || [];
+}
+
+async function upsertAccountAiRule(accountOrKey, rule = {}, actorId = '') {
+  const ruleKey = String(rule.rule_key || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 48);
+  if (!ruleKey) throw new Error('rule_key kerak.');
+  const payload = {
+    account_key: accountKey(accountOrKey),
+    rule_key: ruleKey,
+    display_name: rule.display_name || ruleKey,
+    flow_key: rule.flow_key || null,
+    step_key: rule.step_key || null,
+    example_phrases: rule.example_phrases || [],
+    target_intent: rule.target_intent || 'custom',
+    confidence_threshold: Number(rule.confidence_threshold || 0.7),
+    action: rule.action || 'human_needed',
+    response_text: rule.response_text || null,
+    template_key: rule.template_key || null,
+    template_sequence: rule.template_sequence || [],
+    next_step: rule.next_step || null,
+    notify_admin: Boolean(rule.notify_admin),
+    stop_after_action: Boolean(rule.stop_after_action),
+    is_enabled: rule.is_enabled !== false,
+    updated_by: actorId ? String(actorId) : null,
+    updated_at: new Date().toISOString()
+  };
+  if (actorId) payload.created_by = String(actorId);
+  const { data, error } = await supabase.from('account_ai_rules').upsert(payload, { onConflict: 'account_key,rule_key' }).select().maybeSingle();
+  if (error) throw error;
+  return data || payload;
+}
+
 async function classifyWithAI(lead, userText, ruleIntent) {
   if (!(await getAccountAiEnabled(lead.account_key))) return null;
   const steps = await getFlowSteps(lead.account_key);
+  const customRules = await getAccountAiRules(lead.account_key);
   const decision = await callOpenAIJson([
     {
       role: 'system',
-      content: 'Classify Telegram customer replies for an info-only business bot. Never write a reply to the customer. Return strict JSON only with keys: intent, confidence, next_step, template_key, should_stop, reason. Allowed intents: confirm,reject,has_info,needs_info,thanks,interested,price_question,info_request,unclear,stop,complaint,payment_ready,other.'
+      content: 'Classify Telegram customer replies for an info-only business bot. Never write a reply to the customer. Return strict JSON only with keys: intent, confidence, matched_rule_key, next_step, template_key, should_stop, action, reason. Allowed intents: confirm,reject,has_info,needs_info,thanks,interested,price_question,info_request,unclear,stop,complaint,payment_ready,other,custom.'
     },
     {
       role: 'user',
@@ -1059,6 +1334,16 @@ async function classifyWithAI(lead, userText, ruleIntent) {
           next_step_partial: s.next_step_partial,
           next_step_unknown: s.next_step_unknown,
           stop_after_send: s.stop_after_send
+        })),
+        account_ai_rules: customRules.map(r => ({
+          rule_key: r.rule_key,
+          step_key: r.step_key,
+          example_phrases: r.example_phrases,
+          target_intent: r.target_intent,
+          confidence_threshold: r.confidence_threshold,
+          action: r.action,
+          template_key: r.template_key,
+          next_step: r.next_step
         }))
       })
     }
@@ -1724,9 +2009,10 @@ async function maybeArchiveMediaFile(payload) {
 }
 
 async function archiveBusinessMessage(msg, account, direction = 'unknown') {
-  if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false || account?.media_archive_enabled === false) return null;
+  if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false) return null;
   const payload = messageArchivePayload(msg, account, direction, 'created');
   if (!payload.chat_id || !payload.message_id) return null;
+  if (payload.file_id && account?.media_archive_enabled === false) return null;
   const storage = await maybeArchiveMediaFile({
     ...payload,
     media_archive_download: account?.media_archive_download,
@@ -1749,10 +2035,11 @@ async function archiveBusinessMessage(msg, account, direction = 'unknown') {
 async function archiveEditedBusinessMessage(msg) {
   const resolved = await resolveArchiveAccount(msg, msg.message_id, 'edited');
   const account = resolved.account;
-  if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false || account?.media_archive_enabled === false) return;
+  if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false || account?.track_edited_enabled === false) return;
   const direction = isOwnerMessage(msg) ? 'outgoing' : 'incoming';
   const payload = messageArchivePayload(msg, account, direction, 'edited');
   if (!payload.chat_id || !payload.message_id) return;
+  if (payload.file_id && account?.media_archive_enabled === false) return;
 
   const oldRow = resolved.archived || await findArchivedMessage({
     businessConnectionId: payload.business_connection_id,
@@ -1803,7 +2090,7 @@ async function handleDeletedBusinessMessages(update = {}) {
     if (!messageId) continue;
     const resolved = await resolveArchiveAccount(update, messageId, 'deleted');
     const account = resolved.account;
-    if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false || account?.media_archive_enabled === false) continue;
+    if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false || account?.track_deleted_enabled === false) continue;
     const ak = account.account_key;
     let oldRow = resolved.archived || await findArchivedMessage({
       businessConnectionId,
@@ -2163,6 +2450,14 @@ async function handleBusinessMessage(msg) {
   const lead = await upsertLeadBase({ chatId, businessConnectionId, from: msg.from, text: rawText, accountKey: ak });
   if (!lead) return;
 
+  if (text) {
+    const customCommand = await findMatchingCustomCommand(ak, text);
+    if (customCommand) {
+      await executeCustomCommand(customCommand, lead, text);
+      return;
+    }
+  }
+
   if (lead.stage === STAGE.INFO_SENT_FINISHED) {
     await logIgnore(chatId, 'old_finished_chat', rawText, ak);
     await handlePostFinishSignal(lead, msg, rawText);
@@ -2256,6 +2551,12 @@ async function processLeadBatch(initialLead, texts) {
   const aiDecision = ruleIntent === 'unclear' || ['rahmat', 'raxmat', 'qiziqdim', 'tushunarli', 'mayli', 'boladi', 'bo‘ladi', 'ok', 'ho‘p', "ho'p"].some(x => normalize(text).includes(x))
     ? await classifyWithAI(lead, text, ruleIntent)
     : null;
+  if (aiDecision && Number(aiDecision.confidence || 0) < 0.65) {
+    await updateLead(lead.chat_id, { last_user_message: text, last_message_at: new Date().toISOString(), status: 'needs_admin', stage: STAGE.PAUSED, bot_enabled: false }, lead.account_key);
+    await logEvent(lead.chat_id, 'ai_low_confidence_handoff', JSON.stringify(aiDecision).slice(0, 1000), lead.account_key);
+    await sendAdmin(`⚠️ <b>AI confidence past</b>\nChat ID: <code>${lead.chat_id}</code>\nXabar: ${html(text)}\nBot to‘xtadi, qo‘lda davom ettiring.`, {}, lead.account_key);
+    return;
+  }
   const intent = mapAiIntentToRuleIntent(aiDecision, lead.stage, ruleIntent);
   await updateLead(lead.chat_id, { last_user_message: text, last_message_at: new Date().toISOString() }, lead.account_key);
   await logEvent(lead.chat_id, `intent_${intent}_${lead.stage}`, text, lead.account_key);
@@ -2760,6 +3061,122 @@ async function sendTemplateActions(chatId, templateKey, accountOrKey = DEFAULT_A
   });
 }
 
+async function sendCommandsMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = await getAccount(accountOrKey);
+  const commands = await getCustomCommands(account.account_key, true);
+  const rows = [
+    [{ text: '📋 Buyruqlar ro‘yxati', callback_data: 'cmd_list' }],
+    [{ text: '➕ Buyruq qo‘shish', callback_data: 'cmd_add' }]
+  ];
+  for (const cmd of commands.slice(0, 20)) {
+    rows.push([{ text: `${cmd.is_enabled === false ? '🔴' : '🟢'} /${cmd.command_key}`, callback_data: `cmd_open:${cmd.command_key}` }]);
+  }
+  rows.push([{ text: '⬅️ Orqaga', callback_data: 'menu' }]);
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `Joriy akkaunt: ${account.label || account.account_key}\n\n🧩 Buyruqlar`,
+    reply_markup: { inline_keyboard: rows }
+  });
+}
+
+async function sendCommandDetail(chatId, accountOrKey, commandKey) {
+  const account = await getAccount(accountOrKey);
+  const command = await getCustomCommand(account.account_key, commandKey, true);
+  if (!command) return tg('sendMessage', { chat_id: chatId, text: 'Buyruq topilmadi.' });
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `Joriy akkaunt: ${account.label || account.account_key}\n\n${customCommandPreview(command)}`,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '👁 Ko‘rish', callback_data: `cmd_view:${command.command_key}` }],
+        [{ text: '✏️ Javobni tahrirlash', callback_data: `cmd_editresp:${command.command_key}` }],
+        [{ text: command.is_enabled === false ? '🟢 Yoqish' : '🔴 O‘chirish', callback_data: `cmd_toggle:${command.command_key}` }],
+        [{ text: '🧪 Test', callback_data: `cmd_test:${command.command_key}` }],
+        [{ text: '🗑 O‘chirish', callback_data: `cmd_delete:${command.command_key}` }],
+        [{ text: '⬅️ Buyruqlar', callback_data: 'commands_menu' }]
+      ]
+    }
+  });
+}
+
+async function showCommandPreviewForSession(chatId, payload = {}) {
+  const command = {
+    command_key: payload.command_key,
+    trigger_type: payload.trigger_type || 'slash_command',
+    trigger_patterns: payload.trigger_patterns || [`/${payload.command_key}`],
+    response_type: payload.response_type || 'text',
+    response_text: payload.response_text || '',
+    template_key: payload.template_key || null,
+    template_sequence: payload.template_sequence || [],
+    step_key: payload.step_key || null,
+    is_enabled: true,
+    notify_admin: Boolean(payload.notify_admin),
+    stop_after_response: Boolean(payload.stop_after_response)
+  };
+  await setAdminSession(chatId, 'custom_command_preview', payload);
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `${customCommandPreview(command)}\n\nSaqlaysizmi?`,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '✅ Saqlash', callback_data: 'cmd_save' }, { text: '✏️ Qayta tahrirlash', callback_data: 'cmd_retry' }],
+        [{ text: '❌ Bekor qilish', callback_data: 'cmd_cancel' }]
+      ]
+    }
+  });
+}
+
+async function sendArchiveSettingsMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = await getAccount(accountOrKey);
+  const row = (label, field, enabled) => ([{ text: `${enabled ? '🟢' : '🔴'} ${label}`, callback_data: `archive_toggle:${field}` }]);
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `Joriy akkaunt: ${account.label || account.account_key}\n\n` +
+      `🕵️ Arxiv sozlamalari\n\n` +
+      `Arxiv: ${account.archive_enabled !== false ? 'ON' : 'OFF'}\n` +
+      `Deleted tracking: ${account.track_deleted_enabled !== false ? 'ON' : 'OFF'}\n` +
+      `Edited tracking: ${account.track_edited_enabled !== false ? 'ON' : 'OFF'}\n` +
+      `Media archive: ${account.media_archive_enabled !== false ? 'ON' : 'OFF'}\n` +
+      `Admin notification: ${account.archive_notify_enabled !== false ? 'ON' : 'OFF'}\n` +
+      `Media download: ${account.media_archive_download ? 'ON' : 'OFF'}`,
+    reply_markup: {
+      inline_keyboard: [
+        row('Arxiv yoqilgan / o‘chirilgan', 'archive_enabled', account.archive_enabled !== false),
+        row('O‘chirilgan xabarlarni kuzatish', 'track_deleted_enabled', account.track_deleted_enabled !== false),
+        row('Tahrirlangan xabarlarni kuzatish', 'track_edited_enabled', account.track_edited_enabled !== false),
+        row('Media arxiv', 'media_archive_enabled', account.media_archive_enabled !== false),
+        row('Admin notification', 'archive_notify_enabled', account.archive_notify_enabled !== false),
+        row('Media download', 'media_archive_download', Boolean(account.media_archive_download)),
+        [{ text: '⬅️ Orqaga', callback_data: 'menu' }]
+      ]
+    }
+  });
+}
+
+async function sendAiRulesMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = await getAccount(accountOrKey);
+  const { data, error } = await supabase.from('account_ai_rules')
+    .select('rule_key,display_name,step_key,target_intent,action,is_enabled')
+    .eq('account_key', account.account_key)
+    .order('rule_key', { ascending: true })
+    .limit(20);
+  const rows = [
+    [{ text: '📋 Qoidalar ro‘yxati', callback_data: 'airules_list' }],
+    [{ text: '➕ Qoida qo‘shish', callback_data: 'airule_add' }],
+    [{ text: '🧪 AI test', callback_data: 'airule_test' }],
+    [{ text: '⬅️ Orqaga', callback_data: 'menu' }]
+  ];
+  const list = error
+    ? `AI qoidalar o‘qilmadi: ${error.message}`
+    : (data || []).map((r, i) => `${i + 1}. ${r.is_enabled === false ? '🔴' : '🟢'} ${r.rule_key} — ${r.target_intent || '-'} -> ${r.action || '-'}`).join('\n') || 'Hozircha qoida yo‘q.';
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `Joriy akkaunt: ${account.label || account.account_key}\n\n🧠 AI qoidalar\n\n${list}`,
+    reply_markup: { inline_keyboard: rows }
+  });
+}
+
 async function showAiTemplatePreview(chatId, accountOrKey, templateKey, roughText) {
   const result = await improveTemplateWithAI({ accountKey: accountKey(accountOrKey), templateKey, roughText });
   const edited = result?.text;
@@ -2885,6 +3302,12 @@ async function sendPlatformDashboard(chatId) {
   const accountsWithErrors = accounts.filter(a => a.bot_enabled === false).length;
   const aiEnabledAccounts = accounts.filter(a => a.auto_reply_enabled !== false).length;
   const archiveEnabledAccounts = accounts.filter(a => a.archive_enabled !== false).length;
+  const commandsTotal = await countCustomCommands();
+  const commandsToday = await countCustomCommandExecutions(q => q.gte('created_at', `${localDateKey()}T00:00:00+00:00`));
+  const editedTrackingAccounts = accounts.filter(a => a.track_edited_enabled !== false).length;
+  const deletedTrackingAccounts = accounts.filter(a => a.track_deleted_enabled !== false).length;
+  const aiToday = await countAiDecisionsToday();
+  const humanNeededToday = await countLeads(q => q.in('status', ['needs_admin', 'pending_approval']).gte('last_message_at', `${localDateKey()}T00:00:00+00:00`));
   return adminTg('sendMessage', {
     chat_id: chatId,
     parse_mode: 'HTML',
@@ -2900,11 +3323,18 @@ async function sendPlatformDashboard(chatId) {
       `Bugun media arxivlari: ${mediaToday}\n` +
       `Bugun aktiv chatlar: ${activeChatsToday}\n` +
       `Xatoliklar bilan akkauntlar: ${accountsWithErrors}\n` +
+      `Custom commands: ${commandsTotal}\n` +
+      `Bugun command executions: ${commandsToday}\n` +
       `AI yoqilgan akkauntlar: ${aiEnabledAccounts}\n` +
-      `Arxiv yoqilgan akkauntlar: ${archiveEnabledAccounts}`,
+      `Bugun AI decisions: ${aiToday}\n` +
+      `Bugun human_needed: ${humanNeededToday}\n` +
+      `Arxiv yoqilgan akkauntlar: ${archiveEnabledAccounts}\n` +
+      `Deleted tracking: ${deletedTrackingAccounts}\n` +
+      `Edited tracking: ${editedTrackingAccounts}`,
     reply_markup: {
       inline_keyboard: [
         [{ text: '👥 Akkauntlar', callback_data: 'platform_accounts' }],
+        [{ text: '🧩 Buyruqlar', callback_data: 'platform_commands' }],
         [{ text: '📈 Bugungi hisobot', callback_data: 'platform_today_report' }],
         [{ text: '🩺 Diagnostika', callback_data: 'platform_diagnostics' }]
       ]
@@ -2926,7 +3356,9 @@ async function sendPlatformAccounts(chatId) {
 async function sendPlatformAccountDetail(chatId, accountKey) {
   const account = await getAccount(accountKey);
   const rows = [
+    [{ text: '🧩 Buyruqlar', callback_data: `platform_commands:${account.account_key}` }],
     [{ text: '🕵️ Arxiv', callback_data: `platform_archive:${account.account_key}` }],
+    [{ text: '🕵️ Arxiv sozlamalari', callback_data: `platform_archive_settings:${account.account_key}` }],
     [{ text: '📈 Hisobot', callback_data: `platform_report:${account.account_key}` }],
     [{ text: '✏️ Shablonlar', callback_data: `platform_templates:${account.account_key}` }],
     [{ text: '🔁 Flow', callback_data: `platform_flow:${account.account_key}` }],
@@ -2935,6 +3367,8 @@ async function sendPlatformAccountDetail(chatId, accountKey) {
     [{ text: '🚫 Bloklash', callback_data: `platform_suspend:${account.account_key}` }],
     [{ text: '✅ Yoqish', callback_data: `platform_unsuspend:${account.account_key}` }],
     [{ text: '🧪 Test notification', callback_data: `platform_testnotify:${account.account_key}` }],
+    [{ text: '🧪 Test command', callback_data: `platform_testcommand:${account.account_key}` }],
+    [{ text: '🧪 Test AI rule', callback_data: `platform_testai:${account.account_key}` }],
     [{ text: '⬅️ Orqaga', callback_data: 'platform_accounts' }]
   ];
   return adminTg('sendMessage', {
@@ -2951,6 +3385,8 @@ async function sendPlatformAccountDetail(chatId, accountKey) {
       `bot_enabled: ${account.bot_enabled !== false ? 'true' : 'false'}\n` +
       `auto_reply_enabled: ${account.auto_reply_enabled !== false ? 'true' : 'false'}\n` +
       `archive_enabled: ${account.archive_enabled !== false ? 'true' : 'false'}\n` +
+      `track_deleted_enabled: ${account.track_deleted_enabled !== false ? 'true' : 'false'}\n` +
+      `track_edited_enabled: ${account.track_edited_enabled !== false ? 'true' : 'false'}\n` +
       `reports_enabled: ${account.reports_enabled !== false ? 'true' : 'false'}\n` +
       `ai_intent_enabled: ${await getAccountAiEnabled(account.account_key)}\n` +
       `total chats: ${await countLeads(null, account.account_key)}\n` +
@@ -2982,11 +3418,12 @@ async function sendPlatformMainMenu(chatId) {
       inline_keyboard: [
         [{ text: '📊 Umumiy dashboard', callback_data: 'platform_main' }],
         [{ text: '👥 Akkauntlar', callback_data: 'platform_accounts' }],
-        [{ text: '🔎 Akkaunt qidirish', callback_data: 'platform_search' }],
-        [{ text: '🕵️ Arxivlar', callback_data: 'platform_archive' }],
+        [{ text: '🧩 Buyruqlar', callback_data: 'platform_commands' }],
+        [{ text: '🔁 Flowlar', callback_data: 'platform_flow' }],
+        [{ text: '✏️ Shablonlar', callback_data: 'platform_templates' }],
+        [{ text: '🧠 AI qoidalar', callback_data: 'platform_ai' }],
+        [{ text: '🕵️ Arxiv sozlamalari', callback_data: 'platform_archive_settings' }],
         [{ text: '📈 Hisobotlar', callback_data: 'platform_reports' }],
-        [{ text: '⚙️ Sozlamalar', callback_data: 'platform_settings' }],
-        [{ text: '🧠 AI boshqaruv', callback_data: 'platform_ai' }],
         [{ text: '🚫 Bloklanganlar', callback_data: 'platform_suspended' }],
         [{ text: '🧾 Audit log', callback_data: 'platform_audit' }],
         [{ text: '🩺 Diagnostika', callback_data: 'platform_diagnostics' }]
@@ -3020,17 +3457,17 @@ async function sendPlatformAuditLog(chatId) {
 
 async function sendPlatformAirules(chatId, accountOrKey) {
   const account = await getAccount(accountOrKey);
-  const { data, error } = await supabase.from('account_reply_rules')
-    .select('flow_key,step_key,intent,template_key,next_step,should_stop,is_active')
+  const { data, error } = await supabase.from('account_ai_rules')
+    .select('rule_key,step_key,target_intent,action,template_key,next_step,stop_after_action,is_enabled')
     .eq('account_key', account.account_key)
-    .order('step_key', { ascending: true })
+    .order('rule_key', { ascending: true })
     .limit(30);
   if (error) {
     return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\nAI qoidalar o‘qilmadi: ${error.message}` });
   }
   const rows = data || [];
   const text = rows.length
-    ? rows.map((r, i) => `${i + 1}. ${r.step_key || '-'} / ${r.intent || '-'} -> ${r.template_key || r.next_step || '-'} stop:${r.should_stop ? 'true' : 'false'} active:${r.is_active !== false ? 'true' : 'false'}`).join('\n')
+    ? rows.map((r, i) => `${i + 1}. ${r.rule_key || '-'} / ${r.target_intent || '-'} -> ${r.action || r.template_key || r.next_step || '-'} stop:${r.stop_after_action ? 'true' : 'false'} active:${r.is_enabled !== false ? 'true' : 'false'}`).join('\n')
     : 'AI rule yozuvlari yo‘q.';
   return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\n🧠 AI rules\nAkkaunt: ${account.label || account.account_key}\n\n${text}` });
 }
@@ -3056,6 +3493,8 @@ async function sendPlatformReport(chatId, accountOrKey, title = '📈 Hisobot') 
   const chats = await countUniqueArchiveChats(account.account_key);
   const autoReplies = await countLeads(q => q.eq('stage', STAGE.INFO_SENT_FINISHED), account.account_key);
   const humanNeeded = await countLeads(q => q.in('status', ['needs_admin', 'pending_approval']), account.account_key);
+  const commandExecutions = await countCustomCommandExecutions(null, account.account_key);
+  const topCommands = await topCustomCommands(account.account_key);
   return adminTg('sendMessage', {
     chat_id: chatId,
     text:
@@ -3066,7 +3505,10 @@ async function sendPlatformReport(chatId, accountOrKey, title = '📈 Hisobot') 
       `deleted: ${deleted}\n` +
       `edited: ${edited}\n` +
       `media: ${media}\n` +
+      `custom command executions: ${commandExecutions}\n` +
+      `top commands: ${topCommands.length ? topCommands.map(([k, v]) => `/${k} (${v})`).join(', ') : '-'}\n` +
       `AI handled: ${await countAiDecisions(account.account_key)}\n` +
+      `AI low-confidence handoffs: ${await countLeads(q => q.eq('status', 'needs_admin'), account.account_key)}\n` +
       `human_needed: ${humanNeeded}\n` +
       `auto replies: ${autoReplies}`
   });
@@ -3081,6 +3523,128 @@ async function countAiDecisions(accountOrKey = DEFAULT_ACCOUNT_KEY) {
     return 0;
   }
   return count || 0;
+}
+
+async function countAiDecisionsToday(accountOrKey = null) {
+  let q = supabase.from('ai_decisions').select('*', { count: 'exact', head: true }).gte('created_at', `${localDateKey()}T00:00:00+00:00`);
+  if (accountOrKey) q = accountLeadFilter(q, accountOrKey);
+  const { count, error } = await q;
+  if (error) {
+    console.error('countAiDecisionsToday:', error.message);
+    return 0;
+  }
+  return count || 0;
+}
+
+async function countCustomCommands(accountOrKey = null) {
+  let q = supabase.from('account_custom_commands').select('*', { count: 'exact', head: true });
+  if (accountOrKey) q = q.eq('account_key', accountKey(accountOrKey));
+  const { count, error } = await q;
+  if (error) {
+    if (!String(error.message || '').includes('does not exist')) console.error('countCustomCommands:', error.message);
+    return 0;
+  }
+  return count || 0;
+}
+
+async function countCustomCommandExecutions(apply = null, accountOrKey = null) {
+  let q = supabase.from('custom_command_executions').select('*', { count: 'exact', head: true });
+  if (accountOrKey) q = q.eq('account_key', accountKey(accountOrKey));
+  if (apply) q = apply(q);
+  const { count, error } = await q;
+  if (error) {
+    if (!String(error.message || '').includes('does not exist')) console.error('countCustomCommandExecutions:', error.message);
+    return 0;
+  }
+  return count || 0;
+}
+
+async function topCustomCommands(accountOrKey = DEFAULT_ACCOUNT_KEY, limit = 5) {
+  const { data, error } = await supabase.from('custom_command_executions')
+    .select('command_key')
+    .eq('account_key', accountKey(accountOrKey))
+    .limit(1000);
+  if (error) {
+    if (!String(error.message || '').includes('does not exist')) console.error('topCustomCommands:', error.message);
+    return [];
+  }
+  const counts = new Map();
+  for (const row of data || []) counts.set(row.command_key, (counts.get(row.command_key) || 0) + 1);
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit);
+}
+
+async function sendPlatformCommands(chatId, accountOrKey = null) {
+  if (!accountOrKey) {
+    const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY);
+    const rows = [];
+    for (const account of accounts) {
+      rows.push(`${account.label || account.account_key}: ${await countCustomCommands(account.account_key)} commands`);
+    }
+    return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\n🧩 Buyruqlar\n\n${rows.join('\n') || 'Command yo‘q.'}` });
+  }
+  const account = await getAccount(accountOrKey);
+  const commands = await getCustomCommands(account.account_key, true);
+  const text = commands.length
+    ? commands.map((c, i) => `${i + 1}. ${c.is_enabled === false ? '🔴' : '🟢'} /${c.command_key} — ${c.response_type || 'text'}`).join('\n')
+    : 'Command yo‘q.';
+  return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\n🧩 Buyruqlar\nAkkaunt: ${account.label || account.account_key}\n\n${text}` });
+}
+
+async function setPlatformCommandEnabled({ chatId, adminUser, accountKey: ak, commandKey, enabled }) {
+  const command = await getCustomCommand(ak, commandKey, true);
+  if (!command) return adminTg('sendMessage', { chat_id: chatId, text: `Command topilmadi: /${commandKey}` });
+  const after = await upsertCustomCommand(ak, { ...command, is_enabled: enabled }, adminUser?.id);
+  await logPlatformAudit({
+    adminUserId: adminUser?.id,
+    adminUsername: adminUser?.username,
+    action: enabled ? 'command_enable' : 'command_disable',
+    targetAccountKey: ak,
+    beforeJson: command,
+    afterJson: after
+  });
+  return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\n/${after.command_key}: ${enabled ? 'ON' : 'OFF'}` });
+}
+
+async function sendPlatformCommandTest(chatId, accountOrKey, sampleText) {
+  const command = await findMatchingCustomCommand(accountOrKey, sampleText);
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `🧭 Platform Admin Bot\n\n🧪 Test command\n` +
+      `Akkaunt: ${accountOrKey}\n` +
+      `Text: ${sampleText || '-'}\n\n` +
+      (command ? customCommandPreview(command) : 'Mos command topilmadi.')
+  });
+}
+
+async function sendPlatformArchiveSettings(chatId, accountOrKey) {
+  const account = await getAccount(accountOrKey);
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `🧭 Platform Admin Bot\n\n🕵️ Arxiv sozlamalari\n` +
+      `Akkaunt: ${account.label || account.account_key}\n\n` +
+      `archive_enabled: ${account.archive_enabled !== false}\n` +
+      `track_deleted_enabled: ${account.track_deleted_enabled !== false}\n` +
+      `track_edited_enabled: ${account.track_edited_enabled !== false}\n` +
+      `media_archive_enabled: ${account.media_archive_enabled !== false}\n` +
+      `media_archive_download: ${Boolean(account.media_archive_download)}\n` +
+      `archive_notify_enabled: ${account.archive_notify_enabled !== false}`
+  });
+}
+
+async function setPlatformAccountBoolean({ chatId, adminUser, accountKey: ak, field, value, action }) {
+  const before = await getAccount(ak);
+  const after = await setAccountField(ak, field, value ? 'true' : 'false');
+  await logPlatformAudit({
+    adminUserId: adminUser?.id,
+    adminUsername: adminUser?.username,
+    action,
+    targetAccountKey: ak,
+    beforeJson: before,
+    afterJson: after
+  });
+  return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\n${ak}.${field} = ${value ? 'ON' : 'OFF'}` });
 }
 
 async function setPlatformAccountSuspension({ chatId, adminUser, accountKey: ak, suspended }) {
@@ -3126,9 +3690,11 @@ async function sendPlatformTestNotification(chatId, accountKey, adminUser = {}) 
 function mainMenuKeyboard(showAccounts = false) {
   const rows = [
       ...(showAccounts ? [[{ text: '👤 Akkaunt tanlash', callback_data: 'accounts' }]] : []),
+      [{ text: '🧩 Buyruqlar', callback_data: 'commands_menu' }],
       [{ text: '✏️ Shablonlar', callback_data: 'templates' }],
       [{ text: '🔁 Ketma-ketlik', callback_data: 'flow_menu' }, { text: '🤖 AI sozlamalari', callback_data: 'ai_menu' }],
-      [{ text: '🧠 Javob qoidalari', callback_data: 'rules_menu' }, { text: '🕵️ Arxiv', callback_data: 'archive_menu' }],
+      [{ text: '🧠 AI qoidalar', callback_data: 'rules_menu' }, { text: '🕵️ Arxiv', callback_data: 'archive_menu' }],
+      [{ text: '🕵️ Arxiv sozlamalari', callback_data: 'archive_settings' }],
       [{ text: '📊 Diagnostika', callback_data: 'diagnostics' }, { text: '⚙️ Auto javob', callback_data: 'outreach_menu' }],
       [{ text: '📄 Ma’lumot yuborilganlar', callback_data: 'list:info_sent' }],
       [{ text: '✅ Tanishdim yozganlar', callback_data: 'list:read' }, { text: '💳 To‘lovga yaqinlar', callback_data: 'list:payment' }],
@@ -3279,17 +3845,55 @@ async function handlePlatformAdminMessage(msg) {
   if (text === '/diagnostics') return sendPlatformDiagnostics(chatId);
   if (text === '/audit') return sendPlatformAuditLog(chatId);
   if (text === '/reportall') return sendReportAllPlatform(chatId);
+  if (text === '/commands') return sendPlatformCommands(chatId);
   if (text === '/cancel') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nBekor qilindi.' });
 
   if (text.startsWith('/account ')) return sendPlatformAccountDetail(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/commands ')) return sendPlatformCommands(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/command ')) {
+    const [, ak, commandKey] = text.split(/\s+/);
+    const command = await getCustomCommand(ak, commandKey, true);
+    return adminTg('sendMessage', { chat_id: chatId, text: command ? `🧭 Platform Admin Bot\n\n${customCommandPreview(command)}` : `Command topilmadi: ${ak}/${commandKey}` });
+  }
+  if (text.startsWith('/commandon ')) {
+    const [, ak, commandKey] = text.split(/\s+/);
+    return setPlatformCommandEnabled({ chatId, adminUser: from, accountKey: ak, commandKey, enabled: true });
+  }
+  if (text.startsWith('/commandoff ')) {
+    const [, ak, commandKey] = text.split(/\s+/);
+    return setPlatformCommandEnabled({ chatId, adminUser: from, accountKey: ak, commandKey, enabled: false });
+  }
+  if (text.startsWith('/testcommand ')) {
+    const [, ak, ...rest] = text.split(/\s+/);
+    return sendPlatformCommandTest(chatId, ak, rest.join(' '));
+  }
   if (text.startsWith('/archive ')) return sendPlatformArchivePeopleMenu(chatId, text.split(/\s+/)[1]);
   if (text.startsWith('/report ')) return sendPlatformReport(chatId, text.split(/\s+/)[1], '📈 Hisobot');
   if (text.startsWith('/settings ')) return sendPlatformAccountDetail(chatId, text.split(/\s+/)[1]);
   if (text.startsWith('/templates ')) return sendPlatformTemplatesSummary(chatId, text.split(/\s+/)[1]);
   if (text.startsWith('/flow ')) return sendPlatformFlow(chatId, text.split(/\s+/)[1]);
   if (text.startsWith('/airules ')) return sendPlatformAirules(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/testai ')) {
+    const [, ak, stepKey, ...rest] = text.split(/\s+/);
+    const fakeLead = { account_key: ak, chat_id: 'test', stage: stepKey, last_bot_message: '', last_admin_message: '' };
+    const decision = await classifyWithAI(fakeLead, rest.join(' '), classify(rest.join(' '), stepKey));
+    return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\nAI test\n${JSON.stringify(decision || { ok: false, reason: 'AI unavailable' }, null, 2)}` });
+  }
+  if (text.startsWith('/archivesettings ')) return sendPlatformArchiveSettings(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/archiveon ')) return setPlatformAccountBoolean({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], field: 'archive_enabled', value: true, action: 'archive_on' });
+  if (text.startsWith('/archiveoff ')) return setPlatformAccountBoolean({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], field: 'archive_enabled', value: false, action: 'archive_off' });
+  if (text.startsWith('/deletedon ')) return setPlatformAccountBoolean({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], field: 'track_deleted_enabled', value: true, action: 'deleted_tracking_on' });
+  if (text.startsWith('/deletedoff ')) return setPlatformAccountBoolean({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], field: 'track_deleted_enabled', value: false, action: 'deleted_tracking_off' });
+  if (text.startsWith('/editedon ')) return setPlatformAccountBoolean({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], field: 'track_edited_enabled', value: true, action: 'edited_tracking_on' });
+  if (text.startsWith('/editedoff ')) return setPlatformAccountBoolean({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], field: 'track_edited_enabled', value: false, action: 'edited_tracking_off' });
+  if (text.startsWith('/mediaon ') || text.startsWith('/medianon ')) return setPlatformAccountBoolean({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], field: 'media_archive_enabled', value: true, action: 'media_archive_on' });
+  if (text.startsWith('/mediaoff ')) return setPlatformAccountBoolean({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], field: 'media_archive_enabled', value: false, action: 'media_archive_off' });
+  if (text.startsWith('/notifyon ')) return setPlatformAccountBoolean({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], field: 'archive_notify_enabled', value: true, action: 'archive_notify_on' });
+  if (text.startsWith('/notifyoff ')) return setPlatformAccountBoolean({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], field: 'archive_notify_enabled', value: false, action: 'archive_notify_off' });
   if (text.startsWith('/suspend ')) return setPlatformAccountSuspension({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], suspended: true });
   if (text.startsWith('/unsuspend ')) return setPlatformAccountSuspension({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], suspended: false });
+  if (text.startsWith('/boton ')) return setPlatformAccountBoolean({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], field: 'bot_enabled', value: true, action: 'bot_on' });
+  if (text.startsWith('/botoff ')) return setPlatformAccountBoolean({ chatId, adminUser: from, accountKey: text.split(/\s+/)[1], field: 'bot_enabled', value: false, action: 'bot_off' });
   if (text.startsWith('/testnotify ')) return sendPlatformTestNotification(chatId, text.split(/\s+/)[1], from);
 
   return adminTg('sendMessage', {
@@ -3381,15 +3985,21 @@ async function handlePlatformCallback(cb) {
   if (data === 'platform_main') return sendPlatformDashboard(chatId);
   if (data === 'platform_accounts') return sendPlatformAccounts(chatId);
   if (data === 'platform_diagnostics') return sendPlatformDiagnostics(chatId);
+  if (data === 'platform_commands') return sendPlatformCommands(chatId);
   if (data === 'platform_search') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nQidirish: /account ACCOUNT_KEY' });
   if (data === 'platform_archive') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nArxiv: /archive ACCOUNT_KEY' });
   if (data === 'platform_reports' || data === 'platform_today_report') return sendReportAllPlatform(chatId);
   if (data === 'platform_settings') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nSozlamalar: /settings ACCOUNT_KEY' });
+  if (data === 'platform_templates') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nShablonlar: /templates ACCOUNT_KEY' });
+  if (data === 'platform_flow') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nFlow: /flow ACCOUNT_KEY' });
   if (data === 'platform_ai') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nAI rules: /airules ACCOUNT_KEY' });
+  if (data === 'platform_archive_settings') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nArxiv sozlamalari: /archivesettings ACCOUNT_KEY' });
   if (data === 'platform_suspended') return sendPlatformSuspendedAccounts(chatId);
   if (data === 'platform_audit') return sendPlatformAuditLog(chatId);
   if (data.startsWith('platform_account:')) return sendPlatformAccountDetail(chatId, data.split(':')[1]);
+  if (data.startsWith('platform_commands:')) return sendPlatformCommands(chatId, data.split(':')[1]);
   if (data.startsWith('platform_archive:')) return sendPlatformArchivePeopleMenu(chatId, data.split(':')[1]);
+  if (data.startsWith('platform_archive_settings:')) return sendPlatformArchiveSettings(chatId, data.split(':')[1]);
   if (data.startsWith('platform_report:')) return sendPlatformReport(chatId, data.split(':')[1], '📈 Hisobot');
   if (data.startsWith('platform_templates:')) return sendPlatformTemplatesSummary(chatId, data.split(':')[1]);
   if (data.startsWith('platform_flow:')) return sendPlatformFlow(chatId, data.split(':')[1]);
@@ -3398,6 +4008,8 @@ async function handlePlatformCallback(cb) {
   if (data.startsWith('platform_suspend:')) return setPlatformAccountSuspension({ chatId, adminUser: from, accountKey: data.split(':')[1], suspended: true });
   if (data.startsWith('platform_unsuspend:')) return setPlatformAccountSuspension({ chatId, adminUser: from, accountKey: data.split(':')[1], suspended: false });
   if (data.startsWith('platform_testnotify:')) return sendPlatformTestNotification(chatId, data.split(':')[1], from);
+  if (data.startsWith('platform_testcommand:')) return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\nTest command:\n/testcommand ${data.split(':')[1]} TEXT` });
+  if (data.startsWith('platform_testai:')) return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\nTest AI:\n/testai ${data.split(':')[1]} STEP_KEY TEXT` });
   if (data.startsWith('platform_archp:')) {
     const [, ak, targetChatId] = data.split(':');
     return sendPlatformArchivePersonEvents(chatId, ak, targetChatId);
@@ -3429,6 +4041,79 @@ async function handleAdminMessage(msg) {
   if (session?.mode === 'ai_template_input' && !text.startsWith('/')) {
     const payload = session.payload || {};
     return showAiTemplatePreview(chatId, payload.selected_account_key || selectedAccountKey, payload.template_key, text);
+  }
+
+  if (session?.mode === 'custom_command_key_input' && !text.startsWith('/')) {
+    const sanitized = sanitizeCommandKey(text);
+    if (!sanitized.ok) return tg('sendMessage', { chat_id: chatId, text: `⚠️ ${sanitized.error}\nMasalan: narx` });
+    await setAdminSession(chatId, 'custom_command_trigger_select', {
+      selected_account_key: selectedAccountKey,
+      command_key: sanitized.key
+    });
+    return tg('sendMessage', {
+      chat_id: chatId,
+      text: `/${sanitized.key}\n\nTrigger turini tanlang:`,
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: 'Slash command', callback_data: 'cmd_trigger:slash_command' }],
+          [{ text: 'Kalit so‘z', callback_data: 'cmd_trigger:keyword' }],
+          [{ text: 'Aniq matn', callback_data: 'cmd_trigger:exact_text' }],
+          [{ text: 'Matn ichida bo‘lsa', callback_data: 'cmd_trigger:contains_text' }],
+          [{ text: 'AI intent', callback_data: 'cmd_trigger:ai_intent' }],
+          [{ text: '❌ Bekor qilish', callback_data: 'cmd_cancel' }]
+        ]
+      }
+    });
+  }
+
+  if (session?.mode === 'custom_command_response_text' && !text.startsWith('/')) {
+    const payload = { ...(session.payload || {}), response_text: text.slice(0, 3500) };
+    return showCommandPreviewForSession(chatId, payload);
+  }
+
+  if (session?.mode === 'custom_command_edit_response' && !text.startsWith('/')) {
+    const payload = session.payload || {};
+    const command = await getCustomCommand(payload.selected_account_key || selectedAccountKey, payload.command_key, true);
+    if (!command) return tg('sendMessage', { chat_id: chatId, text: 'Buyruq topilmadi.' });
+    await upsertCustomCommand(payload.selected_account_key || selectedAccountKey, { ...command, response_text: text, response_type: 'text' }, from.id);
+    await setAdminSession(chatId, 'account_selected', { selected_account_key: payload.selected_account_key || selectedAccountKey });
+    return tg('sendMessage', { chat_id: chatId, text: `✅ /${command.command_key} javobi yangilandi.` });
+  }
+
+  if (session?.mode === 'custom_command_test_input' && !text.startsWith('/')) {
+    const payload = session.payload || {};
+    const accountKeyForTest = payload.selected_account_key || selectedAccountKey;
+    const command = payload.command_key
+      ? await getCustomCommand(accountKeyForTest, payload.command_key, true)
+      : await findMatchingCustomCommand(accountKeyForTest, text);
+    const matched = command && customCommandMatches(command, text);
+    await setAdminSession(chatId, 'account_selected', { selected_account_key: accountKeyForTest });
+    return tg('sendMessage', {
+      chat_id: chatId,
+      text:
+        `🧪 Buyruq testi\n\n` +
+        `matched command: ${matched ? '/' + command.command_key : '-'}\n` +
+        `response type: ${matched ? command.response_type : '-'}\n` +
+        `notify admin: ${matched && command.notify_admin ? 'true' : 'false'}\n\n` +
+        `Response preview:\n${matched ? customCommandPreview(command) : 'Mos buyruq topilmadi.'}`
+    });
+  }
+
+  if (session?.mode === 'ai_rule_test_input' && !text.startsWith('/')) {
+    const payload = session.payload || {};
+    const fakeLead = { account_key: payload.selected_account_key || selectedAccountKey, chat_id: 'test', stage: payload.step_key || STAGE.ASKED_APPLICATION, last_bot_message: '', last_admin_message: '' };
+    const decision = await classifyWithAI(fakeLead, text, classify(text, fakeLead.stage));
+    await setAdminSession(chatId, 'account_selected', { selected_account_key: fakeLead.account_key });
+    return tg('sendMessage', {
+      chat_id: chatId,
+      text:
+        `🧪 AI test\n\n` +
+        `detected intent: ${decision?.intent || 'unavailable'}\n` +
+        `confidence: ${decision?.confidence ?? 0}\n` +
+        `matched rule: ${decision?.matched_rule_key || '-'}\n` +
+        `action: ${decision?.action || '-'}\n` +
+        `response preview: ${decision?.template_key || decision?.next_step || '-'}`
+    });
   }
 
   if (text === '/start' || text === '/menu') return sendDashboard(chatId, selectedAccountKey);
@@ -3531,6 +4216,12 @@ async function handleAdminMessage(msg) {
     const decision = await classifyWithAI(fakeLead, sample, classify(sample, stepKey));
     return tg('sendMessage', { chat_id: chatId, text: `AI test\n${JSON.stringify(decision || { ok: false, reason: 'AI unavailable' }, null, 2)}` });
   }
+  if (text.startsWith('/setairule ')) {
+    const [, ak, ruleKey, stepKey, intent, action] = text.split(/\s+/);
+    if (!ak || !ruleKey || !stepKey || !intent || !action) return tg('sendMessage', { chat_id: chatId, text: 'Format: /setairule ACCOUNT_KEY RULE_KEY STEP_KEY INTENT ACTION' });
+    const saved = await upsertAccountAiRule(ak, { rule_key: ruleKey, step_key: stepKey, target_intent: intent, action }, from.id);
+    return tg('sendMessage', { chat_id: chatId, text: `✅ AI rule saqlandi: ${saved.account_key}/${saved.rule_key}` });
+  }
   if (text.startsWith('/aitemplate ')) {
     const rest = text.replace('/aitemplate ', '');
     const accounts = await getAccounts();
@@ -3594,6 +4285,9 @@ async function handleAdminMessage(msg) {
 
   if (text === '/settings') return sendSettings(chatId, selectedAccountKey);
   if (text.startsWith('/settings ')) return sendSettings(chatId, text.split(/\s+/)[1]);
+  if (text === '/commands') return sendCommandsMenu(chatId, selectedAccountKey);
+  if (text === '/archivesettings') return sendArchiveSettingsMenu(chatId, selectedAccountKey);
+  if (text === '/airules') return sendAiRulesMenu(chatId, selectedAccountKey);
   if (text === '/report') return sendReport(chatId, selectedAccountKey);
   if (text.startsWith('/report ')) return sendArchiveReport(chatId, text.split(/\s+/)[1], '📊 Hisobot');
   if (text === '/dailyreport' || text.startsWith('/dailyreport ')) return sendArchiveReport(chatId, text.split(/\s+/)[1] || selectedAccountKey, '📊 Kunlik hisobot');
@@ -3750,11 +4444,23 @@ async function dailyStatus(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
 async function sendReport(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const auto = await getAutoOutreach(accountOrKey);
   if (auto?.session_id) return sendAutoSessionReport(chatId, auto, false, accountOrKey);
+  const account = await getAccount(accountOrKey);
   const stages = [STAGE.OUTREACH_SENT, STAGE.ASKED_APPLICATION, STAGE.ASKED_INFO, STAGE.INFO_SENT_FINISHED, STAGE.PENDING_APPROVAL, STAGE.PAUSED, STAGE.DISABLED];
   const parts = [];
   for (const st of stages) {
     parts.push(`${st}: ${await countLeads(q => q.eq('stage', st), accountOrKey)}`);
   }
+  const topCommands = await topCustomCommands(account.account_key);
+  parts.push(`archived messages: ${await countArchive(null, account.account_key)}`);
+  parts.push(`deleted messages: ${await countArchive(q => q.eq('delete_detected', true), account.account_key)}`);
+  parts.push(`edited messages: ${await countArchive(q => q.gt('edit_count', 0), account.account_key)}`);
+  parts.push(`media messages: ${await countArchive(q => q.not('file_id', 'is', null), account.account_key)}`);
+  parts.push(`custom command executions: ${await countCustomCommandExecutions(null, account.account_key)}`);
+  parts.push(`top commands: ${topCommands.length ? topCommands.map(([k, v]) => `/${k} (${v})`).join(', ') : '-'}`);
+  parts.push(`AI decisions: ${await countAiDecisions(account.account_key)}`);
+  parts.push(`AI low-confidence handoffs: ${await countLeads(q => q.eq('status', 'needs_admin'), account.account_key)}`);
+  parts.push(`active chats: ${await countLeads(q => q.eq('status', 'active'), account.account_key)}`);
+  parts.push(`unique leads: ${await countLeads(null, account.account_key)}`);
   return tg('sendMessage', { chat_id: chatId, text: `📊 Hisobot\n\n${parts.join('\n')}` });
 }
 
@@ -3901,7 +4607,113 @@ async function handleCallback(cb) {
 
   if (data === 'menu' || data === 'noop') return sendDashboard(chatId, selectedAccountKey);
   if (data === 'accounts') return sendAccountsMenu(chatId);
+  if (data === 'commands_menu' || data === 'cmd_list') return sendCommandsMenu(chatId, selectedAccountKey);
+  if (data === 'cmd_add') {
+    await setAdminSession(chatId, 'custom_command_key_input', { selected_account_key: selectedAccountKey });
+    return tg('sendMessage', { chat_id: chatId, text: 'Buyruq nomini yuboring. Masalan: narx' });
+  }
+  if (data.startsWith('cmd_open:') || data.startsWith('cmd_view:')) return sendCommandDetail(chatId, selectedAccountKey, data.split(':')[1]);
+  if (data.startsWith('cmd_trigger:')) {
+    const session = await getAdminSession(chatId);
+    const payload = { ...(session?.payload || {}), trigger_type: data.split(':')[1] };
+    await setAdminSession(chatId, 'custom_command_response_select', payload);
+    return tg('sendMessage', {
+      chat_id: chatId,
+      text: `/${payload.command_key}\n\nJavob turini tanlang:`,
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: 'Oddiy matn', callback_data: 'cmd_response:text' }],
+          [{ text: 'Shablon', callback_data: 'cmd_response:template' }],
+          [{ text: 'Bir nechta shablon', callback_data: 'cmd_response:template_sequence' }],
+          [{ text: 'Flow bosqichi', callback_data: 'cmd_response:flow_step' }],
+          [{ text: 'Human needed', callback_data: 'cmd_response:human_needed' }],
+          [{ text: '❌ Bekor qilish', callback_data: 'cmd_cancel' }]
+        ]
+      }
+    });
+  }
+  if (data.startsWith('cmd_response:')) {
+    const session = await getAdminSession(chatId);
+    const responseType = data.split(':')[1];
+    const payload = { ...(session?.payload || {}), response_type: responseType };
+    if (responseType === 'text') {
+      await setAdminSession(chatId, 'custom_command_response_text', payload);
+      return tg('sendMessage', { chat_id: chatId, text: 'Javob matnini yuboring.' });
+    }
+    if (responseType === 'human_needed') return showCommandPreviewForSession(chatId, payload);
+    if (responseType === 'template') {
+      await setAdminSession(chatId, 'custom_command_template_select', payload);
+      return tg('sendMessage', {
+        chat_id: chatId,
+        text: 'Shablonni tanlang:',
+        reply_markup: { inline_keyboard: TEMPLATE_MENU_KEYS.map(k => ([{ text: k, callback_data: `cmd_template:${k}` }])).concat([[{ text: '❌ Bekor qilish', callback_data: 'cmd_cancel' }]]) }
+      });
+    }
+    if (responseType === 'template_sequence') {
+      await setAdminSession(chatId, 'custom_command_response_text', { ...payload, response_type: 'template_sequence' });
+      return tg('sendMessage', { chat_id: chatId, text: 'Shablon keylarini vergul bilan yuboring. Masalan: full_intro,offer_end' });
+    }
+    if (responseType === 'flow_step') {
+      await setAdminSession(chatId, 'custom_command_response_text', { ...payload, response_type: 'flow_step' });
+      return tg('sendMessage', { chat_id: chatId, text: 'Flow step_key yuboring. Masalan: ask_info' });
+    }
+  }
+  if (data.startsWith('cmd_template:')) {
+    const session = await getAdminSession(chatId);
+    return showCommandPreviewForSession(chatId, { ...(session?.payload || {}), template_key: data.split(':')[1] });
+  }
+  if (data === 'cmd_save') {
+    const session = await getAdminSession(chatId);
+    const payload = session?.payload || {};
+    const command = {
+      ...payload,
+      template_sequence: payload.response_type === 'template_sequence' ? String(payload.response_text || '').split(/[,\s]+/).filter(Boolean) : payload.template_sequence,
+      step_key: payload.response_type === 'flow_step' ? payload.response_text : payload.step_key,
+      response_text: payload.response_type === 'text' ? payload.response_text : null
+    };
+    const saved = await upsertCustomCommand(payload.selected_account_key || selectedAccountKey, command, cb.from?.id);
+    await setAdminSession(chatId, 'account_selected', { selected_account_key: payload.selected_account_key || selectedAccountKey });
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: /${saved.command_key}` });
+  }
+  if (data === 'cmd_retry') {
+    const session = await getAdminSession(chatId);
+    await setAdminSession(chatId, 'custom_command_response_text', session?.payload || {});
+    return tg('sendMessage', { chat_id: chatId, text: 'Yangi javob matnini yuboring.' });
+  }
+  if (data === 'cmd_cancel') {
+    await setAdminSession(chatId, 'account_selected', { selected_account_key: selectedAccountKey });
+    return tg('sendMessage', { chat_id: chatId, text: 'Bekor qilindi.' });
+  }
+  if (data.startsWith('cmd_editresp:')) {
+    await setAdminSession(chatId, 'custom_command_edit_response', { selected_account_key: selectedAccountKey, command_key: data.split(':')[1] });
+    return tg('sendMessage', { chat_id: chatId, text: 'Yangi javob matnini yuboring.' });
+  }
+  if (data.startsWith('cmd_toggle:')) {
+    const key = data.split(':')[1];
+    const command = await getCustomCommand(selectedAccountKey, key, true);
+    if (!command) return tg('sendMessage', { chat_id: chatId, text: 'Buyruq topilmadi.' });
+    await upsertCustomCommand(selectedAccountKey, { ...command, is_enabled: command.is_enabled === false }, cb.from?.id);
+    return sendCommandDetail(chatId, selectedAccountKey, key);
+  }
+  if (data.startsWith('cmd_delete:')) {
+    const key = data.split(':')[1];
+    const command = await getCustomCommand(selectedAccountKey, key, true);
+    if (command) await upsertCustomCommand(selectedAccountKey, { ...command, is_enabled: false, description: 'soft_deleted' }, cb.from?.id);
+    return tg('sendMessage', { chat_id: chatId, text: `🗑 /${key} o‘chirildi (disabled).` });
+  }
+  if (data.startsWith('cmd_test:')) {
+    await setAdminSession(chatId, 'custom_command_test_input', { selected_account_key: selectedAccountKey, command_key: data.split(':')[1] });
+    return tg('sendMessage', { chat_id: chatId, text: 'Test uchun sample lead xabarini yuboring.' });
+  }
   if (data === 'archive_menu') return sendArchiveMenu(chatId);
+  if (data === 'archive_settings') return sendArchiveSettingsMenu(chatId, selectedAccountKey);
+  if (data.startsWith('archive_toggle:')) {
+    const field = data.split(':')[1];
+    const account = await getAccount(selectedAccountKey);
+    if (!ACCOUNT_BOOLEAN_FIELDS.has(field)) return tg('sendMessage', { chat_id: chatId, text: 'Noto‘g‘ri sozlama.' });
+    await setAccountField(selectedAccountKey, field, account[field] === false ? 'true' : 'false');
+    return sendArchiveSettingsMenu(chatId, selectedAccountKey);
+  }
   if (data.startsWith('archa:')) return sendArchivePeopleMenu(chatId, data.split(':')[1]);
   if (data.startsWith('archp:')) {
     const [, ak, targetChatId] = data.split(':');
@@ -3928,7 +4740,12 @@ async function handleCallback(cb) {
     const enabled = await getAccountAiEnabled(selectedAccountKey);
     return tg('sendMessage', { chat_id: chatId, text: `Joriy akkaunt: ${accountDisplayLabel(selectedAccountKey)}\n\n🤖 AI sozlamalari\nAI intent: ${enabled ? 'ON' : 'OFF'}\nModel: ${OPENAI_MODEL}\nOPENAI_API_KEY: ${OPENAI_API_KEY ? 'bor' : 'yo‘q'}` });
   }
-  if (data === 'rules_menu') return tg('sendMessage', { chat_id: chatId, text: `Joriy akkaunt: ${accountDisplayLabel(selectedAccountKey)}\n\n🧠 Javob qoidalari\nTekshirish: /testrule ${selectedAccountKey} STEP_KEY TEXT\nAI test: /testai ${selectedAccountKey} STEP_KEY TEXT` });
+  if (data === 'rules_menu' || data === 'airules_list') return sendAiRulesMenu(chatId, selectedAccountKey);
+  if (data === 'airule_test') {
+    await setAdminSession(chatId, 'ai_rule_test_input', { selected_account_key: selectedAccountKey, step_key: STAGE.ASKED_APPLICATION });
+    return tg('sendMessage', { chat_id: chatId, text: 'AI test uchun sample lead xabarini yuboring.' });
+  }
+  if (data === 'airule_add') return tg('sendMessage', { chat_id: chatId, text: `Qoida qo‘shishning tezkor formati:\n/setairule ${selectedAccountKey} RULE_KEY STEP_KEY INTENT ACTION` });
   if (data === 'autostatus') return autoStatus(chatId, selectedAccountKey);
   if (data.startsWith('auto:')) {
     const arg = data.split(':')[1];
