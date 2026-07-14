@@ -81,7 +81,22 @@ function parseAccountsFromEnv() {
     archive_notify_enabled: true
   }];
 
-  if (!process.env.BUSINESS_ACCOUNTS_JSON) return fallback;
+  if (!process.env.BUSINESS_ACCOUNTS_JSON) {
+    if (String(process.env.SECOND_ACCOUNT_ENABLED || 'false') === 'true') {
+      fallback.push({
+        account_key: process.env.SECOND_ACCOUNT_KEY || 'second',
+        label: process.env.SECOND_ACCOUNT_LABEL || 'Second',
+        business_owner_id: process.env.SECOND_ACCOUNT_BUSINESS_OWNER_ID || '',
+        admin_chat_id: process.env.SECOND_ACCOUNT_ADMIN_CHAT_ID || '',
+        business_connection_id: process.env.SECOND_ACCOUNT_BUSINESS_CONNECTION_ID || '',
+        project_name: process.env.SECOND_ACCOUNT_PROJECT_NAME || 'Second Project',
+        flow_key: process.env.SECOND_ACCOUNT_FLOW_KEY || 'second_info_only',
+        archive_enabled: true,
+        archive_notify_enabled: true
+      });
+    }
+    return fallback;
+  }
   try {
     const parsed = JSON.parse(process.env.BUSINESS_ACCOUNTS_JSON);
     if (!Array.isArray(parsed) || !parsed.length) return fallback;
@@ -135,7 +150,9 @@ async function tg(method, payload = {}) {
   const data = await res.json().catch(() => null);
   if (!res.ok || !data?.ok) {
     console.error('Telegram API error:', method, data);
-    throw new Error(`Telegram API error: ${method}`);
+    const err = new Error(data?.description || `Telegram API error: ${method}`);
+    err.telegram = data || { ok: false, error_code: res.status, description: res.statusText };
+    throw err;
   }
   return data.result;
 }
@@ -164,11 +181,43 @@ async function getAccount(accountOrKey = DEFAULT_ACCOUNT_KEY) {
 async function findAccountForBusinessMessage(msg) {
   const fromId = String(msg?.from?.id || '');
   const businessConnectionId = String(msg?.business_connection_id || msg?.business_connection?.id || '');
+  const chatId = String(msg?.chat?.id || '');
   const accounts = await getAccounts();
-  return accounts.find(a => (
+  const direct = accounts.find(a => (
     (a.business_owner_id && String(a.business_owner_id) === fromId) ||
     (a.business_connection_id && String(a.business_connection_id) === businessConnectionId)
-  )) || DEFAULT_ACCOUNT;
+  ));
+  if (direct) return direct;
+  if (businessConnectionId) {
+    let q = supabase.from('business_leads')
+      .select('account_key')
+      .eq('business_connection_id', businessConnectionId)
+      .order('updated_at', { ascending: false })
+      .limit(1);
+    if (chatId) q = q.eq('chat_id', chatId);
+    const { data } = await q;
+    const learnedKey = data?.[0]?.account_key;
+    if (learnedKey) return accounts.find(a => a.account_key === learnedKey) || { ...DEFAULT_ACCOUNT, account_key: learnedKey };
+  }
+  return DEFAULT_ACCOUNT;
+}
+
+async function rememberAccountBusinessConnection(account, businessConnectionId) {
+  if (!businessConnectionId || !account?.account_key) return;
+  if (account.business_connection_id && String(account.business_connection_id) === String(businessConnectionId)) return;
+  const { error } = await supabase.from('bot_accounts').upsert({
+    account_key: account.account_key,
+    label: account.label || account.account_key,
+    project_name: account.project_name || account.label || account.account_key,
+    business_owner_id: account.business_owner_id || null,
+    admin_chat_id: account.admin_chat_id || null,
+    business_connection_id: String(businessConnectionId),
+    flow_key: account.flow_key || 'info_only',
+    archive_enabled: account.archive_enabled !== false,
+    archive_notify_enabled: account.archive_notify_enabled !== false,
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'account_key' });
+  if (error) console.error('rememberAccountBusinessConnection:', error.message);
 }
 
 function isDefaultAccountKey(ak) {
@@ -1177,6 +1226,63 @@ async function isKnownAdminMessage(msg) {
   ));
 }
 
+async function whoamiText(msg, messageType = 'message') {
+  const chatId = String(msg?.chat?.id || '');
+  const fromId = String(msg?.from?.id || '');
+  const businessConnectionId = msg?.business_connection_id || msg?.business_connection?.id || '';
+  const accounts = await getAccounts();
+  const account = messageType === 'business_message'
+    ? await findAccountForBusinessMessage(msg)
+    : accounts.find(a => (
+      (a.admin_chat_id && (String(a.admin_chat_id) === chatId || String(a.admin_chat_id) === fromId)) ||
+      (a.business_owner_id && String(a.business_owner_id) === fromId)
+    ));
+  const isAdmin = await isKnownAdminMessage(msg);
+  const accountMatches = accounts
+    .filter(a => (
+      (a.admin_chat_id && (String(a.admin_chat_id) === chatId || String(a.admin_chat_id) === fromId)) ||
+      (a.business_owner_id && String(a.business_owner_id) === fromId) ||
+      (a.business_connection_id && businessConnectionId && String(a.business_connection_id) === String(businessConnectionId))
+    ))
+    .map(a => `${a.account_key}:admin=${a.admin_chat_id && (String(a.admin_chat_id) === chatId || String(a.admin_chat_id) === fromId) ? 'true' : 'false'},owner=${a.business_owner_id && String(a.business_owner_id) === fromId ? 'true' : 'false'},connection=${a.business_connection_id && businessConnectionId && String(a.business_connection_id) === String(businessConnectionId) ? 'true' : 'false'}`)
+    .join('\n');
+  return (
+    `🪪 whoami\n\n` +
+    `message_type: ${messageType}\n` +
+    `chat.id: ${chatId || '-'}\n` +
+    `from.id: ${fromId || '-'}\n` +
+    `from.username: ${msg?.from?.username || '-'}\n` +
+    `from.first_name: ${msg?.from?.first_name || '-'}\n` +
+    `business_connection_id: ${businessConnectionId || '-'}\n` +
+    `detected account_key: ${account?.account_key || '-'}\n` +
+    `is_admin: ${isAdmin ? 'true' : 'false'}\n` +
+    `ADMIN_CHAT_ID match: ${chatId === String(ADMIN_CHAT_ID) || fromId === String(ADMIN_CHAT_ID) ? 'true' : 'false'}\n` +
+    `OWNER_TELEGRAM_ID match: ${fromId === String(OWNER_TELEGRAM_ID) ? 'true' : 'false'}\n` +
+    `BUSINESS_OWNER_ID match: ${fromId === String(BUSINESS_OWNER_ID) ? 'true' : 'false'}\n` +
+    `account matches:\n${accountMatches || '-'}`
+  );
+}
+
+async function replyWhoami(msg, messageType = 'message') {
+  const chatId = String(msg?.chat?.id || '');
+  const businessConnectionId = msg?.business_connection_id || msg?.business_connection?.id || null;
+  if (!chatId) {
+    console.error('whoami cannot reply: missing chat.id', JSON.stringify(msg || {}).slice(0, 500));
+    return;
+  }
+  try {
+    const payload = { chat_id: chatId, text: await whoamiText(msg, messageType) };
+    if (messageType === 'business_message' && businessConnectionId) payload.business_connection_id = businessConnectionId;
+    await tg('sendMessage', payload);
+  } catch (err) {
+    console.error('whoami reply failed:', err.message);
+    try {
+      const account = messageType === 'business_message' ? await findAccountForBusinessMessage(msg) : DEFAULT_ACCOUNT;
+      await logEvent(chatId || 'unknown', 'whoami_reply_failed', err.message || String(err), account?.account_key);
+    } catch {}
+  }
+}
+
 async function handleBusinessMessage(msg) {
   const chatId = String(msg.chat?.id || '');
   if (!chatId) return;
@@ -1184,8 +1290,13 @@ async function handleBusinessMessage(msg) {
   const account = await findAccountForBusinessMessage(msg);
   const ak = account.account_key;
   const text = getMessageText(msg).trim();
+  if (text.toLowerCase() === '/whoami') {
+    await replyWhoami(msg, 'business_message');
+    return;
+  }
   const key = `business:${ak}:${chatId}:${msg.message_id || msg.date || Date.now()}`;
   const direction = isOwnerMessage(msg) ? 'outgoing' : 'incoming';
+  if (direction === 'outgoing') await rememberAccountBusinessConnection(account, businessConnectionId);
   await archiveBusinessMessage(msg, account, direction);
 
   const firstTime = await markProcessed(key, chatId, ak);
@@ -1507,6 +1618,16 @@ async function sendArchiveList(chatId, type = 'recent', accountOrKey = DEFAULT_A
   return tg('sendMessage', { chat_id: chatId, text: archiveRowsText(titles[type] || titles.recent, rows) });
 }
 
+async function parseOptionalAccountArg(parts, selectedAccountKey, startIndex = 1) {
+  const accounts = await getAccounts();
+  const maybe = parts[startIndex];
+  const account = accounts.find(a => a.account_key === maybe);
+  return {
+    accountKey: account?.account_key || selectedAccountKey,
+    nextIndex: account ? startIndex + 1 : startIndex
+  };
+}
+
 async function sendList(chatId, type, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   let rows = [];
   let title = '';
@@ -1739,7 +1860,7 @@ async function handleAdminMessage(msg) {
   const selectedAccountKey = await getSelectedAccountKey(chatId);
 
   if (text === '/start' || text === '/menu') return sendDashboard(chatId, selectedAccountKey);
-  if (text === '/whoami') return tg('sendMessage', { chat_id: chatId, text: `Sizning Telegram ID: ${msg.from.id}` });
+  if (text === '/whoami') return replyWhoami(msg, 'message');
   if (text === '/resetme') {
     await resetMeChat({ chatId, from: msg.from, accountKey: selectedAccountKey });
     return tg('sendMessage', { chat_id: chatId, text: '✅ Test profilingiz tozalandi. Endi qayta test qilishingiz mumkin.' });
@@ -1755,6 +1876,7 @@ async function handleAdminMessage(msg) {
     return tg('sendMessage', { chat_id: chatId, text: `✅ Akkaunt tanlandi: ${account.label || account.account_key}` });
   }
   if (text === '/accountstatus') return sendAccountStatus(chatId, selectedAccountKey);
+  if (text === '/flow') return sendFlow(chatId, selectedAccountKey);
   if (text.startsWith('/flow ')) return sendFlow(chatId, text.split(/\s+/)[1]);
   if (text.startsWith('/flowtest ')) return sendFlowTest(chatId, text.split(/\s+/)[1]);
   if (text.startsWith('/setflow ')) {
@@ -1776,21 +1898,31 @@ async function handleAdminMessage(msg) {
   }
 
   if (text === '/autoon') return autoOn(chatId, AUTO_OUTREACH_DEFAULT_HOURS, selectedAccountKey);
-  if (text === '/autooff') return autoOff(chatId, selectedAccountKey);
-  if (text === '/autostatus') return autoStatus(chatId, selectedAccountKey);
+  if (text === '/autooff' || text.startsWith('/autooff ')) {
+    const parts = text.split(/\s+/);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey);
+    return autoOff(chatId, parsed.accountKey);
+  }
+  if (text === '/autostatus' || text.startsWith('/autostatus ')) {
+    const parts = text.split(/\s+/);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey);
+    return autoStatus(chatId, parsed.accountKey);
+  }
 
   if (text === '/auto' || text.startsWith('/auto ')) {
-    const arg = text.split(/\s+/)[1] || `${AUTO_OUTREACH_DEFAULT_HOURS}h`;
-    if (arg === 'off') return autoOff(chatId, selectedAccountKey);
+    const parts = text.split(/\s+/);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey);
+    const arg = parts[parsed.nextIndex] || `${AUTO_OUTREACH_DEFAULT_HOURS}h`;
+    if (arg === 'off') return autoOff(chatId, parsed.accountKey);
     if (arg === 'today') {
       const now = new Date();
       const end = new Date(now);
       end.setHours(23, 59, 59, 999);
       const hours = Math.max(1, Math.ceil((end.getTime() - now.getTime()) / 3600000));
-      return autoOn(chatId, hours, selectedAccountKey);
+      return autoOn(chatId, hours, parsed.accountKey);
     }
     const hours = Number(String(arg).replace('h', '')) || AUTO_OUTREACH_DEFAULT_HOURS;
-    return autoOn(chatId, hours, selectedAccountKey);
+    return autoOn(chatId, hours, parsed.accountKey);
   }
 
   if (text === '/report') return sendReport(chatId, selectedAccountKey);
@@ -1802,6 +1934,7 @@ async function handleAdminMessage(msg) {
   if (text === '/healthtemplates') return healthTemplates(chatId, selectedAccountKey);
   if (text === '/diagnostics') return diagnostics(chatId, selectedAccountKey);
   if (text === '/archive') return sendArchiveMenu(chatId);
+  if (text.startsWith('/archive ')) return sendArchiveList(chatId, 'recent', text.split(/\s+/)[1]);
   if (text === '/deleted' || text.startsWith('/deleted ')) return sendArchiveList(chatId, 'deleted', text.split(/\s+/)[1] || selectedAccountKey);
   if (text === '/edited' || text.startsWith('/edited ')) return sendArchiveList(chatId, 'edited', text.split(/\s+/)[1] || selectedAccountKey);
   if (text === '/media' || text.startsWith('/media ')) return sendArchiveList(chatId, 'media', text.split(/\s+/)[1] || selectedAccountKey);
@@ -1814,16 +1947,23 @@ async function handleAdminMessage(msg) {
   if (text === '/tick') return manualTick(chatId);
 
   if (text.startsWith('/setdaily ')) {
-    const [, start, durationRaw] = text.split(/\s+/);
+    const parts = text.split(/\s+/);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey);
+    const start = parts[parsed.nextIndex];
+    const durationRaw = parts[parsed.nextIndex + 1];
     const hours = Number(String(durationRaw || '').replace('h', '')) || DAILY_DEFAULT_DURATION_HOURS;
-    const daily = await setDailyAuto({ enabled: true, start_time: start || DAILY_DEFAULT_START, duration_hours: hours, skip_date: null }, selectedAccountKey);
+    const daily = await setDailyAuto({ enabled: true, start_time: start || DAILY_DEFAULT_START, duration_hours: hours, skip_date: null }, parsed.accountKey);
     return tg('sendMessage', { chat_id: chatId, text: `✅ Kunlik Auto Outreach sozlandi\n\nHar kuni: ${daily.start_time}\nDavomiylik: ${daily.duration_hours} soat` });
   }
-  if (text === '/dailyoff') {
-    await setDailyAuto({ enabled: false }, selectedAccountKey);
+  if (text === '/dailyoff' || text.startsWith('/dailyoff ')) {
+    const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey);
+    await setDailyAuto({ enabled: false }, parsed.accountKey);
     return tg('sendMessage', { chat_id: chatId, text: '⛔ Kunlik Auto Outreach o‘chirildi.' });
   }
-  if (text === '/dailystatus') return dailyStatus(chatId, selectedAccountKey);
+  if (text === '/dailystatus' || text.startsWith('/dailystatus ')) {
+    const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey);
+    return dailyStatus(chatId, parsed.accountKey);
+  }
 
   if (text.startsWith('/gettemplate ')) {
     const parts = text.split(/\s+/);
@@ -2020,18 +2160,56 @@ app.get('/tick', async (_, res) => {
   res.json({ ok: true, ticked_at: new Date().toISOString() });
 });
 
-app.get('/set-webhook', async (req, res) => {
+const BASIC_ALLOWED_UPDATES = ['message', 'callback_query', 'business_connection', 'business_message'];
+const FULL_ALLOWED_UPDATES = [...BASIC_ALLOWED_UPDATES, 'edited_business_message', 'deleted_business_messages'];
+
+async function setWebhookResponse(req, res, allowedUpdates) {
   try {
     const url = WEBHOOK_URL || `${req.protocol}://${req.get('host')}/webhook`;
     const result = await tg('setWebhook', {
       url,
       secret_token: WEBHOOK_SECRET || undefined,
-      allowed_updates: ['message', 'callback_query', 'business_connection', 'business_message', 'edited_business_message', 'deleted_business_messages']
+      allowed_updates: allowedUpdates
     });
-    res.json({ ok: true, url, result });
+    res.json({ ok: true, url, allowed_updates: allowedUpdates, result });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    console.error('setWebhook error:', err.telegram || err.message);
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+      telegram: err.telegram || null
+    });
   }
+}
+
+app.get('/set-webhook', async (req, res) => setWebhookResponse(req, res, BASIC_ALLOWED_UPDATES));
+app.get('/set-webhook-basic', async (req, res) => setWebhookResponse(req, res, BASIC_ALLOWED_UPDATES));
+app.get('/set-webhook-full', async (req, res) => setWebhookResponse(req, res, FULL_ALLOWED_UPDATES));
+
+app.get('/webhook-debug', async (_, res) => {
+  const accounts = await getAccounts();
+  res.json({
+    ok: true,
+    bot_token_exists: Boolean(BOT_TOKEN),
+    bot_token_length: BOT_TOKEN ? BOT_TOKEN.length : 0,
+    webhook_url_exists: Boolean(WEBHOOK_URL),
+    webhook_url_https: WEBHOOK_URL ? WEBHOOK_URL.startsWith('https://') : false,
+    webhook_url_ends_with_webhook: WEBHOOK_URL ? WEBHOOK_URL.endsWith('/webhook') : false,
+    webhook_secret_exists: Boolean(WEBHOOK_SECRET),
+    webhook_secret_length: WEBHOOK_SECRET ? WEBHOOK_SECRET.length : 0,
+    basic_allowed_updates: BASIC_ALLOWED_UPDATES,
+    full_allowed_updates: FULL_ALLOWED_UPDATES,
+    set_webhook_default: 'basic',
+    detected_accounts: accounts.map(a => ({
+      account_key: a.account_key,
+      label: a.label,
+      project_name: a.project_name,
+      admin_chat_id: a.admin_chat_id ? String(a.admin_chat_id) : '',
+      business_owner_id: a.business_owner_id ? String(a.business_owner_id) : '',
+      business_connection_id: a.business_connection_id ? 'configured' : '',
+      flow_key: a.flow_key
+    }))
+  });
 });
 
 app.get('/webhook-info', async (_, res) => {
@@ -2053,7 +2231,10 @@ app.post('/webhook', async (req, res) => {
     const update = req.body || {};
     if (update.callback_query) await handleCallback(update.callback_query);
     if (update.message) {
-      if (await isKnownAdminMessage(update.message)) {
+      const text = String(update.message.text || '').trim().toLowerCase();
+      if (text === '/whoami') {
+        await replyWhoami(update.message, 'message');
+      } else if (await isKnownAdminMessage(update.message)) {
         await handleAdminMessage(update.message);
       }
     }
