@@ -354,6 +354,10 @@ insert into bot_accounts (account_key, label, project_name, business_owner_id, a
 values ('uzlye', 'UZLYE', 'O‘zbekiston Lider Yoshlari Ensiklopediyasi', null, null, 'uzlye_info_only', true, true)
 on conflict (account_key) do nothing;
 
+insert into bot_accounts (account_key, label, project_name, business_owner_id, admin_chat_id, flow_key, archive_enabled, archive_notify_enabled)
+values ('second', 'Ikkinchi akkaunt', 'Millat Iftixorlari ensiklopediyasi', '8304283149', '8304283149', 'second_info_only', true, true)
+on conflict (account_key) do nothing;
+
 insert into account_flow_steps (account_key, flow_key, step_key, template_key, next_step_yes, next_step_no, next_step_partial, next_step_unknown, stop_after_send, sort_order, is_active)
 values
 ('uzlye', 'uzlye_info_only', 'ask_application', 'ask_application', 'ask_info', 'application_link', 'ask_info', null, false, 10, true),
@@ -362,6 +366,63 @@ values
 ('uzlye', 'uzlye_info_only', 'no_info', 'unknown_info_preface,full_intro,offer_end', null, null, null, null, true, 40, true),
 ('uzlye', 'uzlye_info_only', 'application_link', 'application_link_reply', null, null, null, null, true, 50, true)
 on conflict (account_key, flow_key, step_key) do nothing;
+
+insert into account_flow_steps (account_key, flow_key, step_key, template_key, next_step_yes, next_step_no, next_step_partial, next_step_unknown, stop_after_send, sort_order, is_active)
+values
+('second', 'second_info_only', 'ask_application', 'ask_application', 'ask_info', null, 'ask_info', null, false, 10, true),
+('second', 'second_info_only', 'ask_info', 'ask_info', 'has_info', 'no_info', 'has_info', null, false, 20, true),
+('second', 'second_info_only', 'has_info', 'known_info_preface,full_intro,offer_end', null, null, null, null, true, 30, true),
+('second', 'second_info_only', 'no_info', 'full_intro,offer_end', null, null, null, null, true, 40, true)
+on conflict (account_key, flow_key, step_key) do nothing;
+
+insert into reply_templates (key, account_key, title, body) values
+('second:ask_application', 'second', 'Ariza qoldirganini so‘rash', $$Siz “Millat Iftixorlari ensiklopediyasi”ga kirish uchun ariza qoldirgansiz. Shunaqami?$$),
+('second:ask_info', 'second', 'Ma’lumot bor-yo‘qligini so‘rash', $$Siz ensiklopediyamizga kirishning foydali jihatlari haqida batafsil ma’lumotga egamisiz?$$),
+('second:known_info_preface', 'second', 'Ma’lumot bor desa kirish', $$Ajoyib, keling unda yana bir bor tanishtirib o‘taman.$$),
+('second:full_intro', 'second', 'Millat Iftixorlari batafsil tanishtiruv', $$Ushbu xabarda sizga “Millat Iftixorlari” ensiklopediyasi haqida qo‘shimcha ma’lumotlarni taqdim etamiz. 📚✨
+
+“Millat Iftixorlari” ensiklopediyasi — yoshlarning yutuqlarini hujjatlashtirish, ularni ommaga tanitish va boshqalarga ilhom manbai sifatida targ‘ib qilish uchun yaratilgan noyob loyiha. Bu platformaga istalgan sohada faoliyat yuritayotgan, o‘z ustida izchil ishlayotgan hamda jamiyat rivojiga hissa qo‘shayotgan yoshlar qabul qilinadi.
+
+Ensiklopediyaga kiritilgan nomzodlar quyidagi muhim ustunliklarga ega bo‘ladilar:
+
+🔹 Qidiruv tizimlarida ko‘rinish 🔎
+Siz haqingizdagi maqola Google, Yandex, Bing kabi qidiruv tizimlarida chiqadi. Bu esa sizni hamkorlar, ish beruvchilar, ilmiy tashkilotlar yoki jurnalistlar osongina topa olishini ta’minlaydi.
+
+🔹 Sun’iy intellekt platformalarida tanilish 🤖
+Bugungi kunda ChatGPT, Copilot, Gemini kabi sun’iy intellekt tizimlari ishonchli manbalarga tayangan holda ishlaydi. Siz haqingizdagi maqola shu manbalardan biri bo‘lib, onlayn obro‘yingizni mustahkamlaydi.
+
+🔹 Kelajakdagi Wikipedia sahifangiz uchun asos 🌍
+Bugun e’lon qilinadigan maqola ertaga siz haqingizda yaratiladigan Wikipedia sahifasi uchun tayyor va ishonchli manba bo‘lishi mumkin.
+
+🔹 Ijtimoiy tarmoqlarda tasdiq belgisi olish imkoniyati ✔️
+Instagram, Facebook, TikTok, YouTube kabi platformalarda “ko‘k nishon” olish uchun siz haqingizda onlayn maqolalar zarur. Ushbu maqola bu yo‘lda muhim hujjat bo‘lib xizmat qiladi.
+
+🔹 Rezyume va grantlar uchun rasmiy havola 📄
+Ish qidirishda, grant yoki xalqaro tanlovlarda qatnashishda siz haqingizdagi maqola shaxsiy brendingizni ko‘rsatuvchi kuchli manba bo‘ladi.
+
+🔹 Loyihaning ijtimoiy tarmoqlari va kanallarida yoritilish 📣
+Sizning maqolangiz nafaqat saytimizda, balki loyihaning ijtimoiy tarmoqlari va maxsus kanallarida ham keng targ‘ib qilinadi.
+
+🔹 OAV e’tiboriga tushish imkoniyati 🎙️
+Jurnalistlar, blogerlar, televideniye va radio vakillari uchun siz haqingizdagi maqola ishonchli manba bo‘lib xizmat qiladi. Natijada sizga intervyu yoki chiqishlar bo‘yicha murojaatlar ko‘payishi mumkin.
+
+🔹 Iqtiboslar ruknida faollik 💬
+Jamiyat uchun foydali va mazmunli fikrlaringizni “Iqtiboslar” rukni orqali keng ommaga taqdim etishingiz mumkin.
+
+🔹 Shaxsiy brendingiz uchun mustahkam poydevor 🌟
+Bugungi kunda har bir ekspert yoki jamoat faoli uchun shaxsiy brend muhim. Ushbu maqola sizning obro‘yingiz va ishonchliligingizni yanada mustahkamlaydi.
+
+🔹 Kelajak loyihalarda ajralib turish imkoniyati 🚀
+Forumlar, konferensiyalar, grant dasturlari va xalqaro tanlovlarda qatnashishda siz haqingizdagi onlayn maqola sizni boshqalardan ajratib ko‘rsatadi.
+
+✨ “Millat Iftixorlari” ensiklopediyasiga kiritilish — bu sizning shaxsiy brendingiz, obro‘yingiz va kelajakdagi muvaffaqiyatlaringiz uchun mustahkam poydevordir.$$),
+('second:offer_end', 'second', 'Oferta yakuni', $$Ensiklopediyamizning ommaviy ofertasi bilan quyidagi link orqali batafsil tanishishingiz mumkin:
+https://t.me/mie_rasmiy/3
+
+👨‍🎓 Vebsayt | 📱 Instagram | 📱 Telegram
+
+Oferta va xabar bilan tanishib chiqing va ayting.$$)
+on conflict (key) do nothing;
 
 -- IMPORTANT: on conflict do nothing = your edited templates will NOT be overwritten.
 insert into reply_templates (key, title, body) values

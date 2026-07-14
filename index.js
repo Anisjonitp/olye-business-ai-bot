@@ -89,11 +89,11 @@ function parseAccountsFromEnv() {
     if (String(process.env.SECOND_ACCOUNT_ENABLED || 'false') === 'true') {
       fallback.push({
         account_key: process.env.SECOND_ACCOUNT_KEY || 'second',
-        label: process.env.SECOND_ACCOUNT_LABEL || 'Second',
+        label: process.env.SECOND_ACCOUNT_LABEL || 'Ikkinchi akkaunt',
         business_owner_id: process.env.SECOND_ACCOUNT_BUSINESS_OWNER_ID || '',
         admin_chat_id: process.env.SECOND_ACCOUNT_ADMIN_CHAT_ID || '',
         business_connection_id: process.env.SECOND_ACCOUNT_BUSINESS_CONNECTION_ID || '',
-        project_name: process.env.SECOND_ACCOUNT_PROJECT_NAME || 'Second Project',
+        project_name: process.env.SECOND_ACCOUNT_PROJECT_NAME || 'Millat Iftixorlari ensiklopediyasi',
         flow_key: process.env.SECOND_ACCOUNT_FLOW_KEY || 'second_info_only',
         archive_enabled: true,
         archive_notify_enabled: true
@@ -133,6 +133,13 @@ const DEFAULT_ACCOUNT = ENV_ACCOUNTS[0] || {
   archive_enabled: true,
   archive_notify_enabled: true
 };
+
+function accountDisplayLabel(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const ak = accountKey(accountOrKey);
+  if (ak === 'second') return process.env.SECOND_ACCOUNT_LABEL || 'Ikkinchi akkaunt';
+  if (ak === DEFAULT_ACCOUNT_KEY || ak === LEGACY_DEFAULT_ACCOUNT_KEY) return 'UZLYE';
+  return ak;
+}
 
 function accountKey(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   if (typeof accountOrKey === 'string') return accountOrKey || DEFAULT_ACCOUNT_KEY;
@@ -185,11 +192,11 @@ async function getAccount(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   if (key === (process.env.SECOND_ACCOUNT_KEY || 'second')) {
     return {
       account_key: process.env.SECOND_ACCOUNT_KEY || 'second',
-      label: process.env.SECOND_ACCOUNT_LABEL || 'Second',
+      label: process.env.SECOND_ACCOUNT_LABEL || 'Ikkinchi akkaunt',
       business_owner_id: process.env.SECOND_ACCOUNT_BUSINESS_OWNER_ID || '8304283149',
       admin_chat_id: process.env.SECOND_ACCOUNT_ADMIN_CHAT_ID || '8304283149',
       business_connection_id: process.env.SECOND_ACCOUNT_BUSINESS_CONNECTION_ID || '',
-      project_name: process.env.SECOND_ACCOUNT_PROJECT_NAME || 'Second Project',
+      project_name: process.env.SECOND_ACCOUNT_PROJECT_NAME || 'Millat Iftixorlari ensiklopediyasi',
       flow_key: process.env.SECOND_ACCOUNT_FLOW_KEY || 'second_info_only',
       archive_enabled: true,
       archive_notify_enabled: true
@@ -234,11 +241,11 @@ function findAccountByUserId(accounts, userId) {
   if (uid === '8304283149') {
     return accounts.find(a => a.account_key === 'second') || {
       account_key: process.env.SECOND_ACCOUNT_KEY || 'second',
-      label: process.env.SECOND_ACCOUNT_LABEL || 'Second',
+      label: process.env.SECOND_ACCOUNT_LABEL || 'Ikkinchi akkaunt',
       business_owner_id: process.env.SECOND_ACCOUNT_BUSINESS_OWNER_ID || '8304283149',
       admin_chat_id: process.env.SECOND_ACCOUNT_ADMIN_CHAT_ID || '8304283149',
       business_connection_id: process.env.SECOND_ACCOUNT_BUSINESS_CONNECTION_ID || '',
-      project_name: process.env.SECOND_ACCOUNT_PROJECT_NAME || 'Second Project',
+      project_name: process.env.SECOND_ACCOUNT_PROJECT_NAME || 'Millat Iftixorlari ensiklopediyasi',
       flow_key: process.env.SECOND_ACCOUNT_FLOW_KEY || 'second_info_only',
       archive_enabled: true,
       archive_notify_enabled: true
@@ -764,7 +771,7 @@ async function classifyWithAI(lead, userText, ruleIntent) {
   const decision = await callOpenAIJson([
     {
       role: 'system',
-      content: 'Classify Telegram customer replies for an info-only business bot. Never write a reply to the customer. Return strict JSON only with keys: intent, confidence, next_step, template_key, should_stop, reason. Allowed intents: confirm,reject,thanks,interested,price_question,info_request,unclear,stop,complaint,payment_ready,other.'
+      content: 'Classify Telegram customer replies for an info-only business bot. Never write a reply to the customer. Return strict JSON only with keys: intent, confidence, next_step, template_key, should_stop, reason. Allowed intents: confirm,reject,has_info,needs_info,thanks,interested,price_question,info_request,unclear,stop,complaint,payment_ready,other.'
     },
     {
       role: 'user',
@@ -802,8 +809,8 @@ function mapAiIntentToRuleIntent(decision, stage, fallbackIntent) {
     if (intent === 'info_request') return 'application_not_submitted';
   }
   if (stage === STAGE.ASKED_INFO) {
-    if (['confirm', 'thanks', 'interested'].includes(intent)) return 'has_info';
-    if (intent === 'info_request') return 'no_info';
+    if (['confirm', 'has_info', 'thanks', 'interested'].includes(intent)) return 'has_info';
+    if (['needs_info', 'info_request'].includes(intent)) return 'no_info';
   }
   if (intent === 'thanks' || intent === 'interested') return 'read_offer';
   return fallbackIntent;
@@ -1141,12 +1148,15 @@ Context resume orqali.`, {}, current.account_key);
       await finishAfterInfo(after || current);
       return { handled: true, lead: after || current };
     }
-    if (intent === 'no_info' || intent === 'unclear' || intent === 'payment_near' || intent === 'read_offer') {
+    if (intent === 'no_info' || intent === 'payment_near' || intent === 'read_offer') {
       const keys = await flowTemplateKeys(current.account_key, 'no_info', ['unknown_info_preface', 'full_intro', 'offer_end']);
       const after = await sendPackage(current, 'unknown_info_context_resume', keys, {});
       await finishAfterInfo(after || current);
       return { handled: true, lead: after || current };
     }
+    await updateLead(current.chat_id, { status: 'needs_admin', bot_enabled: false }, current.account_key);
+    await logEvent(current.chat_id, 'context_resume_info_unclear_human_needed', text, current.account_key);
+    return { handled: true, lead: current };
   }
 
   return { handled: false, lead: current };
@@ -1311,10 +1321,10 @@ function classify(text = '', stage = STAGE.NEW) {
   const yes = ['ha', 'xa', 'haa', 'ha shunday', 'shunday', 'albatta', 'togri', "to'g'ri", 'to‘g‘ri', 'instagramda', 'yozgandim', 'dostim aytdi', "do'stim aytdi", 'do‘stim aytdi', 'qoldirgandim'];
   if (stage === STAGE.ASKED_APPLICATION && includesAny(t, yes)) return 'application_confirmed';
 
-  const noInfo = ['yoq', "yo'q", 'bilmayman', 'malumotga ega emas', "ma'lumotga ega emas", 'ma’lumotga ega emas', 'xabardor emas'];
+  const noInfo = ['yoq', "yo'q", 'bilmayman', 'malumotga ega emas', "ma'lumotga ega emas", 'ma’lumotga ega emas', 'xabardor emas', 'tushuntiring', 'malumot bering', "ma'lumot bering", 'ma’lumot bering', 'qanaqa loyiha', 'batafsil ayting'];
   if (stage === STAGE.ASKED_INFO && includesAny(t, noInfo)) return 'no_info';
 
-  const partial = ['biroz', 'ozgina', 'sal pal', 'sal-pal', 'qisman', 'uncha emas'];
+  const partial = ['biroz', 'ozgina', 'sal pal', 'sal-pal', 'qisman', 'uncha emas', 'korganman', "ko'rganman", 'ko‘rganman', 'oqiganman', "o'qiganman", 'o‘qiganman'];
   if (stage === STAGE.ASKED_INFO && includesAny(t, partial)) return 'has_info';
 
   const hasInfo = ['egaman', 'bilaman', 'xabardorman', 'malumotim bor', "ma'lumotim bor", 'ma’lumotim bor', 'tanishman', 'ha', 'xa', 'albatta'];
@@ -1471,7 +1481,7 @@ async function archiveEditedBusinessMessage(msg) {
   });
 
   const nextEditCount = Number(oldRow?.edit_count || 0) + 1;
-  const { error } = await supabase.from('message_archive').upsert({
+  const { data: savedRow, error } = await supabase.from('message_archive').upsert({
     ...(oldRow || {}),
     ...payload,
     ...storage,
@@ -1479,10 +1489,10 @@ async function archiveEditedBusinessMessage(msg) {
     edited_at: new Date().toISOString(),
     edit_count: nextEditCount,
     last_event_type: 'edited'
-  }, { onConflict: 'account_key,chat_id,message_id' });
+  }, { onConflict: 'account_key,chat_id,message_id' }).select().maybeSingle();
   if (error) console.error('archiveEditedBusinessMessage:', error.message);
 
-  if (account.archive_notify_enabled !== false) await notifyEditedMessage(account, oldRow, payload, resolved.reason);
+  if (account.archive_notify_enabled !== false) await notifyEditedMessage(account, oldRow, savedRow || payload, resolved.reason);
 }
 
 function deletedMessageIds(update = {}) {
@@ -1519,19 +1529,41 @@ async function handleDeletedBusinessMessages(update = {}) {
       last_event_type: 'deleted'
     };
     const storedRow = oldRow?.account_key === ak ? oldRow : null;
-    const { error } = await supabase.from('message_archive').upsert({
+    const carry = oldRow ? {
+      from_id: oldRow.from_id || null,
+      from_username: oldRow.from_username || null,
+      from_first_name: oldRow.from_first_name || null,
+      direction: oldRow.direction || 'unknown',
+      message_type: oldRow.message_type || 'other',
+      text: oldRow.text || null,
+      caption: oldRow.caption || null,
+      file_id: oldRow.file_id || null,
+      file_unique_id: oldRow.file_unique_id || null,
+      file_name: oldRow.file_name || null,
+      mime_type: oldRow.mime_type || null,
+      file_size: oldRow.file_size || null,
+      storage_path: oldRow.storage_path || null,
+      storage_url: oldRow.storage_url || null,
+      public_url: oldRow.public_url || null,
+      raw_json: oldRow.raw_json || {}
+    } : {};
+    const { data: savedRow, error } = await supabase.from('message_archive').upsert({
       ...(storedRow || {}),
+      ...carry,
       ...patch,
       id: storedRow?.id
-    }, { onConflict: 'account_key,chat_id,message_id' });
+    }, { onConflict: 'account_key,chat_id,message_id' }).select().maybeSingle();
     if (error) console.error('handleDeletedBusinessMessages:', error.message);
-    if (account.archive_notify_enabled !== false) await notifyDeletedMessage(account, oldRow ? { ...oldRow, ...patch } : patch, resolved.reason);
+    if (account.archive_notify_enabled !== false) await notifyDeletedMessage(account, savedRow || (oldRow ? { ...oldRow, ...patch } : patch), resolved.reason);
   }
 }
 
-async function notifyDeletedMessage(account, row, resolutionReason = '') {
-  const actor = row?.from_username ? `@${row.from_username}` : (row?.from_first_name || 'Foydalanuvchi');
-  const itemByType = {
+function archiveActor(row = {}) {
+  return row.from_username ? `@${row.from_username}` : (row.from_first_name || 'Foydalanuvchi');
+}
+
+function deletedItemLabel(messageType = 'text', full = false) {
+  const shortLabels = {
     photo: 'rasmni',
     voice: 'ovozli xabarni',
     video_note: 'dumaloq videoni',
@@ -1540,7 +1572,13 @@ async function notifyDeletedMessage(account, row, resolutionReason = '') {
     audio: 'audio faylni',
     sticker: 'stikerni'
   };
-  const item = itemByType[row?.message_type] || 'xabarni';
+  if (full) return shortLabels[messageType] || 'xabarni';
+  return shortLabels[messageType] || 'xabarni';
+}
+
+async function notifyDeletedMessage(account, row, resolutionReason = '') {
+  const actor = archiveActor(row);
+  const item = deletedItemLabel(row?.message_type);
   const targetAdminChatId = await getAdminChatIdForAccount(account.account_key);
   if (!targetAdminChatId) {
     await logEvent(row?.chat_id || 'unknown', 'archive_deleted_notification_admin_missing', JSON.stringify({
@@ -1552,12 +1590,9 @@ async function notifyDeletedMessage(account, row, resolutionReason = '') {
     }), account.account_key);
     return;
   }
-  const deletedText = row?.text || row?.caption || '';
-  const body =
-    `🗑 <b>${html(actor)} ushbu ${html(item)} o‘chirdi</b>\n\n` +
-    `Akkaunt: ${html(account.label || account.account_key)}` +
-    (deletedText ? `\n\nO‘chirilgan xabar:\n${html(short(deletedText, 700))}` : '');
-  await sendAdminForAccount(account.account_key, body);
+  await sendAdminForAccount(account.account_key, `🗑 <b>${html(actor)} ${html(item)} o‘chirdi</b>`, {
+    reply_markup: row?.id ? { inline_keyboard: [[{ text: '👁 Ko‘rish', callback_data: `archv:${account.account_key}:${row.id}` }]] } : undefined
+  });
   await logEvent(row?.chat_id || 'unknown', 'archive_deleted_notification_sent', JSON.stringify({
     event_type: 'deleted',
     resolved_account_key: account.account_key,
@@ -1567,11 +1602,10 @@ async function notifyDeletedMessage(account, row, resolutionReason = '') {
     message_ids: [row?.message_id].filter(Boolean),
     resolution_reason: resolutionReason
   }), account.account_key);
-  await sendArchivedMediaToAdmin(account, row, `O‘chirilgan ${row?.message_type === 'photo' ? 'rasm' : 'media'} arxivi`);
 }
 
 async function notifyEditedMessage(account, oldRow, payload, resolutionReason = '') {
-  const actor = payload?.from_username ? `@${payload.from_username}` : (payload?.from_first_name || 'Foydalanuvchi');
+  const actor = archiveActor(payload);
   const targetAdminChatId = await getAdminChatIdForAccount(account.account_key);
   if (!targetAdminChatId) {
     await logEvent(payload.chat_id || 'unknown', 'archive_edited_notification_admin_missing', JSON.stringify({
@@ -1583,13 +1617,9 @@ async function notifyEditedMessage(account, oldRow, payload, resolutionReason = 
     }), account.account_key);
     return;
   }
-  await sendAdminForAccount(
-    account.account_key,
-    `✏️ <b>${html(actor)} ushbu xabarni tahrirladi</b>\n\n` +
-    `Akkaunt: ${html(account.label || account.account_key)}\n\n` +
-    `Eski xabar:\n${html(short(oldRow?.text || oldRow?.caption || '-', 700))}\n\n` +
-    `Yangi xabar:\n${html(short(payload.text || payload.caption || '-', 700))}`
-  );
+  await sendAdminForAccount(account.account_key, `✏️ <b>${html(actor)} xabarni tahrirladi</b>`, {
+    reply_markup: payload?.id ? { inline_keyboard: [[{ text: '👁 Ko‘rish', callback_data: `archv:${account.account_key}:${payload.id}` }]] } : undefined
+  });
   await logEvent(payload.chat_id || 'unknown', 'archive_edited_notification_sent', JSON.stringify({
     event_type: 'edited',
     resolved_account_key: account.account_key,
@@ -1618,6 +1648,67 @@ async function sendArchivedMediaToAdmin(account, row, caption = 'Media arxiv') {
     console.error('sendArchivedMediaToAdmin:', err.message);
     await logEvent(row.chat_id || 'unknown', 'send_archived_media_failed', err.message || String(err), account.account_key);
   }
+}
+
+async function getArchiveRowById(accountOrKey, id) {
+  let q = supabase.from('message_archive').select('*').eq('id', Number(id)).limit(1);
+  q = archiveAccountFilter(q, accountOrKey);
+  const { data, error } = await q.maybeSingle();
+  if (error) {
+    console.error('getArchiveRowById:', error.message);
+    return null;
+  }
+  return data || null;
+}
+
+async function latestEditHistory(accountOrKey, row) {
+  if (!row) return null;
+  let q = supabase.from('message_edit_history')
+    .select('*')
+    .eq('chat_id', String(row.chat_id))
+    .eq('message_id', row.message_id)
+    .order('edited_at', { ascending: false })
+    .limit(1);
+  q = accountLeadFilter(q, accountOrKey);
+  const { data, error } = await q.maybeSingle();
+  if (error) {
+    console.error('latestEditHistory:', error.message);
+    return null;
+  }
+  return data || null;
+}
+
+async function sendArchiveFullDetail(chatId, accountOrKey, archiveId) {
+  const account = await getAccount(accountOrKey);
+  const row = await getArchiveRowById(account.account_key, archiveId);
+  if (!row) return tg('sendMessage', { chat_id: chatId, text: 'Arxiv yozuvi topilmadi.' });
+  const actor = archiveActor(row);
+  if (row.last_event_type === 'edited' || Number(row.edit_count || 0) > 0) {
+    const hist = await latestEditHistory(account.account_key, row);
+    await tg('sendMessage', {
+      chat_id: chatId,
+      parse_mode: 'HTML',
+      text:
+        `✏️ <b>${html(actor)} ushbu xabarni tahrirladi</b>\n\n` +
+        `Akkaunt: ${html(account.label || accountDisplayLabel(account.account_key))}\n\n` +
+        `Eski xabar:\n${html(short(hist?.old_text || hist?.old_caption || '-', 1200))}\n\n` +
+        `Yangi xabar:\n${html(short(hist?.new_text || hist?.new_caption || row.text || row.caption || '-', 1200))}\n\n` +
+        `Vaqt: ${row.edited_at || hist?.edited_at || '-'}`
+    });
+    return;
+  }
+  const item = deletedItemLabel(row.message_type, true);
+  const deletedText = row.text || row.caption || '';
+  await tg('sendMessage', {
+    chat_id: chatId,
+    parse_mode: 'HTML',
+    text:
+      `🗑 <b>${html(actor)} ushbu ${html(item)} o‘chirdi</b>\n\n` +
+      `Akkaunt: ${html(account.label || accountDisplayLabel(account.account_key))}` +
+      (deletedText ? `\n\nO‘chirilgan xabar:\n${html(short(deletedText, 1200))}` : '') +
+      `\n\nVaqt: ${row.deleted_at || '-'}`
+  });
+  await sendArchivedMediaToAdmin(account, row, `O‘chirilgan ${row.message_type === 'photo' ? 'rasm' : 'media'} arxivi`);
 }
 
 function isOwnerMessage(msg) {
@@ -1890,6 +1981,11 @@ async function processLeadBatch(initialLead, texts) {
       await finishAfterInfo(after || lead);
       return;
     }
+    if (intent === 'unclear') {
+      await updateLead(lead.chat_id, { status: 'needs_admin', bot_enabled: false }, lead.account_key);
+      await logEvent(lead.chat_id, 'asked_info_unclear_human_needed', text, lead.account_key);
+      return;
+    }
     const keys = await flowTemplateKeys(lead.account_key, 'no_info', ['unknown_info_preface', 'full_intro', 'offer_end']);
     const after = await sendPackage(lead, 'unknown_info_package', keys, {});
     await finishAfterInfo(after || lead);
@@ -1994,24 +2090,78 @@ async function getArchiveRows(type, accountOrKey = DEFAULT_ACCOUNT_KEY, chatId =
   return data || [];
 }
 
+async function getArchivePeople(accountOrKey = DEFAULT_ACCOUNT_KEY, limit = 20) {
+  let q = supabase.from('message_archive')
+    .select('chat_id,from_username,from_first_name,created_at,deleted_at,edited_at')
+    .order('created_at', { ascending: false })
+    .limit(100);
+  q = archiveAccountFilter(q, accountOrKey);
+  const { data, error } = await q;
+  if (error) {
+    console.error('getArchivePeople:', error.message);
+    return [];
+  }
+  const seen = new Map();
+  for (const row of data || []) {
+    if (!seen.has(row.chat_id)) seen.set(row.chat_id, row);
+    if (seen.size >= limit) break;
+  }
+  return [...seen.values()];
+}
+
+async function sendArchivePeopleMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = await getAccount(accountOrKey);
+  const people = await getArchivePeople(account.account_key);
+  const rows = people.map(p => ([{
+    text: p.from_username ? `@${p.from_username}` : (p.from_first_name || String(p.chat_id)),
+    callback_data: `archp:${account.account_key}:${p.chat_id}`
+  }]));
+  if (!rows.length) rows.push([{ text: 'Hozircha arxiv yo‘q', callback_data: 'noop' }]);
+  rows.push([{ text: '⬅️ Menyu', callback_data: 'menu' }]);
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `Joriy akkaunt: ${account.label || accountDisplayLabel(account.account_key)}\n\n🕵️ Arxiv`,
+    reply_markup: { inline_keyboard: rows }
+  });
+}
+
+function archiveEventLabel(row = {}) {
+  const type = row.last_event_type === 'edited' || Number(row.edit_count || 0) > 0 ? 'tahrirlandi' : 'o‘chirildi';
+  const item = row.message_type === 'photo' ? 'rasm' :
+    row.message_type === 'voice' ? 'ovozli xabar' :
+    row.message_type === 'video_note' ? 'dumaloq video' :
+    row.message_type === 'document' ? 'fayl' :
+    row.message_type === 'video' ? 'video' : 'xabar';
+  return `${item} ${type}`;
+}
+
+async function sendArchivePersonEvents(chatId, accountOrKey, targetChatId) {
+  const account = await getAccount(accountOrKey);
+  const rows = await getArchiveRows('recent', account.account_key, targetChatId, 20);
+  const buttons = rows.map(r => {
+    const d = new Date(r.deleted_at || r.edited_at || r.created_at || Date.now());
+    const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    return [{ text: `${time} — ${archiveEventLabel(r)}`, callback_data: `archv:${account.account_key}:${r.id}` }];
+  });
+  if (!buttons.length) buttons.push([{ text: 'Bu chatda arxiv topilmadi', callback_data: 'noop' }]);
+  buttons.push([{ text: '⬅️ Arxiv', callback_data: `archa:${account.account_key}` }]);
+  const person = rows[0]?.from_username ? `@${rows[0].from_username}` : (rows[0]?.from_first_name || String(targetChatId));
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `Joriy akkaunt: ${account.label || accountDisplayLabel(account.account_key)}\n\n${person}`,
+    reply_markup: { inline_keyboard: buttons }
+  });
+}
+
 async function archiveRowsText(title, rows) {
   if (!rows.length) return `${title}\n\nHozircha ro‘yxat bo‘sh.`;
   const lines = [];
   for (const [i, r] of rows.entries()) {
-    const adminChatId = await getAdminChatIdForAccount(r.account_key || DEFAULT_ACCOUNT_KEY);
+    const d = new Date(r.deleted_at || r.edited_at || r.created_at || Date.now());
+    const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
     lines.push(
-      `${i + 1}. ${r.from_username ? '@' + r.from_username : (r.from_first_name || '-') } — ${r.direction || 'unknown'} ${r.message_type || 'other'}\n` +
-      `   Chat ID: ${r.chat_id}\n` +
-      `   Message ID: ${r.message_id}\n` +
-      `   Business connection: ${r.business_connection_id || '-'}\n` +
-      `   Account: ${r.account_key || '-'}\n` +
-      `   Notification admin: ${adminChatId || '-'}\n` +
-      `   From username: ${r.from_username ? '@' + r.from_username : '-'}\n` +
-      `   Type: ${r.message_type || 'other'}\n` +
-      `   Deleted at: ${r.deleted_at || '-'}\n` +
-      `   Edited at: ${r.edited_at || '-'}\n` +
-      `   Text: ${short(r.text || r.caption || '-', 90)}\n` +
-      `   Event: ${r.last_event_type || '-'}${r.delete_detected ? ' / deleted' : ''}${r.edit_count ? ` / edits:${r.edit_count}` : ''}`
+      `${i + 1}. ${r.from_username ? '@' + r.from_username : (r.from_first_name || '-') } — ${time} — ${archiveEventLabel(r)}\n` +
+      `   ${short(r.text || r.caption || '-', 90)}`
     );
   }
   return `${title}\n\n${lines.join('\n\n')}`;
@@ -2020,10 +2170,8 @@ async function archiveRowsText(title, rows) {
 function archiveMenuKeyboard() {
   return {
     inline_keyboard: [
-      [{ text: '🗑 O‘chirilgan xabarlar', callback_data: 'archive:deleted' }],
-      [{ text: '✏️ Tahrirlangan xabarlar', callback_data: 'archive:edited' }],
-      [{ text: '🖼 Media arxiv', callback_data: 'archive:media' }],
-      [{ text: '🔎 Chat bo‘yicha qidirish', callback_data: 'archive:search_help' }],
+      [{ text: 'UZLYE', callback_data: 'archa:uzlye' }],
+      [{ text: 'Ikkinchi akkaunt', callback_data: 'archa:second' }],
       [{ text: '⬅️ Menyu', callback_data: 'menu' }]
     ]
   };
@@ -2032,7 +2180,7 @@ function archiveMenuKeyboard() {
 async function sendArchiveMenu(chatId) {
   return tg('sendMessage', {
     chat_id: chatId,
-    text: '🕵️ Dialog arxiv',
+    text: '🕵️ Arxiv\n\nAkkauntni tanlang.',
     reply_markup: archiveMenuKeyboard()
   });
 }
@@ -2222,7 +2370,7 @@ async function sendAccountsMenu(chatId) {
   rows.push([{ text: '⬅️ Menyu', callback_data: 'menu' }]);
   return tg('sendMessage', {
     chat_id: chatId,
-    text: '👤 Akkaunt tanlash',
+    text: `Joriy akkaunt: ${accountDisplayLabel(selected)}\n\n👤 Akkaunt tanlash`,
     reply_markup: { inline_keyboard: rows }
   });
 }
@@ -2257,7 +2405,7 @@ async function sendTemplatesMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   rows.push([{ text: '⬅️ Menyu', callback_data: 'menu' }]);
   return tg('sendMessage', {
     chat_id: chatId,
-    text: `✏️ Shablonlar\nAkkaunt: ${accountKey(accountOrKey)}`,
+    text: `Joriy akkaunt: ${accountDisplayLabel(accountOrKey)}\n\n✏️ Shablonlar`,
     reply_markup: { inline_keyboard: rows }
   });
 }
@@ -2265,7 +2413,7 @@ async function sendTemplatesMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
 async function sendTemplateActions(chatId, templateKey, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   return tg('sendMessage', {
     chat_id: chatId,
-    text: `Shablon: ${templateKey}`,
+    text: `Joriy akkaunt: ${accountDisplayLabel(accountOrKey)}\n\nShablon: ${templateKey}`,
     reply_markup: {
       inline_keyboard: [
         [{ text: '👁 Ko‘rish', callback_data: `tpl_view:${templateKey}` }],
@@ -2281,7 +2429,7 @@ async function sendTemplateActions(chatId, templateKey, accountOrKey = DEFAULT_A
 async function showAiTemplatePreview(chatId, accountOrKey, templateKey, roughText) {
   const result = await improveTemplateWithAI({ accountKey: accountKey(accountOrKey), templateKey, roughText });
   const edited = result?.text;
-  if (!edited) return tg('sendMessage', { chat_id: chatId, text: 'AI tahrir hozir ishlamadi. OPENAI_API_KEY va AI_TEMPLATE_EDITOR_ENABLED sozlamalarini tekshiring.' });
+  if (!edited) return tg('sendMessage', { chat_id: chatId, text: 'AI hozircha sozlanmagan. OPENAI_API_KEY kerak.' });
   await setAdminSession(chatId, 'ai_template_preview', {
     selected_account_key: accountKey(accountOrKey),
     template_key: templateKey,
@@ -2290,11 +2438,41 @@ async function showAiTemplatePreview(chatId, accountOrKey, templateKey, roughTex
   });
   return tg('sendMessage', {
     chat_id: chatId,
-    text: `AI tahrirlangan matn:\n\n${edited}`,
+    text: `Joriy akkaunt: ${accountDisplayLabel(accountOrKey)}\n\nAI tahrirlangan matn:\n\n${edited}\n\nSaqlaysizmi?`,
     reply_markup: {
       inline_keyboard: [
         [{ text: '✅ Saqlash', callback_data: 'tpl_ai_save' }, { text: '✏️ Qayta tahrirlash', callback_data: 'tpl_ai_retry' }],
         [{ text: '❌ Bekor qilish', callback_data: 'tpl_ai_cancel' }]
+      ]
+    }
+  });
+}
+
+async function startTemplateEdit(chatId, accountOrKey, templateKey) {
+  await setAdminSession(chatId, 'template_edit_input', {
+    selected_account_key: accountKey(accountOrKey),
+    template_key: templateKey
+  });
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `Joriy akkaunt: ${accountDisplayLabel(accountOrKey)}\n\nYangi matnni yuboring. Bu faqat ${accountDisplayLabel(accountOrKey)} akkaunti uchun saqlanadi.`,
+    reply_markup: { inline_keyboard: [[{ text: '❌ Bekor qilish', callback_data: 'tpl_edit_cancel' }]] }
+  });
+}
+
+async function showTemplateEditPreview(chatId, accountOrKey, templateKey, text) {
+  await setAdminSession(chatId, 'template_edit_preview', {
+    selected_account_key: accountKey(accountOrKey),
+    template_key: templateKey,
+    edited_text: text
+  });
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `Joriy akkaunt: ${accountDisplayLabel(accountOrKey)}\n\nYangi shablon preview:\n${text}\n\nSaqlaysizmi?`,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '✅ Saqlash', callback_data: 'tpl_edit_save' }, { text: '❌ Bekor qilish', callback_data: 'tpl_edit_cancel' }],
+        [{ text: '✏️ Qayta yozish', callback_data: 'tpl_edit_retry' }]
       ]
     }
   });
@@ -2364,14 +2542,13 @@ async function sendDashboard(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
 function mainMenuKeyboard(showAccounts = false) {
   const rows = [
       ...(showAccounts ? [[{ text: '👤 Akkaunt tanlash', callback_data: 'accounts' }]] : []),
-      [{ text: '🟢 Auto javobni yoqish', callback_data: 'auto:2' }, { text: '🔴 Auto javobni o‘chirish', callback_data: 'auto:off' }],
-      [{ text: '📊 Auto holati', callback_data: 'autostatus' }, { text: '📣 Outreach', callback_data: 'outreach_menu' }],
-      [{ text: '📣 Outreach', callback_data: 'outreach_menu' }, { text: '📊 Hisobot', callback_data: 'report' }],
+      [{ text: '✏️ Shablonlar', callback_data: 'templates' }],
+      [{ text: '🔁 Ketma-ketlik', callback_data: 'flow_menu' }, { text: '🤖 AI sozlamalari', callback_data: 'ai_menu' }],
+      [{ text: '🧠 Javob qoidalari', callback_data: 'rules_menu' }, { text: '🕵️ Arxiv', callback_data: 'archive_menu' }],
+      [{ text: '📊 Diagnostika', callback_data: 'diagnostics' }, { text: '⚙️ Auto javob', callback_data: 'outreach_menu' }],
       [{ text: '📄 Ma’lumot yuborilganlar', callback_data: 'list:info_sent' }],
       [{ text: '✅ Tanishdim yozganlar', callback_data: 'list:read' }, { text: '💳 To‘lovga yaqinlar', callback_data: 'list:payment' }],
-      [{ text: '⏰ Eslatma keraklar', callback_data: 'list:reminders' }],
-      [{ text: '🕵️ Dialog arxiv', callback_data: 'archive_menu' }],
-      [{ text: '✏️ Shablonlar', callback_data: 'templates' }, { text: '🩺 Bot holati', callback_data: 'diagnostics' }]
+      [{ text: '⏰ Eslatma keraklar', callback_data: 'list:reminders' }, { text: '📊 Hisobot', callback_data: 'report' }]
   ];
   return { inline_keyboard: rows };
 }
@@ -2414,6 +2591,16 @@ async function handleAdminMessage(msg) {
   if (!text) return;
   const selectedAccountKey = await getSelectedAccountKey(chatId);
   const session = await getAdminSession(chatId);
+
+  if (text === '/cancel') {
+    await setAdminSession(chatId, 'account_selected', { selected_account_key: selectedAccountKey });
+    return tg('sendMessage', { chat_id: chatId, text: 'Bekor qilindi.' });
+  }
+
+  if (session?.mode === 'template_edit_input' && !text.startsWith('/')) {
+    const payload = session.payload || {};
+    return showTemplateEditPreview(chatId, payload.selected_account_key || selectedAccountKey, payload.template_key, text);
+  }
 
   if (session?.mode === 'ai_template_input' && !text.startsWith('/')) {
     const payload = session.payload || {};
@@ -2548,7 +2735,7 @@ async function handleAdminMessage(msg) {
   if (text === '/healthtemplates') return healthTemplates(chatId, selectedAccountKey);
   if (text === '/diagnostics') return diagnostics(chatId, selectedAccountKey);
   if (text === '/archive') return sendArchiveMenu(chatId);
-  if (text.startsWith('/archive ')) return sendArchiveList(chatId, 'recent', text.split(/\s+/)[1]);
+  if (text.startsWith('/archive ')) return sendArchivePeopleMenu(chatId, text.split(/\s+/)[1]);
   if (text === '/deleted' || text.startsWith('/deleted ')) return sendArchiveList(chatId, 'deleted', text.split(/\s+/)[1] || selectedAccountKey);
   if (text === '/edited' || text.startsWith('/edited ')) return sendArchiveList(chatId, 'edited', text.split(/\s+/)[1] || selectedAccountKey);
   if (text === '/media' || text.startsWith('/media ')) return sendArchiveList(chatId, 'media', text.split(/\s+/)[1] || selectedAccountKey);
@@ -2748,6 +2935,15 @@ async function handleCallback(cb) {
   if (data === 'menu' || data === 'noop') return sendDashboard(chatId, selectedAccountKey);
   if (data === 'accounts') return sendAccountsMenu(chatId);
   if (data === 'archive_menu') return sendArchiveMenu(chatId);
+  if (data.startsWith('archa:')) return sendArchivePeopleMenu(chatId, data.split(':')[1]);
+  if (data.startsWith('archp:')) {
+    const [, ak, targetChatId] = data.split(':');
+    return sendArchivePersonEvents(chatId, ak, targetChatId);
+  }
+  if (data.startsWith('archv:')) {
+    const [, ak, archiveId] = data.split(':');
+    return sendArchiveFullDetail(chatId, ak, archiveId);
+  }
   if (data === 'archive:deleted') return sendArchiveList(chatId, 'deleted', selectedAccountKey);
   if (data === 'archive:edited') return sendArchiveList(chatId, 'edited', selectedAccountKey);
   if (data === 'archive:media') return sendArchiveList(chatId, 'media', selectedAccountKey);
@@ -2759,6 +2955,12 @@ async function handleCallback(cb) {
     return tg('sendMessage', { chat_id: chatId, text: `✅ Akkaunt tanlandi: ${account.label || account.account_key}` });
   }
   if (data === 'outreach_menu') return sendOutreachMenu(chatId, selectedAccountKey);
+  if (data === 'flow_menu') return sendFlow(chatId, selectedAccountKey);
+  if (data === 'ai_menu') {
+    const enabled = await getAccountAiEnabled(selectedAccountKey);
+    return tg('sendMessage', { chat_id: chatId, text: `Joriy akkaunt: ${accountDisplayLabel(selectedAccountKey)}\n\n🤖 AI sozlamalari\nAI intent: ${enabled ? 'ON' : 'OFF'}\nModel: ${OPENAI_MODEL}\nOPENAI_API_KEY: ${OPENAI_API_KEY ? 'bor' : 'yo‘q'}` });
+  }
+  if (data === 'rules_menu') return tg('sendMessage', { chat_id: chatId, text: `Joriy akkaunt: ${accountDisplayLabel(selectedAccountKey)}\n\n🧠 Javob qoidalari\nTekshirish: /testrule ${selectedAccountKey} STEP_KEY TEXT\nAI test: /testai ${selectedAccountKey} STEP_KEY TEXT` });
   if (data === 'autostatus') return autoStatus(chatId, selectedAccountKey);
   if (data.startsWith('auto:')) {
     const arg = data.split(':')[1];
@@ -2788,12 +2990,12 @@ async function handleCallback(cb) {
   }
   if (data.startsWith('tpl_edit:')) {
     const key = data.split(':')[1];
-    return tg('sendMessage', { chat_id: chatId, text: `Oddiy tahrirlash:\n/settemplate ${selectedAccountKey} ${key} yangi matn` });
+    return startTemplateEdit(chatId, selectedAccountKey, key);
   }
   if (data.startsWith('tpl_ai:')) {
     const key = data.split(':')[1];
     await setAdminSession(chatId, 'ai_template_input', { selected_account_key: selectedAccountKey, template_key: key });
-    return tg('sendMessage', { chat_id: chatId, text: `🤖 AI bilan tahrirlash\n\n${key} uchun xomaki matn yuboring.` });
+    return tg('sendMessage', { chat_id: chatId, text: `Joriy akkaunt: ${accountDisplayLabel(selectedAccountKey)}\n\nXomaki matnni yuboring. AI imlo, tinish belgilari va uslubni yaxshilab beradi.` });
   }
   if (data.startsWith('tpl_test:')) {
     const key = data.split(':')[1];
@@ -2808,13 +3010,27 @@ async function handleCallback(cb) {
     await setAdminSession(chatId, 'account_selected', { selected_account_key: payload.selected_account_key });
     return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: ${payload.selected_account_key}/${payload.template_key}` });
   }
+  if (data === 'tpl_edit_save') {
+    const session = await getAdminSession(chatId);
+    const payload = session?.payload || {};
+    if (!payload.template_key || !payload.edited_text) return tg('sendMessage', { chat_id: chatId, text: 'Saqlanadigan preview topilmadi.' });
+    await setTemplate(payload.template_key, payload.edited_text, payload.selected_account_key);
+    await setAdminSession(chatId, 'account_selected', { selected_account_key: payload.selected_account_key });
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: ${payload.selected_account_key}/${payload.template_key}` });
+  }
+  if (data === 'tpl_edit_retry') {
+    const session = await getAdminSession(chatId);
+    const payload = session?.payload || {};
+    await setAdminSession(chatId, 'template_edit_input', payload);
+    return tg('sendMessage', { chat_id: chatId, text: `Joriy akkaunt: ${accountDisplayLabel(payload.selected_account_key || selectedAccountKey)}\n\nYangi matnni yuboring.` });
+  }
   if (data === 'tpl_ai_retry') {
     const session = await getAdminSession(chatId);
     const payload = session?.payload || {};
     await setAdminSession(chatId, 'ai_template_input', payload);
     return tg('sendMessage', { chat_id: chatId, text: 'Qayta tahrirlash uchun yangi xomaki matn yuboring.' });
   }
-  if (data === 'tpl_ai_cancel') {
+  if (data === 'tpl_ai_cancel' || data === 'tpl_edit_cancel') {
     await setAdminSession(chatId, 'account_selected', { selected_account_key: selectedAccountKey });
     return tg('sendMessage', { chat_id: chatId, text: 'Bekor qilindi.' });
   }
