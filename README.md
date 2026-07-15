@@ -24,6 +24,8 @@ Bu versiya ataylab sodda qilingan: bot faqat yangi outreach lidga ma’lumot ber
 - Dialog arxiv: Telegram Business bot ruxsat olgan chatlarda xabar metadata, media metadata, tahrir va o‘chirish hodisalarini saqlaydi.
 - `supabase.sql` eski tahrirlangan shablonlarni overwrite qilmaydi (`on conflict do nothing`).
 - `/resetme`: faqat test qilayotgan shu chat/profil holatini tozalaydi, eski funksiyalarni olib tashlamaydi.
+- Test mode default xavfsiz: `TEST_MODE=true` bo‘lsa avtomatik javob faqat `TEST_LEAD_IDS` ichidagi lidlarga ketadi.
+- Har akkauntda Bot ON/OFF va Reach ON/OFF alohida boshqariladi.
 
 ## Render sozlamalari
 
@@ -40,6 +42,17 @@ node index.js
 ```
 
 Environment Variables uchun `.env.example` fayliga qarang.
+
+Muhim test-mode sozlamalari:
+
+```text
+TEST_MODE=true
+TEST_ADMIN_IDS=8254451152,8304283149
+TEST_LEAD_IDS=comma,separated,lead_chat_ids
+ADMIN_TAKEOVER_MINUTES=10
+```
+
+`TEST_LEAD_IDS` bo‘sh bo‘lsa va `TEST_MODE=true` bo‘lsa, mijozlarga avtomatik javob yuborilmaydi. Admin menyusi mavjud account ownership orqali ishlaydi; `TEST_ADMIN_IDS` to‘ldirilsa, admin menyu ham shu ro‘yxat bilan cheklanadi.
 
 ## Webhook ulash
 
@@ -119,6 +132,10 @@ https://YOUR-RENDER-APP.onrender.com/tick
 /akkauntadmin ACCOUNT_KEY TELEGRAM_ID
 /akkauntniyoq ACCOUNT_KEY
 /akkauntochir ACCOUNT_KEY
+/botniyoq ACCOUNT_KEY
+/botniochir ACCOUNT_KEY
+/reachyoq ACCOUNT_KEY
+/reachochir ACCOUNT_KEY
 /sozlamalar
 /sozlamalar ACCOUNT_KEY
 /ketmaketlik ACCOUNT_KEY
@@ -272,11 +289,24 @@ Platform Admin Bot buyruqlari:
 /cancel
 ```
 
-## Account-specific command builder
+## Account-specific command management
 
-Business owner menyusida `🧩 Buyruqlar` bo‘limi bor. Owner o‘z akkaunti uchun slash command, keyword, exact text yoki contains trigger yaratadi; javob sifatida oddiy matn, shablon, shablonlar ketma-ketligi, flow step yoki human-needed holatini tanlaydi. Global buyruqlar (`/menu`, `/whoami`, `/settings`, `/commands`, `/archive`, `/report` va boshqalar) override qilinmaydi.
+Business owner menyusida `🧩 Buyruqlar` bo‘limi faqat ruxsatli ikki profil uchun ishlaydi. Hozir v5 Lite’da yangi buyruq yaratish wizard’i o‘chirilgan: mavjud buyruqlarni ko‘rish, shablonini tahrirlash, arxivlash va qayta tiklash ishlaydi. Global buyruqlar (`/menu`, `/whoami`, `/settings`, `/commands`, `/archive`, `/report` va boshqalar) override qilinmaydi.
 
 Custom commandlar faqat o‘z `account_key` doirasida ishlaydi. Mijoz biznes chatda mos xabar yuborsa, bot avval shu akkaunt commandlarini tekshiradi; mos command topilmasa eski info-only lead flow davom etadi. Test rejimida real mijozga xabar yuborilmaydi.
+
+## Bot va Reach ON/OFF
+
+Har bir akkauntda umumiy bot holati va reach holati alohida:
+
+```text
+/botniyoq ACCOUNT_KEY
+/botniochir ACCOUNT_KEY
+/reachyoq ACCOUNT_KEY
+/reachochir ACCOUNT_KEY
+```
+
+Bot OFF bo‘lsa avtomatik javob, AI intent, timer va follow-up yuborilmaydi. Reach OFF bo‘lsa yangi outreach session boshlanmaydi va outgoing reach xabarlari lidni avtomatik faollashtirmaydi. Admin qo‘lda yozgan xabarlar arxiv/kontekst uchun saqlanishi mumkin.
 
 ## Archive settings
 

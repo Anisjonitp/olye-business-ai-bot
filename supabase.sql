@@ -4,21 +4,55 @@
 
 create table if not exists business_leads (
   id bigserial primary key,
-  chat_id text unique not null,
+  chat_id text not null,
+  lead_chat_id text,
   account_key text,
   business_connection_id text,
   first_name text,
   username text,
   status text default 'active',
   stage text default 'new',
+  current_stage text default 'new',
+  previous_stage text,
   bot_enabled boolean default true,
+  bot_enabled_for_lead boolean default true,
+  manual_only boolean default false,
   outreach_sent boolean default false,
+  reach_sent boolean default false,
+  reach_sent_at timestamptz,
   outreach_session_id text,
   outreach_message text,
+  reach_message_text text,
+  reach_message_id text,
+  reach_batch_id text,
+  assigned_by_reach boolean default false,
+  assigned_by_admin boolean default false,
+  manually_started boolean default false,
   outreach_at timestamptz,
   last_user_message text,
   last_bot_message text,
   last_admin_message text,
+  first_admin_message text,
+  first_admin_message_at timestamptz,
+  last_admin_message_at timestamptz,
+  last_bot_message_at timestamptz,
+  last_customer_message text,
+  last_customer_message_at timestamptz,
+  last_actor text,
+  paused_at timestamptz,
+  paused_by text,
+  pause_reason text,
+  last_intent text,
+  last_intent_confidence numeric,
+  last_template_key text,
+  next_action text,
+  needs_human boolean default false,
+  needs_human_reason text,
+  admin_active_until timestamptz,
+  followup_count integer default 0,
+  opted_out boolean default false,
+  processing_lock_until timestamptz,
+  processing_event_id text,
   last_message_at timestamptz default now(),
   stage_started_at timestamptz default now(),
   finished_at timestamptz,
@@ -38,6 +72,8 @@ create table if not exists bot_accounts (
   project_name text,
   bot_enabled boolean default true,
   auto_reply_enabled boolean default false,
+  reach_enabled boolean default true,
+  followup_enabled boolean default true,
   archive_enabled boolean default true,
   archive_notify_enabled boolean default true,
   reports_enabled boolean default true,
@@ -52,6 +88,7 @@ create table if not exists bot_accounts (
   flow_key text default 'info_only',
   timezone text default 'Asia/Tashkent',
   last_seen_at timestamptz,
+  updated_by text,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
@@ -76,6 +113,8 @@ create table if not exists business_accounts (
   business_connection_id text,
   bot_enabled boolean default true,
   auto_reply_enabled boolean default false,
+  reach_enabled boolean default true,
+  followup_enabled boolean default true,
   archive_enabled boolean default true,
   reports_enabled boolean default true,
   ai_intent_enabled boolean default false,
@@ -83,6 +122,7 @@ create table if not exists business_accounts (
   ai_rules_enabled boolean default true,
   timezone text default 'Asia/Tashkent',
   last_seen_at timestamptz,
+  updated_by text,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
@@ -202,6 +242,8 @@ alter table bot_accounts add column if not exists business_connection_id text;
 alter table bot_accounts add column if not exists project_name text;
 alter table bot_accounts add column if not exists bot_enabled boolean default true;
 alter table bot_accounts add column if not exists auto_reply_enabled boolean default false;
+alter table bot_accounts add column if not exists reach_enabled boolean default true;
+alter table bot_accounts add column if not exists followup_enabled boolean default true;
 alter table bot_accounts add column if not exists archive_enabled boolean default true;
 alter table bot_accounts add column if not exists track_deleted_enabled boolean default true;
 alter table bot_accounts add column if not exists track_edited_enabled boolean default true;
@@ -218,6 +260,7 @@ alter table bot_accounts add column if not exists daily_report_time text default
 alter table bot_accounts add column if not exists flow_key text default 'info_only';
 alter table bot_accounts add column if not exists timezone text default 'Asia/Tashkent';
 alter table bot_accounts add column if not exists last_seen_at timestamptz;
+alter table bot_accounts add column if not exists updated_by text;
 alter table bot_accounts add column if not exists created_at timestamptz default now();
 alter table bot_accounts add column if not exists updated_at timestamptz default now();
 
@@ -236,6 +279,8 @@ alter table business_accounts add column if not exists admin_chat_id text;
 alter table business_accounts add column if not exists business_connection_id text;
 alter table business_accounts add column if not exists bot_enabled boolean default true;
 alter table business_accounts add column if not exists auto_reply_enabled boolean default false;
+alter table business_accounts add column if not exists reach_enabled boolean default true;
+alter table business_accounts add column if not exists followup_enabled boolean default true;
 alter table business_accounts add column if not exists archive_enabled boolean default true;
 alter table business_accounts add column if not exists track_deleted_enabled boolean default true;
 alter table business_accounts add column if not exists track_edited_enabled boolean default true;
@@ -248,6 +293,7 @@ alter table business_accounts add column if not exists custom_commands_enabled b
 alter table business_accounts add column if not exists ai_rules_enabled boolean default true;
 alter table business_accounts add column if not exists timezone text default 'Asia/Tashkent';
 alter table business_accounts add column if not exists last_seen_at timestamptz;
+alter table business_accounts add column if not exists updated_by text;
 alter table business_accounts add column if not exists created_at timestamptz default now();
 alter table business_accounts add column if not exists updated_at timestamptz default now();
 
@@ -336,24 +382,71 @@ alter table account_ai_rules add column if not exists created_at timestamptz def
 alter table account_ai_rules add column if not exists updated_at timestamptz default now();
 
 alter table business_leads add column if not exists account_key text;
+alter table business_leads add column if not exists lead_chat_id text;
 alter table business_leads add column if not exists business_connection_id text;
 alter table business_leads add column if not exists first_name text;
 alter table business_leads add column if not exists username text;
 alter table business_leads add column if not exists status text default 'active';
 alter table business_leads add column if not exists stage text default 'new';
+alter table business_leads add column if not exists current_stage text default 'new';
+alter table business_leads add column if not exists previous_stage text;
 alter table business_leads add column if not exists bot_enabled boolean default true;
+alter table business_leads add column if not exists bot_enabled_for_lead boolean default true;
+alter table business_leads add column if not exists manual_only boolean default false;
 alter table business_leads add column if not exists outreach_sent boolean default false;
+alter table business_leads add column if not exists reach_sent boolean default false;
+alter table business_leads add column if not exists reach_sent_at timestamptz;
 alter table business_leads add column if not exists outreach_session_id text;
 alter table business_leads add column if not exists outreach_message text;
+alter table business_leads add column if not exists reach_message_text text;
+alter table business_leads add column if not exists reach_message_id text;
+alter table business_leads add column if not exists reach_batch_id text;
+alter table business_leads add column if not exists assigned_by_reach boolean default false;
+alter table business_leads add column if not exists assigned_by_admin boolean default false;
+alter table business_leads add column if not exists manually_started boolean default false;
 alter table business_leads add column if not exists outreach_at timestamptz;
 alter table business_leads add column if not exists last_user_message text;
 alter table business_leads add column if not exists last_bot_message text;
 alter table business_leads add column if not exists last_admin_message text;
+alter table business_leads add column if not exists first_admin_message text;
+alter table business_leads add column if not exists first_admin_message_at timestamptz;
+alter table business_leads add column if not exists last_admin_message_at timestamptz;
+alter table business_leads add column if not exists last_bot_message_at timestamptz;
+alter table business_leads add column if not exists last_customer_message text;
+alter table business_leads add column if not exists last_customer_message_at timestamptz;
+alter table business_leads add column if not exists last_actor text;
+alter table business_leads add column if not exists paused_at timestamptz;
+alter table business_leads add column if not exists paused_by text;
+alter table business_leads add column if not exists pause_reason text;
+alter table business_leads add column if not exists last_intent text;
+alter table business_leads add column if not exists last_intent_confidence numeric;
+alter table business_leads add column if not exists last_template_key text;
+alter table business_leads add column if not exists next_action text;
+alter table business_leads add column if not exists needs_human boolean default false;
+alter table business_leads add column if not exists needs_human_reason text;
+alter table business_leads add column if not exists admin_active_until timestamptz;
+alter table business_leads add column if not exists followup_count integer default 0;
+alter table business_leads add column if not exists opted_out boolean default false;
+alter table business_leads add column if not exists processing_lock_until timestamptz;
+alter table business_leads add column if not exists processing_event_id text;
 alter table business_leads add column if not exists last_message_at timestamptz default now();
 alter table business_leads add column if not exists stage_started_at timestamptz default now();
 alter table business_leads add column if not exists finished_at timestamptz;
 alter table business_leads add column if not exists created_at timestamptz default now();
 alter table business_leads add column if not exists updated_at timestamptz default now();
+
+-- Older installs created a global unique constraint on chat_id. Two account mode
+-- needs uniqueness by (account_key, chat_id) instead; this preserves all rows.
+do $$
+begin
+  if exists (
+    select 1 from pg_constraint
+    where conrelid = 'business_leads'::regclass
+      and conname = 'business_leads_chat_id_key'
+  ) then
+    alter table business_leads drop constraint business_leads_chat_id_key;
+  end if;
+end $$;
 
 create table if not exists reply_templates (
   key text primary key,
@@ -375,6 +468,37 @@ create table if not exists lead_events (
 );
 
 alter table lead_events add column if not exists account_key text;
+
+create table if not exists lead_audit_logs (
+  id bigserial primary key,
+  account_key text,
+  lead_chat_id text,
+  action text not null,
+  old_value jsonb,
+  new_value jsonb,
+  actor_type text default 'system',
+  actor_id text,
+  created_at timestamptz default now()
+);
+
+create table if not exists lead_notes (
+  id bigserial primary key,
+  account_key text not null,
+  lead_chat_id text not null,
+  note_text text not null,
+  created_by text,
+  created_at timestamptz default now()
+);
+
+create table if not exists processed_events (
+  id bigserial primary key,
+  account_key text,
+  update_id text,
+  message_id text,
+  event_type text,
+  processed_at timestamptz default now(),
+  unique(account_key, update_id, message_id, event_type)
+);
 
 create table if not exists processed_messages (
   message_key text primary key,
@@ -606,11 +730,17 @@ alter table account_reply_rules add column if not exists created_at timestamptz 
 alter table account_reply_rules add column if not exists updated_at timestamptz default now();
 
 create index if not exists business_leads_account_idx on business_leads(account_key);
+create unique index if not exists business_leads_account_chat_unique_idx on business_leads(account_key, chat_id);
 create index if not exists business_leads_account_stage_idx on business_leads(account_key, stage);
 create index if not exists business_leads_account_status_idx on business_leads(account_key, status);
 create index if not exists business_leads_account_outreach_idx on business_leads(account_key, outreach_session_id);
+create index if not exists business_leads_account_reach_idx on business_leads(account_key, reach_sent, assigned_by_admin, manually_started);
+create index if not exists business_leads_processing_lock_idx on business_leads(account_key, processing_lock_until);
 create index if not exists reply_templates_account_idx on reply_templates(account_key);
 create index if not exists lead_events_account_idx on lead_events(account_key, created_at desc);
+create index if not exists lead_audit_logs_account_chat_idx on lead_audit_logs(account_key, lead_chat_id, created_at desc);
+create index if not exists lead_notes_account_chat_idx on lead_notes(account_key, lead_chat_id, created_at desc);
+create index if not exists processed_events_account_idx on processed_events(account_key, processed_at desc);
 create index if not exists processed_messages_account_idx on processed_messages(account_key);
 create index if not exists sent_actions_account_idx on sent_actions(account_key);
 create unique index if not exists message_archive_account_chat_message_idx on message_archive(account_key, chat_id, message_id);

@@ -56,6 +56,10 @@ const COMMAND_MANAGEMENT_ACCOUNT_KEYS = new Set([
   process.env.SECOND_ACCOUNT_KEY || 'second'
 ].filter(Boolean));
 const COMMAND_MANAGEMENT_DENIED_TEXT = 'Bu bo‘limdan foydalanish uchun sizda ruxsat yo‘q.';
+const TEST_MODE = String(process.env.TEST_MODE || 'true') === 'true';
+const TEST_ADMIN_IDS = envIdSet(process.env.TEST_ADMIN_IDS || '');
+const TEST_LEAD_IDS = envIdSet(process.env.TEST_LEAD_IDS || '');
+const ADMIN_TAKEOVER_MINUTES = Number(process.env.ADMIN_TAKEOVER_MINUTES || 10);
 
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL missing');
@@ -79,6 +83,11 @@ const STAGE = {
 const STOP_REPLY_STAGES = new Set([STAGE.INFO_SENT_FINISHED, STAGE.PAUSED, STAGE.DISABLED]);
 const IGNORE_REASONS = [
   'auto_reply_off',
+  'account_bot_off',
+  'lead_auto_reply_off',
+  'reach_off',
+  'test_mode_blocked',
+  'admin_takeover_active',
   'no_outreach_session',
   'old_finished_chat',
   'blocked_stage',
@@ -87,6 +96,14 @@ const IGNORE_REASONS = [
 ];
 const buffers = new Map();
 let schedulerBusy = false;
+
+function envIdSet(value = '') {
+  return new Set(String(value || '').split(',').map(id => id.trim()).filter(Boolean));
+}
+
+function idSetHas(set, ...ids) {
+  return ids.map(id => String(id || '').trim()).some(id => id && set.has(id));
+}
 
 function parseAccountsFromEnv() {
   const fallback = [{
@@ -97,6 +114,9 @@ function parseAccountsFromEnv() {
     business_connection_id: '',
     project_name: 'O‘zbekiston Lider Yoshlari Ensiklopediyasi',
     flow_key: 'uzlye_info_only',
+    bot_enabled: true,
+    auto_reply_enabled: true,
+    reach_enabled: true,
     archive_enabled: true,
     archive_notify_enabled: true
   }];
@@ -111,6 +131,9 @@ function parseAccountsFromEnv() {
         business_connection_id: process.env.SECOND_ACCOUNT_BUSINESS_CONNECTION_ID || '',
         project_name: process.env.SECOND_ACCOUNT_PROJECT_NAME || 'Millat Iftixorlari ensiklopediyasi',
         flow_key: process.env.SECOND_ACCOUNT_FLOW_KEY || 'second_info_only',
+        bot_enabled: true,
+        auto_reply_enabled: true,
+        reach_enabled: true,
         archive_enabled: true,
         archive_notify_enabled: true
       });
@@ -128,6 +151,9 @@ function parseAccountsFromEnv() {
       business_connection_id: String(a.business_connection_id || ''),
       project_name: String(a.project_name || a.label || a.account_key || `Account ${i + 1}`),
       flow_key: String(a.flow_key || 'info_only'),
+      bot_enabled: a.bot_enabled !== false,
+      auto_reply_enabled: a.auto_reply_enabled !== false,
+      reach_enabled: a.reach_enabled !== false,
       archive_enabled: a.archive_enabled !== false,
       archive_notify_enabled: a.archive_notify_enabled !== false
     }));
@@ -146,6 +172,9 @@ const DEFAULT_ACCOUNT = ENV_ACCOUNTS[0] || {
   business_connection_id: '',
   project_name: 'O‘zbekiston Lider Yoshlari Ensiklopediyasi',
   flow_key: 'uzlye_info_only',
+  bot_enabled: true,
+  auto_reply_enabled: true,
+  reach_enabled: true,
   archive_enabled: true,
   archive_notify_enabled: true
 };
@@ -166,6 +195,8 @@ function normalizeAccount(account = {}) {
     business_connection_id: String(account.business_connection_id || ''),
     bot_enabled: account.bot_enabled !== false,
     auto_reply_enabled: account.auto_reply_enabled !== false,
+    reach_enabled: account.reach_enabled !== false,
+    followup_enabled: account.followup_enabled !== false,
     archive_enabled: account.archive_enabled !== false,
     track_deleted_enabled: account.track_deleted_enabled !== false,
     track_edited_enabled: account.track_edited_enabled !== false,
@@ -192,6 +223,7 @@ function unknownAccount(businessConnectionId = '') {
     admin_chat_id: '',
     bot_enabled: false,
     auto_reply_enabled: false,
+    reach_enabled: false,
     archive_enabled: true,
     archive_notify_enabled: false,
     reports_enabled: false
@@ -278,6 +310,10 @@ async function getAccount(accountOrKey = DEFAULT_ACCOUNT_KEY) {
       business_connection_id: process.env.SECOND_ACCOUNT_BUSINESS_CONNECTION_ID || '',
       project_name: process.env.SECOND_ACCOUNT_PROJECT_NAME || 'Millat Iftixorlari ensiklopediyasi',
       flow_key: process.env.SECOND_ACCOUNT_FLOW_KEY || 'second_info_only',
+      bot_enabled: true,
+      auto_reply_enabled: true,
+      reach_enabled: true,
+      followup_enabled: true,
       archive_enabled: true,
       archive_notify_enabled: true
     };
@@ -321,7 +357,8 @@ function findAccountByUserId(accounts, userId) {
   ));
   if (found) return found;
   if (uid === '8304283149') {
-    return accounts.find(a => a.account_key === 'second') || {
+    const secondKey = process.env.SECOND_ACCOUNT_KEY || 'second';
+    return accounts.find(a => a.account_key === secondKey) || {
       account_key: process.env.SECOND_ACCOUNT_KEY || 'second',
       label: process.env.SECOND_ACCOUNT_LABEL || 'Ikkinchi akkaunt',
       business_owner_id: process.env.SECOND_ACCOUNT_BUSINESS_OWNER_ID || '8304283149',
@@ -330,6 +367,10 @@ function findAccountByUserId(accounts, userId) {
       business_connection_id: process.env.SECOND_ACCOUNT_BUSINESS_CONNECTION_ID || '',
       project_name: process.env.SECOND_ACCOUNT_PROJECT_NAME || 'Millat Iftixorlari ensiklopediyasi',
       flow_key: process.env.SECOND_ACCOUNT_FLOW_KEY || 'second_info_only',
+      bot_enabled: true,
+      auto_reply_enabled: true,
+      reach_enabled: true,
+      followup_enabled: true,
       archive_enabled: true,
       archive_notify_enabled: true
     };
@@ -423,6 +464,8 @@ const ACCOUNT_MUTABLE_FIELDS = new Set([
 const ACCOUNT_BOOLEAN_FIELDS = new Set([
   'bot_enabled',
   'auto_reply_enabled',
+  'reach_enabled',
+  'followup_enabled',
   'archive_enabled',
   'track_deleted_enabled',
   'track_edited_enabled',
@@ -435,6 +478,7 @@ const ACCOUNT_BOOLEAN_FIELDS = new Set([
 ]);
 
 const ACCOUNT_NUMBER_FIELDS = new Set(['media_archive_max_bytes']);
+const OPTIONAL_ACCOUNT_UPDATE_FIELDS = new Set(['updated_by', 'followup_enabled']);
 
 function parseSettingValue(value = '') {
   const raw = String(value).trim();
@@ -443,6 +487,17 @@ function parseSettingValue(value = '') {
   if (['false', 'off', '0', 'no', 'yoq', 'yo‘q'].includes(low)) return false;
   if (/^-?\d+(\.\d+)?$/.test(raw)) return Number(raw);
   return raw;
+}
+
+function stripOptionalAccountUpdateFields(payload = {}) {
+  const clean = { ...payload };
+  for (const field of OPTIONAL_ACCOUNT_UPDATE_FIELDS) delete clean[field];
+  return clean;
+}
+
+function isMissingOptionalAccountUpdateFieldError(error) {
+  const msg = String(error?.message || '');
+  return [...OPTIONAL_ACCOUNT_UPDATE_FIELDS].some(field => msg.includes(field));
 }
 
 async function upsertAccountPatch(accountOrKey, patch = {}) {
@@ -458,7 +513,13 @@ async function upsertAccountPatch(accountOrKey, patch = {}) {
     updated_at: new Date().toISOString()
   };
   if (payload.owner_user_id && !payload.business_owner_id) payload.business_owner_id = payload.owner_user_id;
-  const { data, error } = await supabase.from('bot_accounts').upsert(payload, { onConflict: 'account_key' }).select().maybeSingle();
+  let { data, error } = await supabase.from('bot_accounts').upsert(payload, { onConflict: 'account_key' }).select().maybeSingle();
+  if (error && isMissingOptionalAccountUpdateFieldError(error)) {
+    ({ data, error } = await supabase.from('bot_accounts')
+      .upsert(stripOptionalAccountUpdateFields(payload), { onConflict: 'account_key' })
+      .select()
+      .maybeSingle());
+  }
   if (error) throw error;
   const businessPayload = {};
   for (const field of [
@@ -471,6 +532,8 @@ async function upsertAccountPatch(accountOrKey, patch = {}) {
     'business_connection_id',
     'bot_enabled',
     'auto_reply_enabled',
+    'reach_enabled',
+    'followup_enabled',
     'archive_enabled',
     'track_deleted_enabled',
     'track_edited_enabled',
@@ -480,6 +543,7 @@ async function upsertAccountPatch(accountOrKey, patch = {}) {
     'reports_enabled',
     'timezone',
     'last_seen_at',
+    'updated_by',
     'updated_at'
   ]) {
     if (Object.prototype.hasOwnProperty.call(payload, field)) businessPayload[field] = payload[field];
@@ -497,6 +561,40 @@ async function setAccountField(accountOrKey, field, rawValue) {
   if (ACCOUNT_BOOLEAN_FIELDS.has(field)) value = Boolean(parseSettingValue(rawValue));
   if (ACCOUNT_NUMBER_FIELDS.has(field)) value = Number(rawValue);
   return upsertAccountPatch(accountOrKey, { [field]: value });
+}
+
+async function setAccountBotEnabled(accountOrKey, enabled, actorId = '') {
+  const account = await upsertAccountPatch(accountOrKey, {
+    bot_enabled: Boolean(enabled),
+    auto_reply_enabled: Boolean(enabled),
+    updated_by: actorId ? String(actorId) : null
+  });
+  await writeAuditLog({
+    accountKey: account.account_key,
+    chatId: 'system',
+    action: enabled ? 'account_bot_enabled' : 'account_bot_disabled',
+    newValue: Boolean(enabled),
+    actorType: 'admin',
+    actorId
+  });
+  return account;
+}
+
+async function setAccountReachEnabled(accountOrKey, enabled, actorId = '') {
+  const account = await upsertAccountPatch(accountOrKey, {
+    reach_enabled: Boolean(enabled),
+    updated_by: actorId ? String(actorId) : null
+  });
+  if (!enabled) await disableAutoOutreach(false, account.account_key);
+  await writeAuditLog({
+    accountKey: account.account_key,
+    chatId: 'system',
+    action: enabled ? 'reach_enabled' : 'reach_disabled',
+    newValue: Boolean(enabled),
+    actorType: 'admin',
+    actorId
+  });
+  return account;
 }
 
 async function handleBusinessConnectionUpdate(connection = {}) {
@@ -800,6 +898,11 @@ async function sendAdmin(text, extra = {}, accountOrKey = DEFAULT_ACCOUNT_KEY) {
 }
 
 async function sendBusinessMessage(lead, text) {
+  const allowed = await canLeadAutoReply(lead, lead?.account_key);
+  if (!allowed.ok) {
+    await logIgnore(lead?.chat_id || 'unknown', allowed.reason || 'lead_auto_reply_off', String(text || '').slice(0, 300), lead?.account_key);
+    return null;
+  }
   if (!lead?.business_connection_id) {
     await logEvent(lead?.chat_id || 'unknown', 'send_skipped_no_business_connection', String(text || '').slice(0, 300), lead?.account_key);
     return null;
@@ -809,7 +912,7 @@ async function sendBusinessMessage(lead, text) {
     business_connection_id: lead.business_connection_id,
     text
   });
-  await updateLead(lead.chat_id, { last_bot_message: text, last_message_at: new Date().toISOString() }, lead.account_key);
+  await updateLead(lead.chat_id, { last_bot_message: text, last_message_at: new Date().toISOString(), last_actor: 'bot' }, lead.account_key);
   return true;
 }
 
@@ -832,6 +935,26 @@ async function logIgnore(chatId, reason, message = '', accountOrKey = null) {
   await logEvent(chatId, reason, String(message || '').slice(0, 500), accountOrKey);
 }
 
+async function writeAuditLog({ accountKey: ak, chatId, action, oldValue = null, newValue = null, actorType = 'system', actorId = '' }) {
+  try {
+    const { error } = await supabase.from('lead_audit_logs').insert({
+      account_key: ak ? accountKey(ak) : null,
+      lead_chat_id: chatId ? String(chatId) : null,
+      action: String(action || ''),
+      old_value: oldValue ?? null,
+      new_value: newValue ?? null,
+      actor_type: actorType,
+      actor_id: actorId ? String(actorId) : null,
+      created_at: new Date().toISOString()
+    });
+    if (!error) return;
+    if (!String(error.message || '').includes('does not exist')) console.error('writeAuditLog:', error.message);
+  } catch (err) {
+    console.error('writeAuditLog:', err.message);
+  }
+  if (chatId && action) await logEvent(chatId, `audit_${action}`, JSON.stringify({ oldValue, newValue, actorType, actorId }).slice(0, 1200), ak);
+}
+
 async function getLastIgnoreReason(chatId = null, accountOrKey = null) {
   let q = supabase.from('lead_events')
     .select('chat_id,event_type,message,created_at')
@@ -848,6 +971,92 @@ async function getLastIgnoreReason(chatId = null, accountOrKey = null) {
   return data?.[0] || null;
 }
 
+const OPTIONAL_LEAD_FIELDS = new Set([
+  'lead_chat_id',
+  'reach_sent',
+  'reach_sent_at',
+  'reach_message_text',
+  'reach_message_id',
+  'reach_batch_id',
+  'assigned_by_reach',
+  'assigned_by_admin',
+  'manually_started',
+  'bot_enabled_for_lead',
+  'manual_only',
+  'current_stage',
+  'previous_stage',
+  'first_admin_message',
+  'first_admin_message_at',
+  'last_admin_message_at',
+  'last_bot_message_at',
+  'last_customer_message',
+  'last_customer_message_at',
+  'last_actor',
+  'paused_at',
+  'paused_by',
+  'pause_reason',
+  'last_intent',
+  'last_intent_confidence',
+  'last_template_key',
+  'next_action',
+  'needs_human',
+  'needs_human_reason',
+  'admin_active_until',
+  'followup_count',
+  'opted_out',
+  'processing_lock_until',
+  'processing_event_id'
+]);
+
+function stripOptionalLeadFields(payload = {}) {
+  const clean = { ...payload };
+  for (const field of OPTIONAL_LEAD_FIELDS) delete clean[field];
+  return clean;
+}
+
+function isMissingLeadFieldError(error) {
+  const msg = String(error?.message || '');
+  return error?.code === 'PGRST204' || [...OPTIONAL_LEAD_FIELDS].some(field => msg.includes(field));
+}
+
+function enrichLeadPayload(patch = {}, existing = null) {
+  const now = new Date().toISOString();
+  const payload = { ...patch };
+  if (Object.prototype.hasOwnProperty.call(payload, 'stage')) {
+    payload.current_stage = payload.stage;
+    if (!Object.prototype.hasOwnProperty.call(payload, 'previous_stage')) payload.previous_stage = existing?.stage || existing?.current_stage || null;
+  }
+  if (!Object.prototype.hasOwnProperty.call(payload, 'lead_chat_id') && (payload.chat_id || existing?.chat_id)) {
+    payload.lead_chat_id = String(payload.chat_id || existing.chat_id);
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'bot_enabled') && !Object.prototype.hasOwnProperty.call(payload, 'bot_enabled_for_lead')) {
+    payload.bot_enabled_for_lead = payload.bot_enabled;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'outreach_sent') && !Object.prototype.hasOwnProperty.call(payload, 'reach_sent')) {
+    payload.reach_sent = payload.outreach_sent;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'outreach_at') && !Object.prototype.hasOwnProperty.call(payload, 'reach_sent_at')) {
+    payload.reach_sent_at = payload.outreach_at;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'outreach_message') && !Object.prototype.hasOwnProperty.call(payload, 'reach_message_text')) {
+    payload.reach_message_text = payload.outreach_message;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'last_user_message')) {
+    payload.last_customer_message = payload.last_user_message;
+    payload.last_customer_message_at = payload.last_message_at || now;
+    payload.last_actor = 'customer';
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'last_admin_message')) {
+    payload.last_admin_message_at = payload.last_message_at || now;
+    payload.last_actor = 'admin';
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'last_bot_message')) {
+    payload.last_bot_message_at = payload.last_message_at || now;
+    payload.last_actor = 'bot';
+  }
+  return payload;
+}
+
 async function getLead(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   let q = supabase.from('business_leads').select('*').eq('chat_id', String(chatId));
   q = accountLeadFilter(q, accountOrKey);
@@ -860,21 +1069,32 @@ async function getLead(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
 }
 
 async function createLead({ chatId, businessConnectionId, from, text, stage = STAGE.NEW, status = 'active', botEnabled = true, accountKey = DEFAULT_ACCOUNT_KEY }) {
-  const payload = {
+  const now = new Date().toISOString();
+  const payload = enrichLeadPayload({
     chat_id: String(chatId),
+    lead_chat_id: String(chatId),
     account_key: accountKey,
     business_connection_id: businessConnectionId || null,
     first_name: from?.first_name || null,
     username: from?.username || null,
     status,
     stage,
+    current_stage: stage,
     bot_enabled: botEnabled,
+    bot_enabled_for_lead: botEnabled,
+    manual_only: false,
     last_user_message: text || '',
-    last_message_at: new Date().toISOString(),
-    stage_started_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
-  };
-  const { data, error } = await supabase.from('business_leads').insert(payload).select().single();
+    last_customer_message: text || '',
+    last_customer_message_at: now,
+    last_actor: text ? 'customer' : null,
+    last_message_at: now,
+    stage_started_at: now,
+    updated_at: now
+  });
+  let { data, error } = await supabase.from('business_leads').insert(payload).select().single();
+  if (error && isMissingLeadFieldError(error)) {
+    ({ data, error } = await supabase.from('business_leads').insert(stripOptionalLeadFields(payload)).select().single());
+  }
   if (error) {
     console.error('createLead:', error.message);
     return null;
@@ -885,12 +1105,27 @@ async function createLead({ chatId, businessConnectionId, from, text, stage = ST
 
 async function updateLead(chatId, patch, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const changedStage = Object.prototype.hasOwnProperty.call(patch, 'stage');
-  const payload = { ...patch, updated_at: new Date().toISOString() };
+  const existing = changedStage ? await getLead(chatId, accountOrKey) : null;
+  const payload = enrichLeadPayload({ ...patch, updated_at: new Date().toISOString() }, existing);
   if (changedStage) payload.stage_started_at = new Date().toISOString();
   let q = supabase.from('business_leads').update(payload).eq('chat_id', String(chatId));
   q = accountLeadFilter(q, accountOrKey);
-  const { data, error } = await q.select().maybeSingle();
+  let { data, error } = await q.select().maybeSingle();
+  if (error && isMissingLeadFieldError(error)) {
+    let fallbackQ = supabase.from('business_leads').update(stripOptionalLeadFields(payload)).eq('chat_id', String(chatId));
+    fallbackQ = accountLeadFilter(fallbackQ, accountOrKey);
+    ({ data, error } = await fallbackQ.select().maybeSingle());
+  }
   if (error) console.error('updateLead:', error.message);
+  if (!error && changedStage && existing?.stage !== patch.stage) {
+    await writeAuditLog({
+      accountKey: accountOrKey,
+      chatId,
+      action: 'stage_changed',
+      oldValue: existing?.stage || null,
+      newValue: patch.stage
+    });
+  }
   return data;
 }
 
@@ -907,6 +1142,115 @@ async function upsertLeadBase({ chatId, businessConnectionId, from, text, accoun
     }, accountKey);
   }
   return createLead({ chatId, businessConnectionId, from, text, stage: STAGE.NEW, accountKey });
+}
+
+function isTestAdminAllowed(chatId, fromId = '') {
+  if (!TEST_MODE || !TEST_ADMIN_IDS.size) return true;
+  return idSetHas(TEST_ADMIN_IDS, chatId, fromId);
+}
+
+function isTestLeadAllowed(chatId, fromId = '') {
+  if (!TEST_MODE) return true;
+  if (!TEST_LEAD_IDS.size) return false;
+  return idSetHas(TEST_LEAD_IDS, chatId, fromId);
+}
+
+function canAccountAutoReply(account = {}) {
+  const normalized = normalizeAccount(account);
+  return normalized.account_key !== UNKNOWN_ACCOUNT_KEY &&
+    normalized.bot_enabled !== false &&
+    normalized.auto_reply_enabled !== false;
+}
+
+function canAccountReach(account = {}) {
+  return canAccountAutoReply(account) && normalizeAccount(account).reach_enabled !== false;
+}
+
+function leadAssignmentActive(lead = {}) {
+  return Boolean(lead.reach_sent || lead.outreach_sent || lead.assigned_by_admin || lead.manually_started);
+}
+
+function leadBotEnabled(lead = {}) {
+  const botEnabled = Object.prototype.hasOwnProperty.call(lead, 'bot_enabled_for_lead')
+    ? lead.bot_enabled_for_lead !== false
+    : lead.bot_enabled !== false;
+  return botEnabled && lead.manual_only !== true;
+}
+
+function adminTakeoverActive(lead = {}) {
+  if (!lead.admin_active_until) return false;
+  return new Date(lead.admin_active_until).getTime() > Date.now();
+}
+
+async function canLeadAutoReply(lead = {}, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = typeof accountOrKey === 'object' ? normalizeAccount(accountOrKey) : await getAccount(accountOrKey || lead.account_key);
+  if (!canAccountAutoReply(account)) return { ok: false, reason: 'account_bot_off' };
+  if (!isTestLeadAllowed(lead.chat_id || lead.lead_chat_id)) return { ok: false, reason: 'test_mode_blocked' };
+  if (!leadAssignmentActive(lead)) return { ok: false, reason: 'no_outreach_session' };
+  if (!leadBotEnabled(lead)) return { ok: false, reason: 'lead_auto_reply_off' };
+  if (adminTakeoverActive(lead)) return { ok: false, reason: 'admin_takeover_active' };
+  return { ok: true, reason: 'ok' };
+}
+
+async function pauseLeadBot(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, actorId = '', reason = 'admin_paused') {
+  const patch = {
+    bot_enabled: false,
+    bot_enabled_for_lead: false,
+    paused_at: new Date().toISOString(),
+    paused_by: actorId ? String(actorId) : null,
+    pause_reason: reason
+  };
+  const lead = await updateLead(chatId, patch, accountOrKey);
+  await writeAuditLog({ accountKey: accountOrKey, chatId, action: 'bot_disabled', oldValue: true, newValue: false, actorType: 'admin', actorId });
+  return lead;
+}
+
+async function resumeLeadBot(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, actorId = '') {
+  const patch = {
+    bot_enabled: true,
+    bot_enabled_for_lead: true,
+    manual_only: false,
+    paused_at: null,
+    paused_by: null,
+    pause_reason: null,
+    admin_active_until: null
+  };
+  const lead = await updateLead(chatId, patch, accountOrKey);
+  await writeAuditLog({ accountKey: accountOrKey, chatId, action: 'bot_enabled', oldValue: false, newValue: true, actorType: 'admin', actorId });
+  return lead;
+}
+
+async function setLeadManualOnly(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, actorId = '') {
+  const lead = await updateLead(chatId, {
+    bot_enabled: false,
+    bot_enabled_for_lead: false,
+    manual_only: true,
+    stage: STAGE.PAUSED,
+    status: 'manual_control',
+    paused_at: new Date().toISOString(),
+    paused_by: actorId ? String(actorId) : null,
+    pause_reason: 'manual_only'
+  }, accountOrKey);
+  await writeAuditLog({ accountKey: accountOrKey, chatId, action: 'manual_only_enabled', oldValue: false, newValue: true, actorType: 'admin', actorId });
+  return lead;
+}
+
+async function manuallyStartLeadBot(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, actorId = '') {
+  const existing = await getLead(chatId, accountOrKey);
+  if (!existing) return null;
+  const lead = await updateLead(chatId, {
+    assigned_by_admin: true,
+    manually_started: true,
+    bot_enabled: true,
+    bot_enabled_for_lead: true,
+    manual_only: false,
+    paused_at: null,
+    paused_by: null,
+    pause_reason: null,
+    admin_active_until: null
+  }, accountOrKey);
+  await writeAuditLog({ accountKey: accountOrKey, chatId, action: 'lead_assigned', oldValue: false, newValue: true, actorType: 'admin', actorId });
+  return lead;
 }
 
 async function markProcessed(messageKey, chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
@@ -1202,7 +1546,7 @@ async function executeCustomCommand(command, lead, text) {
     const keys = await flowTemplateKeys(lead.account_key, command.step_key, []);
     for (const key of keys) await sendTemplate(lead, key);
   } else if (responseType === 'human_needed') {
-    await updateLead(lead.chat_id, { status: 'needs_admin', stage: STAGE.PAUSED, bot_enabled: false }, lead.account_key);
+    await updateLead(lead.chat_id, { status: 'needs_admin', stage: STAGE.PAUSED, bot_enabled: false, bot_enabled_for_lead: false, needs_human: true, needs_human_reason: 'custom_command' }, lead.account_key);
   }
   if (command.notify_admin) {
     await sendAdmin(
@@ -1212,7 +1556,7 @@ async function executeCustomCommand(command, lead, text) {
     );
   }
   if (command.stop_after_response) {
-    await updateLead(lead.chat_id, { stage: STAGE.PAUSED, status: 'custom_command_stopped', bot_enabled: false }, lead.account_key);
+    await updateLead(lead.chat_id, { stage: STAGE.PAUSED, status: 'custom_command_stopped', bot_enabled: false, bot_enabled_for_lead: false, manual_only: true }, lead.account_key);
   }
   await logEvent(lead.chat_id, 'custom_command_executed', command.command_key, lead.account_key);
   return Boolean(command.stop_after_response);
@@ -1440,7 +1784,11 @@ async function saveCommandCreateSession(chatId, accountKeyForSetup, step, payloa
     account_key: accountKeyForSetup,
     step
   };
-  const result = await setWizardSession(payload.telegram_user_id, 'public', accountKeyForSetup, 'command_create', step, nextPayload, chatId);
+  const result = await setAdminSession(chatId, 'command_create', {
+    ...nextPayload,
+    telegram_user_id: String(payload.telegram_user_id || chatId),
+    return_to: 'command_details'
+  });
   if (!result.ok) throw result.error;
   console.log('command_create state saved', { chat_id: String(chatId), account_key: accountKeyForSetup, step, command_key: nextPayload.command_key || null });
   return nextPayload;
@@ -1795,12 +2143,19 @@ async function sendTemplate(lead, templateKey) {
     return false;
   }
   const text = renderTemplate(body);
-  await sendBusinessMessage(lead, text);
+  const sent = await sendBusinessMessage(lead, text);
+  if (!sent) return false;
   await logEvent(lead.chat_id, `sent_${templateKey}`, text.slice(0, 300), lead.account_key);
+  await writeAuditLog({ accountKey: lead.account_key, chatId: lead.chat_id, action: 'template_sent', newValue: templateKey, actorType: 'bot' });
   return true;
 }
 
 async function sendPackage(lead, actionName, templateKeys, nextPatch = {}) {
+  const allowed = await canLeadAutoReply(lead, lead.account_key);
+  if (!allowed.ok) {
+    await logIgnore(lead.chat_id, allowed.reason, actionName, lead.account_key);
+    return lead;
+  }
   const reserved = await reserveAction(lead.chat_id, lead.stage, actionName, lead.account_key);
   if (!reserved) {
     await logEvent(lead.chat_id, `duplicate_action_skipped_${actionName}`, '', lead.account_key);
@@ -1808,7 +2163,8 @@ async function sendPackage(lead, actionName, templateKeys, nextPatch = {}) {
   }
   let currentLead = lead;
   for (const key of templateKeys) {
-    await sendTemplate(currentLead, key);
+    const sent = await sendTemplate(currentLead, key);
+    if (!sent) return currentLead;
     await sleep(350);
   }
   if (Object.keys(nextPatch).length) {
@@ -1822,6 +2178,7 @@ async function finishAfterInfo(lead) {
     stage: STAGE.INFO_SENT_FINISHED,
     status: 'info_sent',
     bot_enabled: false,
+    bot_enabled_for_lead: false,
     finished_at: new Date().toISOString()
   }, lead.account_key);
   await sendAdmin(
@@ -1855,10 +2212,17 @@ async function resetMeChat({ chatId, businessConnectionId = null, from = null, a
     status: 'active',
     stage: STAGE.OUTREACH_SENT,
     bot_enabled: true,
+    bot_enabled_for_lead: true,
+    manual_only: false,
+    assigned_by_admin: true,
+    manually_started: true,
     outreach_sent: true,
+    reach_sent: true,
     outreach_session_id: `resetme_${Date.now()}`,
     outreach_message: '/resetme test reset',
+    reach_message_text: '/resetme test reset',
     outreach_at: new Date().toISOString(),
+    reach_sent_at: new Date().toISOString(),
     last_user_message: '',
     last_bot_message: '',
     last_admin_message: existing?.last_admin_message || '',
@@ -1881,6 +2245,10 @@ async function stopLead(lead, reason = 'stopped') {
     stage: STAGE.DISABLED,
     status: reason,
     bot_enabled: false,
+    bot_enabled_for_lead: false,
+    manual_only: true,
+    paused_at: new Date().toISOString(),
+    pause_reason: reason,
     finished_at: new Date().toISOString()
   }, lead.account_key);
   await logEvent(lead.chat_id, reason, 'bot stopped', lead.account_key);
@@ -1907,6 +2275,11 @@ async function getAutoOutreach(accountOrKey = DEFAULT_ACCOUNT_KEY) {
 
 async function enableAutoOutreach(hours, source = 'manual', accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const ak = accountKey(accountOrKey);
+  const account = await getAccount(ak);
+  if (!canAccountReach(account)) {
+    await logEvent('system', 'reach_off', `auto outreach start skipped: ${source}`, ak);
+    return { enabled: false, account_key: ak, reason: 'reach_off', source, disabled_at: Date.now() };
+  }
   const now = Date.now();
   const until = now + hours * 60 * 60 * 1000;
   const sessionId = `outreach_${ak}_${localDateKey()}_${now}`;
@@ -1947,10 +2320,19 @@ function looksLikeOutreachGreeting(text = '') {
   return t.includes('yaxshimisiz') || t.includes('qalaysiz') || t.includes('yaxshilarmi') || t.length < 110;
 }
 
-async function markOutreach({ chatId, businessConnectionId, from, text, accountKey = DEFAULT_ACCOUNT_KEY }) {
+async function markOutreach({ chatId, businessConnectionId, from, text, messageId = null, accountKey = DEFAULT_ACCOUNT_KEY }) {
+  const account = await getAccount(accountKey);
+  if (!canAccountReach(account)) {
+    await logIgnore(chatId, 'reach_off', text, account.account_key);
+    return false;
+  }
+  if (!isTestLeadAllowed(chatId)) {
+    await logIgnore(chatId, 'test_mode_blocked', text, account.account_key);
+    return false;
+  }
   const auto = await getAutoOutreach(accountKey);
-  if (!isAutoActive(auto)) return;
-  if (OUTREACH_GREETING_REQUIRED && !looksLikeOutreachGreeting(text)) return;
+  if (!isAutoActive(auto)) return false;
+  if (OUTREACH_GREETING_REQUIRED && !looksLikeOutreachGreeting(text)) return false;
 
   const existing = await getLead(chatId, accountKey);
   const patch = {
@@ -1961,22 +2343,36 @@ async function markOutreach({ chatId, businessConnectionId, from, text, accountK
     status: 'active',
     stage: STAGE.OUTREACH_SENT,
     bot_enabled: true,
+    bot_enabled_for_lead: true,
+    manual_only: false,
     outreach_sent: true,
+    reach_sent: true,
+    assigned_by_reach: true,
+    assigned_by_admin: false,
+    manually_started: false,
     outreach_session_id: auto.session_id,
     outreach_message: text,
+    reach_message_text: text,
+    reach_message_id: messageId ? String(messageId) : null,
+    reach_batch_id: auto.session_id,
     outreach_at: new Date().toISOString(),
+    reach_sent_at: new Date().toISOString(),
     last_admin_message: text,
+    first_admin_message: existing?.first_admin_message || text,
+    first_admin_message_at: existing?.first_admin_message_at || new Date().toISOString(),
     last_message_at: new Date().toISOString()
   };
 
   if (existing) {
-    if (STOP_REPLY_STAGES.has(existing.stage) || existing.status === 'disabled') return;
+    if (STOP_REPLY_STAGES.has(existing.stage) || existing.status === 'disabled') return false;
     await updateLead(chatId, patch, accountKey);
   } else {
     await createLead({ chatId, businessConnectionId, from, text, stage: STAGE.OUTREACH_SENT, status: 'active', botEnabled: true, accountKey });
     await updateLead(chatId, patch, accountKey);
   }
   await logEvent(chatId, 'outreach_sent_detected', text, accountKey);
+  await writeAuditLog({ accountKey, chatId, action: 'reach_sent', newValue: { message_id: messageId, text }, actorType: 'admin', actorId: from?.id });
+  return true;
 }
 
 function detectAdminPromptStage(text = '') {
@@ -2002,22 +2398,41 @@ function detectAdminPromptStage(text = '') {
   return null;
 }
 
-async function syncAdminContext({ chatId, businessConnectionId, from, text, accountKey = DEFAULT_ACCOUNT_KEY }) {
+async function syncAdminContext({ chatId, businessConnectionId, from, text, accountKey = DEFAULT_ACCOUNT_KEY, adminTakeover = true }) {
   const existing = await getLead(chatId, accountKey);
   const detectedStage = detectAdminPromptStage(text);
+  const now = new Date().toISOString();
+  const activeUntil = adminTakeover ? new Date(Date.now() + ADMIN_TAKEOVER_MINUTES * 60000).toISOString() : null;
   const basePatch = {
     account_key: accountKey,
     business_connection_id: businessConnectionId || existing?.business_connection_id || null,
     first_name: existing?.first_name || from?.first_name || null,
     username: existing?.username || from?.username || null,
     last_admin_message: text || '[media]',
-    last_message_at: new Date().toISOString()
+    last_admin_message_at: now,
+    first_admin_message: existing?.first_admin_message || text || '[media]',
+    first_admin_message_at: existing?.first_admin_message_at || now,
+    last_actor: 'admin',
+    admin_active_until: activeUntil,
+    last_message_at: now
   };
 
   if (!detectedStage) {
     if (existing) await updateLead(chatId, basePatch, accountKey);
-    else await createLead({ chatId, businessConnectionId, from, text, stage: STAGE.NEW, status: 'active', botEnabled: false, accountKey });
+    else {
+      await createLead({ chatId, businessConnectionId, from, text, stage: STAGE.NEW, status: 'active', botEnabled: false, accountKey });
+      await updateLead(chatId, {
+        ...basePatch,
+        bot_enabled: false,
+        bot_enabled_for_lead: false,
+        manual_only: true,
+        assigned_by_admin: true,
+        needs_human: true,
+        needs_human_reason: 'admin_manual_context'
+      }, accountKey);
+    }
     await logEvent(chatId, 'admin_context_saved', text || '[media]', accountKey);
+    await writeAuditLog({ accountKey, chatId, action: 'lead_assigned', newValue: 'manual_context', actorType: 'admin', actorId: from?.id });
     return;
   }
 
@@ -2026,7 +2441,9 @@ async function syncAdminContext({ chatId, businessConnectionId, from, text, acco
     stage: detectedStage,
     status: detectedStage === STAGE.INFO_SENT_FINISHED ? 'info_sent' : 'active',
     bot_enabled: detectedStage !== STAGE.INFO_SENT_FINISHED,
-    outreach_sent: true,
+    bot_enabled_for_lead: detectedStage !== STAGE.INFO_SENT_FINISHED,
+    manual_only: detectedStage === STAGE.INFO_SENT_FINISHED,
+    assigned_by_admin: true,
     outreach_session_id: existing?.outreach_session_id || `admin_context_${localDateKey()}_${Date.now()}`,
     outreach_message: text || '[admin prompt]',
     outreach_at: existing?.outreach_at || new Date().toISOString(),
@@ -2039,6 +2456,7 @@ async function syncAdminContext({ chatId, businessConnectionId, from, text, acco
     await updateLead(chatId, patch, accountKey);
   }
   await logEvent(chatId, `admin_context_stage_${detectedStage}`, text || '[media]', accountKey);
+  await writeAuditLog({ accountKey, chatId, action: 'lead_assigned', newValue: detectedStage, actorType: 'admin', actorId: from?.id });
 }
 
 function strongUserApplicationAnswer(text = '') {
@@ -2070,10 +2488,14 @@ async function tryResumeFromContext(lead, text) {
     stage: assumedStage,
     status: assumedStage === STAGE.INFO_SENT_FINISHED ? 'info_sent' : 'active',
     bot_enabled: assumedStage !== STAGE.INFO_SENT_FINISHED,
+    bot_enabled_for_lead: assumedStage !== STAGE.INFO_SENT_FINISHED,
+    manual_only: assumedStage === STAGE.INFO_SENT_FINISHED,
+    assigned_by_admin: true,
     outreach_sent: true,
     outreach_session_id: lead.outreach_session_id || `context_resume_${localDateKey()}_${Date.now()}`,
     outreach_message: lead.last_admin_message || '[context resume]',
     outreach_at: lead.outreach_at || new Date().toISOString(),
+    admin_active_until: null,
     finished_at: assumedStage === STAGE.INFO_SENT_FINISHED ? (lead.finished_at || new Date().toISOString()) : null
   }, lead.account_key) || lead;
 
@@ -2088,7 +2510,7 @@ async function tryResumeFromContext(lead, text) {
     const intent = forcedIntent || classify(text, STAGE.ASKED_APPLICATION);
     if (intent === 'application_confirmed' || intent === 'application_submitted') {
       const keys = await flowTemplateKeys(current.account_key, 'ask_info', ['ask_info']);
-      current = await sendPackage(current, 'ask_info_context_resume', keys, { stage: STAGE.ASKED_INFO, status: 'active', bot_enabled: true }) || current;
+      current = await sendPackage(current, 'ask_info_context_resume', keys, { stage: STAGE.ASKED_INFO, status: 'active', bot_enabled: true, bot_enabled_for_lead: true }) || current;
       return { handled: true, lead: current };
     }
     if (intent === 'application_not_submitted') {
@@ -2097,6 +2519,7 @@ async function tryResumeFromContext(lead, text) {
         stage: STAGE.INFO_SENT_FINISHED,
         status: 'application_link_sent',
         bot_enabled: false,
+        bot_enabled_for_lead: false,
         finished_at: new Date().toISOString()
       }) || current;
       await sendAdmin(`🔗 <b>Ariza havolasi yuborildi</b>
@@ -2121,7 +2544,7 @@ Context resume orqali.`, {}, current.account_key);
       await finishAfterInfo(after || current);
       return { handled: true, lead: after || current };
     }
-    await updateLead(current.chat_id, { status: 'needs_admin', bot_enabled: false }, current.account_key);
+    await updateLead(current.chat_id, { status: 'needs_admin', bot_enabled: false, bot_enabled_for_lead: false, needs_human: true, needs_human_reason: 'context_resume_info_unclear' }, current.account_key);
     await logEvent(current.chat_id, 'context_resume_info_unclear_human_needed', text, current.account_key);
     return { handled: true, lead: current };
   }
@@ -2208,6 +2631,8 @@ async function maybeSendScheduledDailyReport(account) {
 
 async function maybeStartDailyAuto(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const ak = accountKey(accountOrKey);
+  const account = await getAccount(ak);
+  if (!canAccountReach(account)) return;
   const daily = await getDailyAuto(ak);
   if (!daily?.enabled) return;
   const today = localDateKey();
@@ -2830,10 +3255,6 @@ async function handleBusinessMessage(msg) {
     await logIgnore(chatId, 'unmapped_business_connection_no_flow', businessConnectionId || '', ak);
     return;
   }
-  if (account.bot_enabled === false || account.auto_reply_enabled === false) {
-    await logIgnore(chatId, 'auto_reply_off', businessConnectionId || '', ak);
-    return;
-  }
 
   const firstTime = await markProcessed(key, chatId, ak);
   if (!firstTime) {
@@ -2854,22 +3275,21 @@ async function handleBusinessMessage(msg) {
 
   // Owner/admin outgoing message: remember outreach/context. Do not respond to the admin message itself.
   if (isAccountOwnerMessage(msg, account)) {
-    if (text) await markOutreach({ chatId, businessConnectionId, from: msg.from, text, accountKey: ak });
-    await syncAdminContext({ chatId, businessConnectionId, from: msg.from, text: text || '[media]', accountKey: ak });
+    const outreachMarked = text
+      ? await markOutreach({ chatId, businessConnectionId, from: msg.from, text, messageId: msg.message_id, accountKey: ak })
+      : false;
+    await syncAdminContext({ chatId, businessConnectionId, from: msg.from, text: text || '[media]', accountKey: ak, adminTakeover: !outreachMarked });
+    return;
+  }
+
+  if (!canAccountAutoReply(account)) {
+    await logIgnore(chatId, 'account_bot_off', businessConnectionId || '', ak);
     return;
   }
 
   const rawText = text || (isMediaOnly(msg) ? '[media]' : '');
-  const lead = await upsertLeadBase({ chatId, businessConnectionId, from: msg.from, text: rawText, accountKey: ak });
+  let lead = await upsertLeadBase({ chatId, businessConnectionId, from: msg.from, text: rawText, accountKey: ak });
   if (!lead) return;
-
-  if (text) {
-    const customCommand = await findMatchingCustomCommand(ak, text);
-    if (customCommand) {
-      const shouldStopFlow = await executeCustomCommand(customCommand, lead, text);
-      if (shouldStopFlow) return;
-    }
-  }
 
   if (lead.stage === STAGE.INFO_SENT_FINISHED) {
     await logIgnore(chatId, 'old_finished_chat', rawText, ak);
@@ -2887,7 +3307,7 @@ async function handleBusinessMessage(msg) {
   let activeLead = lead;
   const auto = await getAutoOutreach(ak);
   const inActiveSession = hasActiveOutreachSession(lead, auto);
-  if (AUTO_START_REQUIRE_OUTREACH && !inActiveSession) {
+  if (AUTO_START_REQUIRE_OUTREACH && !inActiveSession && !leadAssignmentActive(lead)) {
     const resumed = await tryResumeFromContext(lead, rawText);
     if (resumed.handled) return;
     activeLead = resumed.lead || lead;
@@ -2898,14 +3318,25 @@ async function handleBusinessMessage(msg) {
       return;
     }
 
-    await updateLead(chatId, { stage: STAGE.PENDING_APPROVAL, status: 'pending_approval', bot_enabled: false }, ak);
+    await updateLead(chatId, { stage: STAGE.PENDING_APPROVAL, status: 'pending_approval', bot_enabled: false, bot_enabled_for_lead: false, needs_human: true, needs_human_reason: 'no_outreach_session' }, ak);
     await logIgnore(chatId, 'no_outreach_session', rawText, ak);
     return;
   }
 
-  if (!activeLead.bot_enabled) {
-    await logIgnore(chatId, 'blocked_stage', `bot_disabled:${activeLead.stage}`, ak);
+  lead = await getLead(chatId, ak) || activeLead;
+  activeLead = lead;
+  const allowed = await canLeadAutoReply(activeLead, account);
+  if (!allowed.ok) {
+    await logIgnore(chatId, allowed.reason, `${activeLead.stage}: ${rawText}`, ak);
     return;
+  }
+
+  if (text) {
+    const customCommand = await findMatchingCustomCommand(ak, text);
+    if (customCommand) {
+      const shouldStopFlow = await executeCustomCommand(customCommand, activeLead, text);
+      if (shouldStopFlow) return;
+    }
   }
 
   if (isMediaOnly(msg)) {
@@ -2951,8 +3382,9 @@ function enqueueLeadMessage(lead, text) {
 
 async function processLeadBatch(initialLead, texts) {
   let lead = await getLead(initialLead.chat_id, initialLead.account_key) || initialLead;
-  if (!lead.bot_enabled) {
-    await logIgnore(lead.chat_id, 'blocked_stage', `bot_disabled:${lead.stage}`, lead.account_key);
+  const allowed = await canLeadAutoReply(lead, lead.account_key);
+  if (!allowed.ok) {
+    await logIgnore(lead.chat_id, allowed.reason, `batch:${lead.stage}`, lead.account_key);
     return;
   }
   if (STOP_REPLY_STAGES.has(lead.stage)) {
@@ -2965,13 +3397,30 @@ async function processLeadBatch(initialLead, texts) {
     ? await classifyWithAI(lead, text, ruleIntent)
     : null;
   if (aiDecision && Number(aiDecision.confidence || 0) < 0.65) {
-    await updateLead(lead.chat_id, { last_user_message: text, last_message_at: new Date().toISOString(), status: 'needs_admin', stage: STAGE.PAUSED, bot_enabled: false }, lead.account_key);
+    await updateLead(lead.chat_id, {
+      last_user_message: text,
+      last_message_at: new Date().toISOString(),
+      status: 'needs_admin',
+      stage: STAGE.PAUSED,
+      bot_enabled: false,
+      bot_enabled_for_lead: false,
+      needs_human: true,
+      needs_human_reason: 'ai_low_confidence',
+      last_intent: aiDecision.intent || ruleIntent,
+      last_intent_confidence: Number(aiDecision.confidence || 0)
+    }, lead.account_key);
     await logEvent(lead.chat_id, 'ai_low_confidence_handoff', JSON.stringify(aiDecision).slice(0, 1000), lead.account_key);
     await sendAdmin(`⚠️ <b>AI confidence past</b>\nChat ID: <code>${lead.chat_id}</code>\nXabar: ${html(text)}\nBot to‘xtadi, qo‘lda davom ettiring.`, {}, lead.account_key);
     return;
   }
   const intent = mapAiIntentToRuleIntent(aiDecision, lead.stage, ruleIntent);
-  await updateLead(lead.chat_id, { last_user_message: text, last_message_at: new Date().toISOString() }, lead.account_key);
+  await updateLead(lead.chat_id, {
+    last_user_message: text,
+    last_message_at: new Date().toISOString(),
+    last_intent: intent,
+    last_intent_confidence: aiDecision ? Number(aiDecision.confidence || 0) : null,
+    needs_human: false
+  }, lead.account_key);
   await logEvent(lead.chat_id, `intent_${intent}_${lead.stage}`, text, lead.account_key);
 
   if (intent === 'hard_reject') {
@@ -2979,7 +3428,7 @@ async function processLeadBatch(initialLead, texts) {
     return;
   }
   if (intent === 'later') {
-    await updateLead(lead.chat_id, { stage: STAGE.PAUSED, status: 'paused', bot_enabled: false }, lead.account_key);
+    await updateLead(lead.chat_id, { stage: STAGE.PAUSED, status: 'paused', bot_enabled: false, bot_enabled_for_lead: false, pause_reason: 'later' }, lead.account_key);
     await logEvent(lead.chat_id, 'paused_by_later', text, lead.account_key);
     return;
   }
@@ -2987,7 +3436,7 @@ async function processLeadBatch(initialLead, texts) {
   // Main info-only flow.
   if (lead.stage === STAGE.OUTREACH_SENT || lead.stage === STAGE.NEW || lead.stage === STAGE.PENDING_APPROVAL) {
     const keys = await flowTemplateKeys(lead.account_key, 'ask_application', ['ask_application']);
-    await sendPackage(lead, 'ask_application', keys, { stage: STAGE.ASKED_APPLICATION, status: 'active', bot_enabled: true });
+    await sendPackage(lead, 'ask_application', keys, { stage: STAGE.ASKED_APPLICATION, status: 'active', bot_enabled: true, bot_enabled_for_lead: true });
     return;
   }
 
@@ -3003,6 +3452,7 @@ async function processLeadBatch(initialLead, texts) {
         stage: STAGE.INFO_SENT_FINISHED,
         status: 'application_link_sent',
         bot_enabled: false,
+        bot_enabled_for_lead: false,
         finished_at: new Date().toISOString()
       });
       await sendAdmin(`🔗 <b>Ariza havolasi yuborildi</b>\nChat ID: <code>${lead.chat_id}</code>\nEndi chatni qo‘lda davom ettiring.`, {}, lead.account_key);
@@ -3013,7 +3463,7 @@ async function processLeadBatch(initialLead, texts) {
       await sendTemplate(lead, 'clarify_application');
       return;
     }
-    await updateLead(lead.chat_id, { stage: STAGE.PAUSED, status: 'needs_admin', bot_enabled: false }, lead.account_key);
+    await updateLead(lead.chat_id, { stage: STAGE.PAUSED, status: 'needs_admin', bot_enabled: false, bot_enabled_for_lead: false, needs_human: true, needs_human_reason: 'application_unclear' }, lead.account_key);
     await sendAdmin(`⚠️ <b>Noaniq lid</b>\nChat ID: <code>${lead.chat_id}</code>\nXabar: ${html(text)}\nBot to‘xtadi, qo‘lda davom ettiring.`, {}, lead.account_key);
     return;
   }
@@ -3026,7 +3476,7 @@ async function processLeadBatch(initialLead, texts) {
       return;
     }
     if (intent === 'unclear') {
-      await updateLead(lead.chat_id, { status: 'needs_admin', bot_enabled: false }, lead.account_key);
+      await updateLead(lead.chat_id, { status: 'needs_admin', bot_enabled: false, bot_enabled_for_lead: false, needs_human: true, needs_human_reason: 'asked_info_unclear' }, lead.account_key);
       await logEvent(lead.chat_id, 'asked_info_unclear_human_needed', text, lead.account_key);
       return;
     }
@@ -3036,7 +3486,7 @@ async function processLeadBatch(initialLead, texts) {
     return;
   }
 
-  await updateLead(lead.chat_id, { stage: STAGE.PAUSED, status: 'needs_admin', bot_enabled: false }, lead.account_key);
+  await updateLead(lead.chat_id, { stage: STAGE.PAUSED, status: 'needs_admin', bot_enabled: false, bot_enabled_for_lead: false, needs_human: true, needs_human_reason: 'unexpected_stage' }, lead.account_key);
   await logEvent(lead.chat_id, 'unexpected_stage_stopped', `${lead.stage}: ${text}`, lead.account_key);
 }
 
@@ -3361,6 +3811,11 @@ async function sendReminderConfirm(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   if (!rows.length) return tg('sendMessage', { chat_id: chatId, text: '⏰ Yuboriladigan lidlar qolmadi.' });
   let sent = 0;
   for (const lead of rows) {
+    const allowed = await canLeadAutoReply(lead, lead.account_key);
+    if (!allowed.ok) {
+      await logIgnore(lead.chat_id, allowed.reason, 'manual_offer_followup', lead.account_key);
+      continue;
+    }
     const reserved = await reserveAction(lead.chat_id, lead.stage, 'manual_offer_followup', lead.account_key);
     if (!reserved) continue;
     const ok = await sendTemplate(lead, 'offer_followup');
@@ -3391,6 +3846,7 @@ async function getSelectedAccountKey(adminChatId) {
 async function getPublicOwnedAccounts(chatId, fromId = '') {
   const chat = String(chatId || '');
   const from = String(fromId || chat || '');
+  if (!isTestAdminAllowed(chat, from)) return [];
   const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY);
   const byKey = new Map();
   for (const account of accounts) {
@@ -3499,132 +3955,6 @@ async function setAdminSession(chatId, mode, payload = {}) {
     console.error('setAdminSession:', error.message);
     return { ok: false, error };
   }
-  return { ok: true };
-}
-
-function isMissingBotWizardTableError(error) {
-  const msg = String(error?.message || '');
-  return (
-    error?.code === 'PGRST205' ||
-    (msg.includes('bot_wizard_sessions') && (msg.includes('schema cache') || msg.includes('does not exist')))
-  );
-}
-
-async function getAdminWizardSession(userId, botScope = 'public') {
-  const fallback = await getAdminSession(userId);
-  const payload = fallback?.payload || {};
-  if (!payload.__wizard_session || payload.bot_scope !== botScope) return null;
-  return {
-    bot_scope: botScope,
-    telegram_user_id: String(userId),
-    chat_id: String(userId),
-    account_key: payload.selected_account_key || payload.account_key || null,
-    mode: fallback.mode,
-    step: payload.step,
-    payload,
-    updated_at: fallback.updated_at || null,
-    storage: 'admin_sessions'
-  };
-}
-
-async function getWizardSession(userId, botScope = 'public') {
-  const { data, error } = await supabase.from('bot_wizard_sessions')
-    .select('*')
-    .eq('bot_scope', botScope)
-    .eq('telegram_user_id', String(userId))
-    .maybeSingle();
-  if (error) {
-    if (isMissingBotWizardTableError(error)) return getAdminWizardSession(userId, botScope);
-    if (!String(error.message || '').includes('does not exist')) console.error('getWizardSession:', error.message);
-    return null;
-  }
-  return data || null;
-}
-
-async function setWizardSession(userId, botScope = 'public', accountKeyForSession, mode, step, payload = {}, chatId = null) {
-  const fallbackChatId = chatId || userId;
-  const accountKeyValue = accountKeyForSession ? accountKey(accountKeyForSession) : null;
-  const wizardPayload = {
-    ...(payload || {}),
-    __wizard_session: true,
-    bot_scope: botScope,
-    telegram_user_id: String(userId),
-    selected_account_key: accountKeyValue || payload?.selected_account_key || null,
-    account_key: accountKeyValue || payload?.account_key || null,
-    step
-  };
-  const row = {
-    bot_scope: botScope,
-    telegram_user_id: String(userId),
-    chat_id: fallbackChatId ? String(fallbackChatId) : null,
-    account_key: accountKeyValue,
-    mode,
-    step,
-    payload: wizardPayload,
-    updated_at: new Date().toISOString()
-  };
-  const { data, error } = await supabase.from('bot_wizard_sessions')
-    .upsert(row, { onConflict: 'bot_scope,telegram_user_id' })
-    .select()
-    .maybeSingle();
-  if (error) {
-    if (isMissingBotWizardTableError(error)) {
-      const fallback = await setAdminSession(fallbackChatId, mode, wizardPayload);
-      if (!fallback.ok) return fallback;
-      console.log('wizard session saved in admin_sessions fallback', {
-        scope: botScope,
-        user_id: String(userId),
-        account_key: row.account_key,
-        mode,
-        step
-      });
-      return { ok: true, data: { ...row, storage: 'admin_sessions' } };
-    }
-    console.error('setWizardSession:', error.message);
-    return { ok: false, error };
-  }
-  console.log('wizard session saved', {
-    scope: botScope,
-    user_id: String(userId),
-    account_key: row.account_key,
-    mode,
-    step
-  });
-  return { ok: true, data: data || row };
-}
-
-async function updateWizardSession(userId, botScope = 'public', patch = {}) {
-  const current = await getWizardSession(userId, botScope);
-  if (!current) return { ok: false, error: new Error('wizard session topilmadi') };
-  const nextPayload = { ...(current.payload || {}), ...(patch.payload || {}) };
-  return setWizardSession(
-    userId,
-    botScope,
-    patch.account_key || current.account_key,
-    patch.mode || current.mode,
-    patch.step || current.step,
-    nextPayload,
-    patch.chat_id || current.chat_id
-  );
-}
-
-async function clearWizardSession(userId, botScope = 'public') {
-  const { error } = await supabase.from('bot_wizard_sessions')
-    .delete()
-    .eq('bot_scope', botScope)
-    .eq('telegram_user_id', String(userId));
-  if (error && isMissingBotWizardTableError(error)) {
-    const current = await getAdminWizardSession(userId, botScope);
-    const selectedAccountKey = current?.payload?.selected_account_key || current?.account_key || null;
-    if (current) await setAdminSession(userId, 'account_selected', { selected_account_key: selectedAccountKey });
-    console.log('wizard session cleared from admin_sessions fallback', { scope: botScope, user_id: String(userId) });
-    return { ok: true };
-  }
-  if (error && !String(error.message || '').includes('does not exist')) {
-    console.error('clearWizardSession:', error.message);
-    return { ok: false, error };
-  }
-  console.log('wizard session cleared', { scope: botScope, user_id: String(userId) });
   return { ok: true };
 }
 
@@ -4061,6 +4391,8 @@ async function sendDashboard(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const daily = await getDailyAuto(account.account_key);
   const showCommands = await canUseCommandManagement(chatId, chatId, account.account_key);
   const autoStatus = isAutoActive(auto) ? `yoqilgan, tugaydi: ${new Date(auto.until).toLocaleString('uz-UZ')}` : 'o‘chiq';
+  const botStatus = canAccountAutoReply(account) ? '🟢 Bot ishlayapti' : '🔴 Bot o‘chirilgan';
+  const reachStatus = account.reach_enabled !== false ? '🟢 Reach yoqilgan' : '🔴 Reach o‘chirilgan';
   const today = localDateKey();
   const todayCount = await countLeads(q => q.gte('outreach_at', `${today}T00:00:00+00:00`), account.account_key);
   const read = await countLeads(q => q.eq('status', 'tanishdim'), account.account_key);
@@ -4072,13 +4404,15 @@ async function sendDashboard(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
     text:
       `<b>🏠 Bosh menyu</b>\n` +
       `Joriy akkaunt: ${html(account.label || account.account_key)}\n\n` +
+      `${botStatus}\n` +
+      `${reachStatus}\n` +
       `📣 Auto Outreach: ${html(autoStatus)}\n` +
       `📅 Kunlik auto: ${daily.enabled ? `yoqilgan (${daily.start_time}, ${daily.duration_hours} soat)` : 'o‘chiq'}\n` +
       `Bugungi outreach: ${todayCount} ta\n` +
       `✅ Tanishdim: ${read} ta\n` +
       `💳 To‘lovga yaqin: ${payment} ta\n` +
       `⏰ Eslatma kerak: ${due} ta`,
-    reply_markup: mainMenuKeyboard(accounts.length > 1, showCommands)
+    reply_markup: mainMenuKeyboard(accounts.length > 1, showCommands, account)
   });
 }
 
@@ -4476,7 +4810,7 @@ async function sendPlatformTestNotification(chatId, accountKey, adminUser = {}) 
   });
 }
 
-function mainMenuKeyboard(showAccounts = false, showCommands = false) {
+function mainMenuKeyboard(showAccounts = false, showCommands = false, account = null) {
   const rows = [
       [{ text: '👤 Akkaunt tanlash', callback_data: 'accounts' }],
       [{ text: '✏️ Shablonlar', callback_data: 'templates' }],
@@ -4486,6 +4820,14 @@ function mainMenuKeyboard(showAccounts = false, showCommands = false) {
       [{ text: '📈 Hisobotlar', callback_data: 'report' }],
       [{ text: '🩺 Diagnostika', callback_data: 'diagnostics' }]
   ];
+  if (account) {
+    rows.splice(1, 0, [
+      { text: account.bot_enabled === false || account.auto_reply_enabled === false ? '▶️ Botni yoqish' : '⏸ Botni o‘chirish', callback_data: account.bot_enabled === false || account.auto_reply_enabled === false ? 'account_bot:on' : 'account_bot:off' }
+    ]);
+    rows.splice(2, 0, [
+      { text: account.reach_enabled === false ? '▶️ Reachni yoqish' : '⏸ Reachni o‘chirish', callback_data: account.reach_enabled === false ? 'account_reach:on' : 'account_reach:off' }
+    ]);
+  }
   if (showCommands) rows.splice(1, 0, [{ text: '🧩 Buyruqlar', callback_data: 'commands_menu' }]);
   if (!showAccounts) rows[0][0].text = '👤 Akkaunt';
   return { inline_keyboard: rows };
@@ -4538,6 +4880,10 @@ const COMMAND_ALIASES_UZ = new Map(Object.entries({
   '/akkauntadmin': '/accountadmin',
   '/akkauntniyoq': '/accounton',
   '/akkauntochir': '/accountoff',
+  '/botniyoq': '/boton',
+  '/botniochir': '/botoff',
+  '/reachyoq': '/reachon',
+  '/reachochir': '/reachoff',
   '/sozlamalar': '/settings',
   '/suniyintellekt': '/ai',
   '/aiholati': '/aistatus',
@@ -5041,14 +5387,50 @@ async function handleAdminMessage(msg) {
   if (text.startsWith('/accounton ')) {
     const ak = await publicAccountArg(text.split(/\s+/)[1]);
     if (!ak) return denyAccount();
-    await upsertAccountPatch(ak, { bot_enabled: true, auto_reply_enabled: true });
+    await setAccountBotEnabled(ak, true, from.id);
     return tg('sendMessage', { chat_id: chatId, text: `✅ Akkaunt yoqildi: ${ak}` });
   }
   if (text.startsWith('/accountoff ')) {
     const ak = await publicAccountArg(text.split(/\s+/)[1]);
     if (!ak) return denyAccount();
-    await upsertAccountPatch(ak, { bot_enabled: false, auto_reply_enabled: false });
+    await setAccountBotEnabled(ak, false, from.id);
     return tg('sendMessage', { chat_id: chatId, text: `⛔ Akkaunt o‘chirildi: ${ak}` });
+  }
+  if (text === '/boton' || text.startsWith('/boton ')) {
+    const parts = text.split(/\s+/);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return denyAccount();
+    const allowedAccountKey = await getCommandManagementAccountKey(chatId, from.id, parsed.accountKey);
+    if (!allowedAccountKey) return commandManagementDenied(chatId);
+    await setAccountBotEnabled(allowedAccountKey, true, from.id);
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Bot yoqildi: ${allowedAccountKey}` });
+  }
+  if (text === '/botoff' || text.startsWith('/botoff ')) {
+    const parts = text.split(/\s+/);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return denyAccount();
+    const allowedAccountKey = await getCommandManagementAccountKey(chatId, from.id, parsed.accountKey);
+    if (!allowedAccountKey) return commandManagementDenied(chatId);
+    await setAccountBotEnabled(allowedAccountKey, false, from.id);
+    return tg('sendMessage', { chat_id: chatId, text: `⛔ Bot o‘chirildi: ${allowedAccountKey}` });
+  }
+  if (text === '/reachon' || text.startsWith('/reachon ')) {
+    const parts = text.split(/\s+/);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return denyAccount();
+    const allowedAccountKey = await getCommandManagementAccountKey(chatId, from.id, parsed.accountKey);
+    if (!allowedAccountKey) return commandManagementDenied(chatId);
+    await setAccountReachEnabled(allowedAccountKey, true, from.id);
+    return tg('sendMessage', { chat_id: chatId, text: `✅ Reach yoqildi: ${allowedAccountKey}` });
+  }
+  if (text === '/reachoff' || text.startsWith('/reachoff ')) {
+    const parts = text.split(/\s+/);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return denyAccount();
+    const allowedAccountKey = await getCommandManagementAccountKey(chatId, from.id, parsed.accountKey);
+    if (!allowedAccountKey) return commandManagementDenied(chatId);
+    await setAccountReachEnabled(allowedAccountKey, false, from.id);
+    return tg('sendMessage', { chat_id: chatId, text: `⛔ Reach o‘chirildi: ${allowedAccountKey}` });
   }
   if (text === '/accountstatus') return sendAccountStatus(chatId, selectedAccountKey);
   if (text.startsWith('/ai ')) {
@@ -5334,24 +5716,34 @@ async function handleAdminMessage(msg) {
 
   if (text.startsWith('/leadsoff ')) {
     const id = text.split(/\s+/)[1];
-    await updateLead(id, { stage: STAGE.DISABLED, status: 'disabled', bot_enabled: false }, selectedAccountKey);
+    await pauseLeadBot(id, selectedAccountKey, from.id, 'leadsoff');
     return tg('sendMessage', { chat_id: chatId, text: `🔕 ${id} o‘chirildi.` });
   }
   if (text.startsWith('/leadson ')) {
     const id = text.split(/\s+/)[1];
-    await updateLead(id, { status: 'active', bot_enabled: true }, selectedAccountKey);
+    await resumeLeadBot(id, selectedAccountKey, from.id);
     return tg('sendMessage', { chat_id: chatId, text: `🔔 ${id} yoqildi.` });
   }
   if (text.startsWith('/reset ')) {
     const id = text.split(/\s+/)[1];
     await accountLeadFilter(supabase.from('sent_actions').delete().eq('chat_id', String(id)), selectedAccountKey);
-    await updateLead(id, { stage: STAGE.OUTREACH_SENT, status: 'active', bot_enabled: true, finished_at: null }, selectedAccountKey);
+    await updateLead(id, {
+      stage: STAGE.OUTREACH_SENT,
+      status: 'active',
+      bot_enabled: true,
+      bot_enabled_for_lead: true,
+      manual_only: false,
+      assigned_by_admin: true,
+      manually_started: true,
+      finished_at: null,
+      admin_active_until: null
+    }, selectedAccountKey);
     return tg('sendMessage', { chat_id: chatId, text: `🔁 ${id} reset qilindi. Keyingi xabarida bot ask_application’dan boshlaydi.` });
   }
   if (text.startsWith('/status ')) {
     const id = text.split(/\s+/)[1];
     const lead = await getLead(id, selectedAccountKey);
-    return tg('sendMessage', { chat_id: chatId, text: lead ? await leadCardText(lead) : 'Topilmadi.' });
+    return lead ? sendLeadStatus(chatId, lead) : tg('sendMessage', { chat_id: chatId, text: 'Topilmadi.' });
   }
 
   return sendDashboard(chatId, selectedAccountKey);
@@ -5360,6 +5752,9 @@ async function handleAdminMessage(msg) {
 async function autoOn(chatId, hours, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const account = await getAccount(accountOrKey);
   const value = await enableAutoOutreach(hours, 'manual', account.account_key);
+  if (!value.enabled) {
+    return tg('sendMessage', { chat_id: chatId, text: `⛔ Auto Outreach yoqilmadi: bot yoki reach o‘chirilgan (${account.label || account.account_key}).` });
+  }
   return tg('sendMessage', {
     chat_id: chatId,
     text: `✅ Auto Reply / Auto Outreach ${hours} soatga yoqildi.\n\nAkkaunt: ${account.label || account.account_key}\nTugash vaqti: ${new Date(value.until).toLocaleString('uz-UZ')}\nSession: ${value.session_id}\n\nShu vaqt ichida siz yozgan “Assalomu alaykum...” xabarlari eslab qolinadi va faqat shu sessiondagi lidlarga bot avtomatik javob beradi.`
@@ -5496,6 +5891,7 @@ async function sendSettings(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
       `Akkaunt: ${account.label || account.account_key}\n` +
       `bot_enabled: ${account.bot_enabled ? 'ON' : 'OFF'}\n` +
       `auto_reply_enabled: ${account.auto_reply_enabled ? 'ON' : 'OFF'}\n` +
+      `reach_enabled: ${account.reach_enabled ? 'ON' : 'OFF'}\n` +
       `archive_enabled: ${account.archive_enabled ? 'ON' : 'OFF'}\n` +
       `archive_notify_enabled: ${account.archive_notify_enabled ? 'ON' : 'OFF'}\n` +
       `reports_enabled: ${account.reports_enabled ? 'ON' : 'OFF'}\n` +
@@ -5570,6 +5966,22 @@ async function handleCallback(cb) {
 
   if (data === 'menu' || data === 'noop') return sendDashboard(chatId, selectedAccountKey);
   if (data === 'accounts') return sendAccountsMenu(chatId);
+  if (data.startsWith('account_bot:')) {
+    const allowedAccountKey = await getCommandManagementAccountKey(chatId, cb.from?.id, selectedAccountKey);
+    if (!allowedAccountKey) return commandManagementDenied(chatId);
+    const enabled = data.endsWith(':on');
+    await setAccountBotEnabled(allowedAccountKey, enabled, cb.from?.id);
+    await tg('sendMessage', { chat_id: chatId, text: `${enabled ? '✅ Bot yoqildi' : '⛔ Bot o‘chirildi'}: ${allowedAccountKey}` });
+    return sendDashboard(chatId, allowedAccountKey);
+  }
+  if (data.startsWith('account_reach:')) {
+    const allowedAccountKey = await getCommandManagementAccountKey(chatId, cb.from?.id, selectedAccountKey);
+    if (!allowedAccountKey) return commandManagementDenied(chatId);
+    const enabled = data.endsWith(':on');
+    await setAccountReachEnabled(allowedAccountKey, enabled, cb.from?.id);
+    await tg('sendMessage', { chat_id: chatId, text: `${enabled ? '✅ Reach yoqildi' : '⛔ Reach o‘chirildi'}: ${allowedAccountKey}` });
+    return sendDashboard(chatId, allowedAccountKey);
+  }
   if (commandCallback) {
     const commandAccountKey = await getCommandManagementAccountKey(chatId, cb.from?.id, selectedAccountKey);
     if (!commandAccountKey) return commandManagementDenied(chatId);
@@ -5609,6 +6021,39 @@ async function handleCallback(cb) {
       return sendCommandDetail(chatId, commandAccountKey, saved.command_key || key);
     }
     return tg('sendMessage', { chat_id: chatId, text: 'Yangi buyruq qo‘shish va kengaytirilgan sozlash hozircha o‘chirilgan.' });
+  }
+  if (data.startsWith('lead_')) {
+    const leadChatId = data.split(':')[1];
+    if (!leadChatId) return tg('sendMessage', { chat_id: chatId, text: 'Lid topilmadi.' });
+    if (!ownedAccountKeys.has(selectedAccountKey)) return denyAccount();
+    let lead = await getLead(leadChatId, selectedAccountKey);
+    if (!lead) return tg('sendMessage', { chat_id: chatId, text: 'Lid topilmadi.' });
+    if (data.startsWith('lead_pause:')) lead = await pauseLeadBot(leadChatId, selectedAccountKey, cb.from?.id, 'callback_pause') || lead;
+    else if (data.startsWith('lead_resume:')) lead = await resumeLeadBot(leadChatId, selectedAccountKey, cb.from?.id) || lead;
+    else if (data.startsWith('lead_manual:')) lead = await setLeadManualOnly(leadChatId, selectedAccountKey, cb.from?.id) || lead;
+    else if (data.startsWith('lead_start:')) lead = await manuallyStartLeadBot(leadChatId, selectedAccountKey, cb.from?.id) || lead;
+    else if (data.startsWith('lead_reset_confirm:')) {
+      return tg('sendMessage', {
+        chat_id: chatId,
+        text: `🔄 ${leadChatId} bosqichini tiklashni tasdiqlaysizmi?`,
+        reply_markup: { inline_keyboard: [[{ text: '✅ Ha', callback_data: `lead_reset_do:${leadChatId}` }, { text: '❌ Yo‘q', callback_data: `lead_status:${leadChatId}` }]] }
+      });
+    } else if (data.startsWith('lead_reset_do:')) {
+      await accountLeadFilter(supabase.from('sent_actions').delete().eq('chat_id', String(leadChatId)), selectedAccountKey);
+      lead = await updateLead(leadChatId, {
+        stage: STAGE.OUTREACH_SENT,
+        status: 'active',
+        bot_enabled: true,
+        bot_enabled_for_lead: true,
+        manual_only: false,
+        assigned_by_admin: true,
+        manually_started: true,
+        finished_at: null,
+        admin_active_until: null
+      }, selectedAccountKey) || lead;
+    }
+    if (data.startsWith('lead_status:')) lead = await getLead(leadChatId, selectedAccountKey) || lead;
+    return sendLeadStatus(chatId, lead);
   }
   if (data === 'archive_menu') return sendArchiveMenu(chatId, ownedAccountKeys);
   if (data === 'archive_settings') return sendArchiveSettingsMenu(chatId, selectedAccountKey);
@@ -5833,7 +6278,24 @@ async function handleCallback(cb) {
 async function leadCardText(lead) {
   const auto = await getAutoOutreach(lead.account_key);
   const lastIgnore = await getLastIgnoreReason(lead.chat_id, lead.account_key);
-  return `👤 Lid\nAkkaunt: ${lead.account_key || DEFAULT_ACCOUNT_KEY}\nIsm: ${lead.first_name || '-'}\nUsername: ${lead.username ? '@' + lead.username : '-'}\nChat ID: ${lead.chat_id}\nAuto Reply: ${isAutoActive(auto) ? 'ON' : 'OFF'}\nActive session: ${auto?.session_id || '-'}\nOutreach sent: ${lead.outreach_sent ? 'true' : 'false'}\nOutreach session: ${lead.outreach_session_id || '-'}\nStatus: ${lead.status}\nStage: ${lead.stage}\nBot enabled: ${lead.bot_enabled ? 'true' : 'false'}\nLast user message: ${lead.last_user_message || '-'}\nLast admin message: ${lead.last_admin_message || '-'}\nLast ignore reason: ${lastIgnore ? `${lastIgnore.event_type} (${lastIgnore.created_at})` : '-'}`;
+  return `👤 Lid\nAkkaunt: ${lead.account_key || DEFAULT_ACCOUNT_KEY}\nIsm: ${lead.first_name || '-'}\nUsername: ${lead.username ? '@' + lead.username : '-'}\nChat ID: ${lead.chat_id}\nAuto Reply: ${isAutoActive(auto) ? 'ON' : 'OFF'}\nActive session: ${auto?.session_id || '-'}\nReach sent: ${lead.reach_sent || lead.outreach_sent ? 'true' : 'false'}\nReach text: ${short(lead.reach_message_text || lead.outreach_message || '-', 120)}\nAssigned by admin: ${lead.assigned_by_admin ? 'true' : 'false'}\nManually started: ${lead.manually_started ? 'true' : 'false'}\nStatus: ${lead.status}\nStage: ${lead.stage || lead.current_stage || '-'}\nBot enabled: ${leadBotEnabled(lead) ? 'true' : 'false'}\nManual only: ${lead.manual_only ? 'true' : 'false'}\nLast intent: ${lead.last_intent || '-'} ${lead.last_intent_confidence != null ? `(${lead.last_intent_confidence})` : ''}\nNeeds human: ${lead.needs_human ? 'true' : 'false'}\nLast user message: ${lead.last_customer_message || lead.last_user_message || '-'}\nLast admin message: ${lead.last_admin_message || '-'}\nLast bot message: ${lead.last_bot_message || '-'}\nLast ignore reason: ${lastIgnore ? `${lastIgnore.event_type} (${lastIgnore.created_at})` : '-'}`;
+}
+
+async function sendLeadStatus(chatId, lead) {
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: await leadCardText(lead),
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '⏸ Botni to‘xtatish', callback_data: `lead_pause:${lead.chat_id}` }],
+        [{ text: '🤖 Bot davom etsin', callback_data: `lead_resume:${lead.chat_id}` }],
+        [{ text: '👤 Faqat admin yozadi', callback_data: `lead_manual:${lead.chat_id}` }],
+        [{ text: '▶️ Botni ishga tushirish', callback_data: `lead_start:${lead.chat_id}` }],
+        [{ text: '🔄 Bosqichni tiklash', callback_data: `lead_reset_confirm:${lead.chat_id}` }],
+        [{ text: '⬅️ Menyu', callback_data: 'menu' }]
+      ]
+    }
+  });
 }
 
 // -------------------- HTTP routes --------------------
