@@ -136,6 +136,8 @@ https://YOUR-RENDER-APP.onrender.com/tick
 /botniochir ACCOUNT_KEY
 /reachyoq ACCOUNT_KEY
 /reachochir ACCOUNT_KEY
+/reach_start
+/account_debug
 /sozlamalar
 /sozlamalar ACCOUNT_KEY
 /ketmaketlik ACCOUNT_KEY
@@ -307,6 +309,10 @@ Har bir akkauntda umumiy bot holati va reach holati alohida:
 ```
 
 Bot OFF bo‘lsa avtomatik javob, AI intent, timer va follow-up yuborilmaydi. Reach OFF bo‘lsa yangi outreach session boshlanmaydi va outgoing reach xabarlari lidni avtomatik faollashtirmaydi. Admin qo‘lda yozgan xabarlar arxiv/kontekst uchun saqlanishi mumkin.
+
+`/reach_start` joriy tanlangan akkaunt bo‘yicha reach yuborilmagan yangi lidlarni preview qiladi va `✅ Reachni boshlash` tasdig‘idan keyin account-specific reach shabloni bilan yozadi. `TEST_MODE=true` bo‘lsa faqat `TEST_LEAD_IDS` ichidagi lidlarga yuboriladi.
+
+`/account_debug` ruxsatli admin uchun joriy Telegram ID, tanlangan account, normalized account key va `can_manage_account` holatini ko‘rsatadi.
 
 ## Archive settings
 

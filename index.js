@@ -56,10 +56,12 @@ const COMMAND_MANAGEMENT_ACCOUNT_KEYS = new Set([
   process.env.SECOND_ACCOUNT_KEY || 'second'
 ].filter(Boolean));
 const COMMAND_MANAGEMENT_DENIED_TEXT = 'Bu bo‘limdan foydalanish uchun sizda ruxsat yo‘q.';
+const ACCOUNT_NOT_SELECTED_TEXT = 'Akkaunt tanlanmagan. /menu orqali profilni tanlang.';
 const TEST_MODE = String(process.env.TEST_MODE || 'true') === 'true';
 const TEST_ADMIN_IDS = envIdSet(process.env.TEST_ADMIN_IDS || '');
 const TEST_LEAD_IDS = envIdSet(process.env.TEST_LEAD_IDS || '');
 const ADMIN_TAKEOVER_MINUTES = Number(process.env.ADMIN_TAKEOVER_MINUTES || 10);
+const DEFAULT_REACH_START_TEXT = 'Assalomu alaykum. Siz “O‘zbekiston Lider Yoshlari Ensiklopediyasi”ga kirish uchun ariza qoldirgansiz. Shunaqami?';
 
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
 if (!SUPABASE_URL) throw new Error('SUPABASE_URL missing');
@@ -103,6 +105,72 @@ function envIdSet(value = '') {
 
 function idSetHas(set, ...ids) {
   return ids.map(id => String(id || '').trim()).some(id => id && set.has(id));
+}
+
+function addId(set, value) {
+  const id = String(value || '').trim();
+  if (id) set.add(id);
+}
+
+function normalizeAccountKey(value) {
+  const key = String(value || '').trim().toLowerCase();
+  const secondKey = String(process.env.SECOND_ACCOUNT_KEY || 'second').trim().toLowerCase() || 'second';
+  if (!key || key === LEGACY_DEFAULT_ACCOUNT_KEY || key === DEFAULT_ACCOUNT_KEY) return DEFAULT_ACCOUNT_KEY;
+  if (key === 'second' || key === 'liderlar' || key === secondKey) return secondKey;
+  return key;
+}
+
+function getAllowedAccountKeys() {
+  return new Set([
+    normalizeAccountKey(DEFAULT_ACCOUNT_KEY),
+    normalizeAccountKey(process.env.SECOND_ACCOUNT_KEY || 'second')
+  ]);
+}
+
+function getAllowedAdminIds() {
+  const ids = new Set();
+  for (const id of TEST_ADMIN_IDS) addId(ids, id);
+  for (const id of PLATFORM_OWNER_IDS) addId(ids, id);
+  [
+    ADMIN_CHAT_ID,
+    OWNER_TELEGRAM_ID,
+    BUSINESS_OWNER_ID,
+    process.env.SECOND_ACCOUNT_ADMIN_CHAT_ID,
+    process.env.SECOND_ACCOUNT_BUSINESS_OWNER_ID
+  ].forEach(id => addId(ids, id));
+  if (typeof ENV_ACCOUNTS !== 'undefined') {
+    for (const account of ENV_ACCOUNTS || []) {
+      addId(ids, account.admin_chat_id);
+      addId(ids, account.owner_user_id);
+      addId(ids, account.business_owner_id);
+    }
+  }
+  return ids;
+}
+
+function isAllowedAdminId(telegramUserId) {
+  return getAllowedAdminIds().has(String(telegramUserId || '').trim());
+}
+
+function isAllowedAccountKey(accountOrKey) {
+  return getAllowedAccountKeys().has(normalizeAccountKey(accountKey(accountOrKey)));
+}
+
+function canManageAccount({ telegramUserId, accountKey: rawAccountKey }) {
+  const allowedAdminIds = getAllowedAdminIds();
+  const allowedAccountKeys = getAllowedAccountKeys();
+  return (
+    allowedAdminIds.has(String(telegramUserId || '').trim()) &&
+    allowedAccountKeys.has(normalizeAccountKey(rawAccountKey))
+  );
+}
+
+function accountKeyMatches(a, b) {
+  return normalizeAccountKey(a) === normalizeAccountKey(b);
+}
+
+function accountSetHas(set, key) {
+  return [...(set || [])].some(value => accountKeyMatches(value, key));
 }
 
 function parseAccountsFromEnv() {
@@ -232,8 +300,9 @@ function unknownAccount(businessConnectionId = '') {
 
 function accountDisplayLabel(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const ak = accountKey(accountOrKey);
-  if (ak === 'second') return process.env.SECOND_ACCOUNT_LABEL || 'Ikkinchi akkaunt';
-  if (ak === DEFAULT_ACCOUNT_KEY || ak === LEGACY_DEFAULT_ACCOUNT_KEY) return 'UZLYE';
+  const normalized = normalizeAccountKey(ak);
+  if (normalized === normalizeAccountKey(process.env.SECOND_ACCOUNT_KEY || 'second')) return process.env.SECOND_ACCOUNT_LABEL || 'Liderlar';
+  if (normalized === DEFAULT_ACCOUNT_KEY) return 'UZLYE';
   return ak;
 }
 
@@ -243,12 +312,11 @@ function accountKey(accountOrKey = DEFAULT_ACCOUNT_KEY) {
 }
 
 function commandManagementTargetAccountKey(accountOrKey = DEFAULT_ACCOUNT_KEY) {
-  const key = accountKey(accountOrKey);
-  return isDefaultAccountKey(key) ? DEFAULT_ACCOUNT_KEY : key;
+  return normalizeAccountKey(accountKey(accountOrKey));
 }
 
 function isCommandManagementAccountKey(accountOrKey = DEFAULT_ACCOUNT_KEY) {
-  return COMMAND_MANAGEMENT_ACCOUNT_KEYS.has(commandManagementTargetAccountKey(accountOrKey));
+  return isAllowedAccountKey(accountOrKey) || COMMAND_MANAGEMENT_ACCOUNT_KEYS.has(commandManagementTargetAccountKey(accountOrKey));
 }
 
 function settingKey(key, accountOrKey = DEFAULT_ACCOUNT_KEY) {
@@ -1146,7 +1214,7 @@ async function upsertLeadBase({ chatId, businessConnectionId, from, text, accoun
 
 function isTestAdminAllowed(chatId, fromId = '') {
   if (!TEST_MODE || !TEST_ADMIN_IDS.size) return true;
-  return idSetHas(TEST_ADMIN_IDS, chatId, fromId);
+  return idSetHas(TEST_ADMIN_IDS, chatId, fromId) || isAllowedAdminId(chatId) || isAllowedAdminId(fromId);
 }
 
 function isTestLeadAllowed(chatId, fromId = '') {
@@ -1857,7 +1925,7 @@ async function handleCommandCreateInput({ chatId, from = {}, text, session, sele
   const payload = session?.payload || {};
   const targetAccountKey = payload.selected_account_key || payload.account_key || selectedAccountKey;
   console.log('owner text received while wizard session exists', { chat_id: String(chatId), user_id: String(from?.id || ''), account_key: targetAccountKey, mode: session?.mode, step: session?.step || payload.step || '-' });
-  if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+  if (!accountSetHas(ownedAccountKeys, targetAccountKey)) return denyAccount();
   const step = session?.step || payload.step || 'command_key';
   try {
     if (step === 'command_key') {
@@ -3557,6 +3625,178 @@ async function getReminderDue(limit = 50, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   return getLeads(q => dueReminderFilter(q), limit, accountOrKey);
 }
 
+async function getReachStartTemplate(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  for (const key of ['reach_start', 'outreach_start', 'ask_application']) {
+    const body = await getTemplate(key, accountOrKey);
+    if (body) return renderTemplate(body);
+  }
+  return DEFAULT_REACH_START_TEXT;
+}
+
+async function getReachCandidates(accountOrKey = DEFAULT_ACCOUNT_KEY, limit = 30) {
+  if (TEST_MODE && !TEST_LEAD_IDS.size) return [];
+  return getLeads(q => {
+    let next = q
+      .not('chat_id', 'is', null)
+      .not('business_connection_id', 'is', null)
+      .or('reach_sent.is.null,reach_sent.eq.false')
+      .or('outreach_sent.is.null,outreach_sent.eq.false');
+    if (TEST_MODE && TEST_LEAD_IDS.size) next = next.in('chat_id', [...TEST_LEAD_IDS]);
+    return next;
+  }, limit, accountOrKey);
+}
+
+async function sendAccountDebug(chatId, telegramUserId, selectedAccountKey = DEFAULT_ACCOUNT_KEY) {
+  const session = await getAdminSession(chatId);
+  const sessionSelected = session?.payload?.selected_account_key || session?.account_key || selectedAccountKey;
+  const normalized = normalizeAccountKey(sessionSelected);
+  const owned = await getPublicOwnedAccounts(chatId, telegramUserId);
+  const effectiveCanManage = accountSetHas(new Set(owned.map(a => a.account_key)), sessionSelected);
+  const allowedAdmin = isAllowedAdminId(telegramUserId) || Boolean(owned.length);
+  const allowedAccount = isAllowedAccountKey(sessionSelected);
+  const canManage = canManageAccount({ telegramUserId, accountKey: sessionSelected }) || effectiveCanManage;
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `account_debug\n\n` +
+      `telegram_user_id: ${telegramUserId || '-'}\n` +
+      `admin_chat_id: ${chatId || '-'}\n` +
+      `selected_account_key: ${sessionSelected || '-'}\n` +
+      `normalized_account_key: ${normalized || '-'}\n` +
+      `SECOND_ACCOUNT_KEY: ${process.env.SECOND_ACCOUNT_KEY || 'second'}\n` +
+      `is_allowed_admin: ${allowedAdmin ? 'true' : 'false'}\n` +
+      `is_allowed_account: ${allowedAccount ? 'true' : 'false'}\n` +
+      `can_manage_account: ${canManage ? 'true' : 'false'}\n` +
+      `TEST_MODE: ${TEST_MODE ? 'true' : 'false'}`
+  });
+}
+
+async function sendReachStartPreview(chatId, telegramUserId, selectedAccountKey = DEFAULT_ACCOUNT_KEY) {
+  const allowedAccountKey = await getCommandManagementAccountKey(chatId, telegramUserId, selectedAccountKey);
+  if (!allowedAccountKey) {
+    return isAllowedAdminId(telegramUserId)
+      ? tg('sendMessage', { chat_id: chatId, text: ACCOUNT_NOT_SELECTED_TEXT })
+      : commandManagementDenied(chatId);
+  }
+  let account = await getAccount(allowedAccountKey);
+  if (!canAccountAutoReply(account)) {
+    return tg('sendMessage', {
+      chat_id: chatId,
+      text:
+        `Akkaunt: ${account.label || account.account_key}\n` +
+        `Bot holati: OFF\n` +
+        `Reach holati: ${account.reach_enabled === false ? 'OFF' : 'ON'}\n\n` +
+        `Bot o‘chirilgan. Avval yoqing.`,
+      reply_markup: { inline_keyboard: [[{ text: '▶️ Botni yoqish', callback_data: 'account_bot:on' }], [{ text: '❌ Bekor qilish', callback_data: 'reach_start_cancel' }]] }
+    });
+  }
+  if (account.reach_enabled === false) {
+    account = await setAccountReachEnabled(allowedAccountKey, true, telegramUserId);
+  }
+  const reachText = await getReachStartTemplate(allowedAccountKey);
+  const candidates = await getReachCandidates(allowedAccountKey, 50);
+  await setAdminSession(chatId, 'reach_start_confirm', {
+    telegram_user_id: String(telegramUserId || chatId),
+    selected_account_key: allowedAccountKey,
+    account_key: allowedAccountKey,
+    reach_text: reachText,
+    candidate_count: candidates.length
+  });
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `Akkaunt: ${account.label || account.account_key}\n` +
+      `Bot holati: ${canAccountAutoReply(account) ? 'ON' : 'OFF'}\n` +
+      `Reach holati: ${account.reach_enabled === false ? 'OFF' : 'ON'}\n` +
+      `Yangi lidlar soni: ${candidates.length}\n\n` +
+      `Reach matni:\n${short(reachText, 1200)}`,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '✅ Reachni boshlash', callback_data: 'reach_start_confirm' }],
+        [{ text: '❌ Bekor qilish', callback_data: 'reach_start_cancel' }]
+      ]
+    }
+  });
+}
+
+async function executeReachStart(chatId, telegramUserId) {
+  const session = await getAdminSession(chatId);
+  const payload = session?.payload || {};
+  const allowedAccountKey = await getCommandManagementAccountKey(chatId, telegramUserId, payload.selected_account_key || payload.account_key);
+  if (!allowedAccountKey) return commandManagementDenied(chatId);
+  let account = await getAccount(allowedAccountKey);
+  if (!canAccountAutoReply(account)) {
+    return tg('sendMessage', { chat_id: chatId, text: 'Bot o‘chirilgan. Avval yoqing.' });
+  }
+  if (account.reach_enabled === false) account = await setAccountReachEnabled(allowedAccountKey, true, telegramUserId);
+  const reachText = payload.reach_text || await getReachStartTemplate(allowedAccountKey);
+  const candidates = await getReachCandidates(allowedAccountKey, 50);
+  let sent = 0;
+  let failed = 0;
+  let skipped = 0;
+  for (const lead of candidates) {
+    if (lead.reach_sent || lead.outreach_sent) {
+      skipped += 1;
+      continue;
+    }
+    if (!lead.business_connection_id) {
+      skipped += 1;
+      await logIgnore(lead.chat_id, 'reach_skipped_no_business_connection', 'manual_reach_start', allowedAccountKey);
+      continue;
+    }
+    if (!isTestLeadAllowed(lead.chat_id)) {
+      skipped += 1;
+      await logIgnore(lead.chat_id, 'test_mode_blocked', 'manual_reach_start', allowedAccountKey);
+      continue;
+    }
+    try {
+      const result = await tg('sendMessage', {
+        chat_id: lead.chat_id,
+        business_connection_id: lead.business_connection_id,
+        text: reachText
+      });
+      await updateLead(lead.chat_id, {
+        account_key: allowedAccountKey,
+        stage: STAGE.OUTREACH_SENT,
+        current_stage: STAGE.OUTREACH_SENT,
+        status: 'active',
+        bot_enabled: true,
+        bot_enabled_for_lead: true,
+        manual_only: false,
+        reach_sent: true,
+        outreach_sent: true,
+        assigned_by_reach: true,
+        assigned_by_admin: false,
+        manually_started: false,
+        reach_sent_at: new Date().toISOString(),
+        outreach_at: new Date().toISOString(),
+        reach_message_text: reachText,
+        outreach_message: reachText,
+        reach_message_id: result?.message_id ? String(result.message_id) : null,
+        reach_batch_id: `manual_reach_${localDateKey()}`,
+        last_admin_message: reachText,
+        admin_active_until: null
+      }, allowedAccountKey);
+      await writeAuditLog({ accountKey: allowedAccountKey, chatId: lead.chat_id, action: 'reach_sent', newValue: { manual: true, message_id: result?.message_id || null }, actorType: 'admin', actorId: telegramUserId });
+      sent += 1;
+      await sleep(350);
+    } catch (err) {
+      failed += 1;
+      await logEvent(lead.chat_id, 'manual_reach_send_failed', err.message || String(err), allowedAccountKey);
+    }
+  }
+  await setSelectedAccountKey(chatId, allowedAccountKey, telegramUserId);
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `✅ Reach yakunlandi\n\n` +
+      `Akkaunt: ${account.label || account.account_key}\n` +
+      `Yuborildi: ${sent}\n` +
+      `O‘tkazib yuborildi: ${skipped}\n` +
+      `Xato: ${failed}`
+  });
+}
+
 function listText(title, rows) {
   if (!rows.length) return `${title}\n\nHozircha ro‘yxat bo‘sh.`;
   return `${title}\n\n` + rows.map((l, i) => `${i + 1}. ${l.first_name || '-'} ${l.username ? '@' + l.username : ''}\n   Chat ID: ${l.chat_id}\n   Status: ${l.status}\n   Oxirgi: ${short(l.last_user_message || '-')}`).join('\n\n');
@@ -3752,13 +3992,18 @@ async function sendArchiveDebug(chatId, parts, selectedAccountKey) {
 async function parseOptionalAccountArg(parts, selectedAccountKey, startIndex = 1, allowedAccountKeys = null) {
   const accounts = await getAccounts();
   const maybe = parts[startIndex];
-  const account = accounts.find(a => a.account_key === maybe);
-  if (account && allowedAccountKeys && !allowedAccountKeys.has(account.account_key)) {
+  const maybeNormalized = normalizeAccountKey(maybe);
+  const account = accounts.find(a => accountKeyMatches(a.account_key, maybeNormalized));
+  const allowed = allowedAccountKeys
+    ? [...allowedAccountKeys].some(key => accountKeyMatches(key, account?.account_key || maybeNormalized))
+    : true;
+  if ((account || isAllowedAccountKey(maybe)) && !allowed) {
     return { accountKey: null, nextIndex: startIndex + 1, denied: true };
   }
+  const recognizedAccount = account || (isAllowedAccountKey(maybe) ? { account_key: maybeNormalized } : null);
   return {
-    accountKey: account?.account_key || selectedAccountKey,
-    nextIndex: account ? startIndex + 1 : startIndex
+    accountKey: recognizedAccount?.account_key || selectedAccountKey,
+    nextIndex: recognizedAccount ? startIndex + 1 : startIndex
   };
 }
 
@@ -3829,8 +4074,8 @@ async function sendReminderConfirm(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
 }
 
 async function getSelectedAccountKey(adminChatId) {
-  const { data, error } = await supabase.from('admin_sessions').select('payload').eq('chat_id', String(adminChatId)).maybeSingle();
-  if (!error && data?.payload?.selected_account_key) return data.payload.selected_account_key;
+  const { data, error } = await supabase.from('admin_sessions').select('account_key,payload').eq('chat_id', String(adminChatId)).maybeSingle();
+  if (!error && (data?.payload?.selected_account_key || data?.account_key)) return data.payload?.selected_account_key || data.account_key;
   const accounts = await getAccounts();
   const direct = accounts.find(a => String(a.admin_chat_id || '') === String(adminChatId));
   if (direct?.account_key) return direct.account_key;
@@ -3846,16 +4091,32 @@ async function getSelectedAccountKey(adminChatId) {
 async function getPublicOwnedAccounts(chatId, fromId = '') {
   const chat = String(chatId || '');
   const from = String(fromId || chat || '');
-  if (!isTestAdminAllowed(chat, from)) return [];
   const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY);
   const byKey = new Map();
+  const allowedAccountKeys = getAllowedAccountKeys();
+
+  const addAllowedAccount = (account) => {
+    if (!account?.account_key) return;
+    if (!allowedAccountKeys.has(normalizeAccountKey(account.account_key))) return;
+    byKey.set(account.account_key, account);
+  };
+
+  if (isAllowedAdminId(from) || isAllowedAdminId(chat)) {
+    for (const account of accounts) addAllowedAccount(account);
+    for (const key of allowedAccountKeys) {
+      if (![...byKey.values()].some(a => accountKeyMatches(a.account_key, key))) {
+        addAllowedAccount(await getAccount(key));
+      }
+    }
+  }
+
   for (const account of accounts) {
     if (
       (account.admin_chat_id && (String(account.admin_chat_id) === chat || String(account.admin_chat_id) === from)) ||
       (account.owner_user_id && String(account.owner_user_id) === from) ||
       (account.business_owner_id && String(account.business_owner_id) === from)
     ) {
-      byKey.set(account.account_key, account);
+      addAllowedAccount(account);
     }
   }
   const ids = [...new Set([chat, from].filter(Boolean))];
@@ -3866,8 +4127,8 @@ async function getPublicOwnedAccounts(chatId, fromId = '') {
       .eq('is_active', true);
     if (!error) {
       for (const row of data || []) {
-        const account = accounts.find(a => a.account_key === row.account_key);
-        if (account) byKey.set(account.account_key, account);
+        const account = accounts.find(a => accountKeyMatches(a.account_key, row.account_key)) || await getAccount(row.account_key);
+        addAllowedAccount(account);
       }
     } else if (!String(error.message || '').includes('does not exist')) {
       console.error('getPublicOwnedAccounts:', error.message);
@@ -3879,20 +4140,26 @@ async function getPublicOwnedAccounts(chatId, fromId = '') {
 async function getPublicSelectedAccountKey(chatId, fromId = '') {
   const owned = await getPublicOwnedAccounts(chatId, fromId);
   const selected = await getSelectedAccountKey(chatId);
-  if (owned.some(a => a.account_key === selected)) return selected;
+  const ownedSelected = owned.find(a => accountKeyMatches(a.account_key, selected));
+  if (ownedSelected?.account_key) return ownedSelected.account_key;
   return owned[0]?.account_key || selected;
 }
 
 async function requirePublicAccountAccess(chatId, fromId, requestedAccountKey) {
   const owned = await getPublicOwnedAccounts(chatId, fromId);
-  const requested = accountKey(requestedAccountKey);
-  return owned.some(a => a.account_key === requested) ? requested : null;
+  const requested = normalizeAccountKey(requestedAccountKey);
+  const found = owned.find(a => accountKeyMatches(a.account_key, requested));
+  if (found?.account_key) return found.account_key;
+  if (canManageAccount({ telegramUserId: fromId, accountKey: requested })) return requested;
+  return null;
 }
 
 async function getCommandManagementAccountKey(chatId, fromId, preferredAccountKey = DEFAULT_ACCOUNT_KEY) {
   const targetAccountKey = commandManagementTargetAccountKey(preferredAccountKey);
   if (!isCommandManagementAccountKey(targetAccountKey)) return null;
-  return requirePublicAccountAccess(chatId, fromId, targetAccountKey);
+  const allowedKey = await requirePublicAccountAccess(chatId, fromId, targetAccountKey);
+  if (allowedKey) await setSelectedAccountKey(chatId, allowedKey, fromId);
+  return allowedKey;
 }
 
 async function canUseCommandManagement(chatId, fromId, preferredAccountKey = DEFAULT_ACCOUNT_KEY) {
@@ -3924,13 +4191,32 @@ function isCommandManagementCallbackData(data = '') {
   ].includes(data) || data.startsWith('cmd_') || data.startsWith('command_');
 }
 
-async function setSelectedAccountKey(adminChatId, selectedAccountKey) {
-  const { error } = await supabase.from('admin_sessions').upsert({
+async function upsertAdminSessionRow(row) {
+  let { error } = await supabase.from('admin_sessions').upsert(row);
+  if (error && String(error.message || '').includes('telegram_user_id')) {
+    const fallback = { ...row };
+    delete fallback.telegram_user_id;
+    ({ error } = await supabase.from('admin_sessions').upsert(fallback));
+  }
+  return error;
+}
+
+async function setSelectedAccountKey(adminChatId, selectedAccountKey, telegramUserId = '') {
+  const normalizedKey = normalizeAccountKey(selectedAccountKey);
+  const row = {
     chat_id: String(adminChatId),
+    telegram_user_id: String(telegramUserId || adminChatId),
     mode: 'account_selected',
-    payload: { selected_account_key: selectedAccountKey },
+    account_key: normalizedKey,
+    payload: {
+      telegram_user_id: String(telegramUserId || adminChatId),
+      chat_id: String(adminChatId),
+      selected_account_key: normalizedKey,
+      account_key: normalizedKey
+    },
     updated_at: new Date().toISOString()
-  });
+  };
+  const error = await upsertAdminSessionRow(row);
   if (error) console.error('setSelectedAccountKey:', error.message);
 }
 
@@ -3944,13 +4230,17 @@ async function getAdminSession(chatId) {
 }
 
 async function setAdminSession(chatId, mode, payload = {}) {
+  const selectedAccountKey = payload.selected_account_key || payload.account_key || null;
   const row = {
     chat_id: String(chatId),
+    telegram_user_id: payload.telegram_user_id ? String(payload.telegram_user_id) : undefined,
     mode,
+    account_key: selectedAccountKey ? normalizeAccountKey(selectedAccountKey) : null,
     payload,
     updated_at: new Date().toISOString()
   };
-  const { error } = await supabase.from('admin_sessions').upsert(row);
+  if (!row.telegram_user_id) delete row.telegram_user_id;
+  const error = await upsertAdminSessionRow(row);
   if (error) {
     console.error('setAdminSession:', error.message);
     return { ok: false, error };
@@ -3958,9 +4248,9 @@ async function setAdminSession(chatId, mode, payload = {}) {
   return { ok: true };
 }
 
-async function sendAccountsMenu(chatId) {
-  const accounts = await getPublicOwnedAccounts(chatId, chatId);
-  const selected = await getPublicSelectedAccountKey(chatId, chatId);
+async function sendAccountsMenu(chatId, fromId = chatId) {
+  const accounts = await getPublicOwnedAccounts(chatId, fromId);
+  const selected = await getPublicSelectedAccountKey(chatId, fromId);
   const rows = accounts.map(a => ([{
     text: `${a.account_key === selected ? '✅ ' : ''}${a.label || a.account_key}`,
     callback_data: `account:${a.account_key}`
@@ -4384,12 +4674,12 @@ async function sendFlowTest(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   return tg('sendMessage', { chat_id: chatId, text: `Flow test: ${account.account_key}/${account.flow_key || 'info_only'}\n\n${lines.join('\n\n')}` });
 }
 
-async function sendDashboard(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+async function sendDashboard(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, fromId = chatId) {
   const account = await getAccount(accountOrKey);
-  const accounts = await getPublicOwnedAccounts(chatId, chatId);
+  const accounts = await getPublicOwnedAccounts(chatId, fromId);
   const auto = await getAutoOutreach(account.account_key);
   const daily = await getDailyAuto(account.account_key);
-  const showCommands = await canUseCommandManagement(chatId, chatId, account.account_key);
+  const showCommands = await canUseCommandManagement(chatId, fromId, account.account_key);
   const autoStatus = isAutoActive(auto) ? `yoqilgan, tugaydi: ${new Date(auto.until).toLocaleString('uz-UZ')}` : 'o‘chiq';
   const botStatus = canAccountAutoReply(account) ? '🟢 Bot ishlayapti' : '🔴 Bot o‘chirilgan';
   const reachStatus = account.reach_enabled !== false ? '🟢 Reach yoqilgan' : '🔴 Reach o‘chirilgan';
@@ -5193,22 +5483,29 @@ async function handleAdminMessage(msg) {
   const selectedAccountKey = await getPublicSelectedAccountKey(chatId, from.id);
   const session = await getAdminSession(chatId);
   const ownedAccountKeys = new Set((await getPublicOwnedAccounts(chatId, from.id)).map(a => a.account_key));
-  const denyAccount = () => tg('sendMessage', { chat_id: chatId, text: '⛔ Bu akkaunt sizga tegishli emas.' });
+  const denyAccount = () => commandManagementDenied(chatId);
   const publicAccountArg = async (maybeAccountKey, fallback = selectedAccountKey) => {
     if (!maybeAccountKey) return fallback;
     const accounts = await getAccounts();
-    const account = accounts.find(a => a.account_key === maybeAccountKey);
+    const account = accounts.find(a => accountKeyMatches(a.account_key, maybeAccountKey));
     if (!account) return fallback;
-    return ownedAccountKeys.has(account.account_key) ? account.account_key : null;
+    return [...ownedAccountKeys].some(key => accountKeyMatches(key, account.account_key)) ? account.account_key : null;
   };
+
+  if (text === '/account_debug') return sendAccountDebug(chatId, from.id, selectedAccountKey);
+  if (text === '/reach_start' || text.startsWith('/reach_start ')) {
+    const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return commandManagementDenied(chatId);
+    return sendReachStartPreview(chatId, from.id, parsed.accountKey);
+  }
 
   if (!ownedAccountKeys.size && !['/start', '/menu', '/accounts', '/whoami', '/cancel'].includes(text)) {
     return denyAccount();
   }
 
   if (text === '/cancel') {
-    await setAdminSession(chatId, 'account_selected', { selected_account_key: selectedAccountKey });
-    return sendDashboard(chatId, selectedAccountKey);
+    await setSelectedAccountKey(chatId, selectedAccountKey, from.id);
+    return sendDashboard(chatId, selectedAccountKey, from.id);
   }
 
   if ((session?.mode === 'editing_command_template' || session?.mode === 'custom_command_edit_response') && !text.startsWith('/')) {
@@ -5218,35 +5515,35 @@ async function handleAdminMessage(msg) {
     if (!allowedAccountKey) return commandManagementDenied(chatId);
     const commandKey = payload.command_key;
     const saved = await saveCommandTemplateEdit(allowedAccountKey, commandKey, text, from.id);
-    await setAdminSession(chatId, 'account_selected', { selected_account_key: allowedAccountKey });
+    await setSelectedAccountKey(chatId, allowedAccountKey, from.id);
     if (!saved) return tg('sendMessage', { chat_id: chatId, text: 'Buyruq topilmadi.' });
     await tg('sendMessage', { chat_id: chatId, text: 'Shablon muvaffaqiyatli yangilandi' });
     return sendCommandDetail(chatId, allowedAccountKey, saved.command_key || commandKey);
   }
 
   if (session?.mode === 'command_create' && !text.startsWith('/')) {
-    await setAdminSession(chatId, 'account_selected', { selected_account_key: selectedAccountKey });
+    await setSelectedAccountKey(chatId, selectedAccountKey, from.id);
     return tg('sendMessage', { chat_id: chatId, text: 'Yangi buyruq qo‘shish hozircha o‘chirilgan.' });
   }
 
   if (session?.mode === 'template_edit_input' && !text.startsWith('/')) {
     const payload = session.payload || {};
     const targetAccountKey = payload.selected_account_key || selectedAccountKey;
-    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, targetAccountKey)) return denyAccount();
     return showTemplateEditPreview(chatId, targetAccountKey, payload.template_key, text);
   }
 
   if (session?.mode === 'ai_template_input' && !text.startsWith('/')) {
     const payload = session.payload || {};
     const targetAccountKey = payload.selected_account_key || selectedAccountKey;
-    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, targetAccountKey)) return denyAccount();
     return showAiTemplatePreview(chatId, targetAccountKey, payload.template_key, text);
   }
 
   if (session?.mode === 'template_key_input' && !text.startsWith('/')) {
     const payload = session.payload || {};
     const targetAccountKey = payload.selected_account_key || selectedAccountKey;
-    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, targetAccountKey)) return denyAccount();
     const templateKey = sanitizeSetupKey(text, 64);
     if (!templateKey) return tg('sendMessage', { chat_id: chatId, text: '⚠️ Shablon key noto‘g‘ri. Masalan: narx_javobi' });
     await setAdminSession(chatId, 'template_body_input', { selected_account_key: targetAccountKey, template_key: templateKey });
@@ -5256,7 +5553,7 @@ async function handleAdminMessage(msg) {
   if (session?.mode === 'template_body_input' && !text.startsWith('/')) {
     const payload = session.payload || {};
     const targetAccountKey = payload.selected_account_key || selectedAccountKey;
-    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, targetAccountKey)) return denyAccount();
     return showTemplateEditPreview(chatId, targetAccountKey, payload.template_key, text);
   }
 
@@ -5269,21 +5566,21 @@ async function handleAdminMessage(msg) {
     'custom_command_template_select',
     'custom_command_preview'
   ].includes(session?.mode) && !text.startsWith('/')) {
-    await setAdminSession(chatId, 'account_selected', { selected_account_key: selectedAccountKey });
+    await setSelectedAccountKey(chatId, selectedAccountKey, from.id);
     return tg('sendMessage', { chat_id: chatId, text: 'Yangi buyruq qo‘shish va test qilish hozircha o‘chirilgan.' });
   }
 
   if (session?.mode === 'ai_rule_test_input' && !text.startsWith('/')) {
     const payload = session.payload || {};
     const fakeLead = { account_key: payload.selected_account_key || selectedAccountKey, chat_id: 'test', stage: payload.step_key || STAGE.ASKED_APPLICATION, last_bot_message: '', last_admin_message: '' };
-    if (!ownedAccountKeys.has(fakeLead.account_key)) return denyAccount();
-    await setAdminSession(chatId, 'account_selected', { selected_account_key: fakeLead.account_key });
+    if (!accountSetHas(ownedAccountKeys, fakeLead.account_key)) return denyAccount();
+    await setSelectedAccountKey(chatId, fakeLead.account_key, from.id);
     return tg('sendMessage', { chat_id: chatId, text: await aiRuleDryRunText(fakeLead.account_key, fakeLead.stage, text) });
   }
 
   if (session?.mode === 'flow_display_input' && !text.startsWith('/')) {
     const targetAccountKey = session.payload?.selected_account_key || selectedAccountKey;
-    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, targetAccountKey)) return denyAccount();
     const stepKey = sanitizeSetupKey(text, 48);
     await setAdminSession(chatId, 'flow_step_key_input', { selected_account_key: targetAccountKey, display_name: text.slice(0, 80), suggested_step_key: stepKey });
     return tg('sendMessage', { chat_id: chatId, text: `step_key yuboring.\nTaklif: ${stepKey || 'ariza_tasdigi'}` });
@@ -5292,7 +5589,7 @@ async function handleAdminMessage(msg) {
   if (session?.mode === 'flow_step_key_input' && !text.startsWith('/')) {
     const payload = session.payload || {};
     const targetAccountKey = payload.selected_account_key || selectedAccountKey;
-    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, targetAccountKey)) return denyAccount();
     const stepKey = sanitizeSetupKey(text || payload.suggested_step_key, 48);
     const templateKeys = await listAccountTemplateKeys(targetAccountKey);
     await setAdminSession(chatId, 'flow_template_select', { ...payload, selected_account_key: targetAccountKey, step_key: stepKey });
@@ -5306,34 +5603,34 @@ async function handleAdminMessage(msg) {
   if (session?.mode === 'flow_test_input' && !text.startsWith('/')) {
     const payload = session.payload || {};
     const targetAccountKey = payload.selected_account_key || selectedAccountKey;
-    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, targetAccountKey)) return denyAccount();
     await clearSetupSession(chatId, targetAccountKey);
     return tg('sendMessage', { chat_id: chatId, text: await flowDryRunText(targetAccountKey, payload.step_key || STAGE.ASKED_APPLICATION, text) });
   }
 
   if (session?.mode === 'ai_rule_natural_input' && !text.startsWith('/')) {
     const targetAccountKey = session.payload?.selected_account_key || selectedAccountKey;
-    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, targetAccountKey)) return denyAccount();
     const rule = await proposeAiRuleFromNatural({ accountKey: targetAccountKey, text, actorId: from.id });
     return showAiRulePreview(chatId, targetAccountKey, rule);
   }
 
-  if (text === '/start' || text === '/menu') return sendDashboard(chatId, selectedAccountKey);
+  if (text === '/start' || text === '/menu') return sendDashboard(chatId, selectedAccountKey, from.id);
   if (text === '/whoami') return replyWhoami(msg, 'message');
   if (text === '/resetme') {
     await resetMeChat({ chatId, from: msg.from, accountKey: selectedAccountKey });
     return tg('sendMessage', { chat_id: chatId, text: '✅ Test profilingiz tozalandi. Endi qayta test qilishingiz mumkin.' });
   }
 
-  if (text === '/accounts') return sendAccountsMenu(chatId);
+  if (text === '/accounts') return sendAccountsMenu(chatId, from.id);
   if (text === '/connections') return sendConnections(chatId, ownedAccountKeys);
   if (text.startsWith('/account ')) {
     const key = text.split(/\s+/)[1];
     const allowedKey = await requirePublicAccountAccess(chatId, from.id, key);
-    if (!allowedKey) return tg('sendMessage', { chat_id: chatId, text: '⛔ Bu akkaunt sizga tegishli emas.' });
+    if (!allowedKey) return commandManagementDenied(chatId);
     const account = await getAccount(allowedKey);
     if (!account) return tg('sendMessage', { chat_id: chatId, text: `Topilmadi: ${key}` });
-    await setSelectedAccountKey(chatId, allowedKey);
+    await setSelectedAccountKey(chatId, allowedKey, from.id);
     return tg('sendMessage', { chat_id: chatId, text: `✅ Akkaunt tanlandi: ${account.label || account.account_key}` });
   }
   if (text.startsWith('/bindconnection ')) {
@@ -5439,7 +5736,7 @@ async function handleAdminMessage(msg) {
     const maybeAccount = accounts.find(a => a.account_key === parts[1]);
     const targetAccount = maybeAccount ? parts[1] : selectedAccountKey;
     const mode = maybeAccount ? parts[2] : parts[1];
-    if (maybeAccount && !ownedAccountKeys.has(targetAccount)) return denyAccount();
+    if (maybeAccount && !accountSetHas(ownedAccountKeys, targetAccount)) return denyAccount();
     if (mode === 'on') {
       await setAccountAiEnabled(targetAccount, true);
       return tg('sendMessage', { chat_id: chatId, text: `✅ AI intent yoqildi: ${targetAccount}` });
@@ -5485,7 +5782,7 @@ async function handleAdminMessage(msg) {
     const [first, second] = rest.split(/\s+/, 2);
     const maybeAccount = accounts.find(a => a.account_key === first);
     const templateAccountKey = maybeAccount ? first : selectedAccountKey;
-    if (maybeAccount && !ownedAccountKeys.has(templateAccountKey)) return denyAccount();
+    if (maybeAccount && !accountSetHas(ownedAccountKeys, templateAccountKey)) return denyAccount();
     const templateKey = maybeAccount ? second : first;
     const prefix = maybeAccount ? `${first} ${second}` : first;
     const rough = rest.slice(prefix.length).trim();
@@ -5628,14 +5925,14 @@ async function handleAdminMessage(msg) {
     const parts = text.split(/\s+/);
     const accounts = await getAccounts();
     const maybeAccount = accounts.find(a => a.account_key === parts[1]);
-    if (maybeAccount && !ownedAccountKeys.has(maybeAccount.account_key)) return denyAccount();
+    if (maybeAccount && !accountSetHas(ownedAccountKeys, maybeAccount.account_key)) return denyAccount();
     return sendArchiveDebug(chatId, parts, selectedAccountKey);
   }
   if (text.startsWith('/archivechat ')) {
     const parts = text.split(/\s+/);
     const accounts = await getAccounts();
     const maybeAccount = accounts.find(a => a.account_key === parts[1]);
-    if (maybeAccount && !ownedAccountKeys.has(maybeAccount.account_key)) return denyAccount();
+    if (maybeAccount && !accountSetHas(ownedAccountKeys, maybeAccount.account_key)) return denyAccount();
     return sendArchiveList(chatId, 'chat', maybeAccount ? maybeAccount.account_key : selectedAccountKey, maybeAccount ? parts[2] : parts[1]);
   }
   if (text.startsWith('/testnotify ')) {
@@ -5694,7 +5991,7 @@ async function handleAdminMessage(msg) {
     const accounts = await getAccounts();
     const maybeAccount = accounts.find(a => a.account_key === parts[1]);
     const templateAccountKey = maybeAccount ? parts[1] : selectedAccountKey;
-    if (maybeAccount && !ownedAccountKeys.has(templateAccountKey)) return denyAccount();
+    if (maybeAccount && !accountSetHas(ownedAccountKeys, templateAccountKey)) return denyAccount();
     const key = maybeAccount ? parts[2] : parts[1];
     const body = await getTemplate(key, templateAccountKey);
     return tg('sendMessage', { chat_id: chatId, text: body ? `Template: ${templateAccountKey}/${key}\n\n${body}` : `Topilmadi: ${templateAccountKey}/${key}` });
@@ -5705,7 +6002,7 @@ async function handleAdminMessage(msg) {
     const [first, second] = rest.split(/\s+/, 2);
     const maybeAccount = accounts.find(a => a.account_key === first);
     const templateAccountKey = maybeAccount ? first : selectedAccountKey;
-    if (maybeAccount && !ownedAccountKeys.has(templateAccountKey)) return denyAccount();
+    if (maybeAccount && !accountSetHas(ownedAccountKeys, templateAccountKey)) return denyAccount();
     const key = maybeAccount ? second : first;
     const prefix = maybeAccount ? `${first} ${second}` : first;
     const body = rest.slice(prefix.length).trim();
@@ -5746,7 +6043,7 @@ async function handleAdminMessage(msg) {
     return lead ? sendLeadStatus(chatId, lead) : tg('sendMessage', { chat_id: chatId, text: 'Topilmadi.' });
   }
 
-  return sendDashboard(chatId, selectedAccountKey);
+  return sendDashboard(chatId, selectedAccountKey, from.id);
 }
 
 async function autoOn(chatId, hours, accountOrKey = DEFAULT_ACCOUNT_KEY) {
@@ -5953,26 +6250,26 @@ async function handleCallback(cb) {
   if (!chatId) return;
   const selectedAccountKey = await getPublicSelectedAccountKey(chatId, cb.from?.id);
   const ownedAccountKeys = new Set((await getPublicOwnedAccounts(chatId, cb.from?.id)).map(a => a.account_key));
-  const denyAccount = () => tg('sendMessage', { chat_id: chatId, text: '⛔ Bu akkaunt sizga tegishli emas.' });
+  const denyAccount = () => commandManagementDenied(chatId);
   const commandCallback = isCommandManagementCallbackData(data);
 
   if (data.startsWith('platform_')) return tg('sendMessage', { chat_id: chatId, text: 'Platform Admin Bot uchun alohida admin botdan foydalaning.' });
 
   if (!ownedAccountKeys.size) {
-    if (data === 'menu' || data === 'noop' || data === 'accounts') return sendAccountsMenu(chatId);
+    if (data === 'menu' || data === 'noop' || data === 'accounts') return sendAccountsMenu(chatId, cb.from?.id);
     if (commandCallback) return commandManagementDenied(chatId);
     return denyAccount();
   }
 
-  if (data === 'menu' || data === 'noop') return sendDashboard(chatId, selectedAccountKey);
-  if (data === 'accounts') return sendAccountsMenu(chatId);
+  if (data === 'menu' || data === 'noop') return sendDashboard(chatId, selectedAccountKey, cb.from?.id);
+  if (data === 'accounts') return sendAccountsMenu(chatId, cb.from?.id);
   if (data.startsWith('account_bot:')) {
     const allowedAccountKey = await getCommandManagementAccountKey(chatId, cb.from?.id, selectedAccountKey);
     if (!allowedAccountKey) return commandManagementDenied(chatId);
     const enabled = data.endsWith(':on');
     await setAccountBotEnabled(allowedAccountKey, enabled, cb.from?.id);
     await tg('sendMessage', { chat_id: chatId, text: `${enabled ? '✅ Bot yoqildi' : '⛔ Bot o‘chirildi'}: ${allowedAccountKey}` });
-    return sendDashboard(chatId, allowedAccountKey);
+    return sendDashboard(chatId, allowedAccountKey, cb.from?.id);
   }
   if (data.startsWith('account_reach:')) {
     const allowedAccountKey = await getCommandManagementAccountKey(chatId, cb.from?.id, selectedAccountKey);
@@ -5980,7 +6277,12 @@ async function handleCallback(cb) {
     const enabled = data.endsWith(':on');
     await setAccountReachEnabled(allowedAccountKey, enabled, cb.from?.id);
     await tg('sendMessage', { chat_id: chatId, text: `${enabled ? '✅ Reach yoqildi' : '⛔ Reach o‘chirildi'}: ${allowedAccountKey}` });
-    return sendDashboard(chatId, allowedAccountKey);
+    return sendDashboard(chatId, allowedAccountKey, cb.from?.id);
+  }
+  if (data === 'reach_start_confirm') return executeReachStart(chatId, cb.from?.id);
+  if (data === 'reach_start_cancel') {
+    await setSelectedAccountKey(chatId, selectedAccountKey, cb.from?.id);
+    return tg('sendMessage', { chat_id: chatId, text: 'Bekor qilindi.' });
   }
   if (commandCallback) {
     const commandAccountKey = await getCommandManagementAccountKey(chatId, cb.from?.id, selectedAccountKey);
@@ -5988,7 +6290,7 @@ async function handleCallback(cb) {
     if (data === 'cmd_menu' || data === 'commands_menu' || data === 'cmd_list') return sendCommandsMenu(chatId, commandAccountKey);
     if (data === 'cmd_archive_list') return sendCommandsMenu(chatId, commandAccountKey, { archived: true });
     if (data === 'command_cancel' || data === 'cmd_cancel') {
-      await setAdminSession(chatId, 'account_selected', { selected_account_key: commandAccountKey });
+      await setSelectedAccountKey(chatId, commandAccountKey, cb.from?.id);
       return tg('sendMessage', { chat_id: chatId, text: 'Bekor qilindi.' });
     }
     if (data.startsWith('command_view:') || data.startsWith('cmd_open:') || data.startsWith('cmd_view:')) {
@@ -6025,7 +6327,7 @@ async function handleCallback(cb) {
   if (data.startsWith('lead_')) {
     const leadChatId = data.split(':')[1];
     if (!leadChatId) return tg('sendMessage', { chat_id: chatId, text: 'Lid topilmadi.' });
-    if (!ownedAccountKeys.has(selectedAccountKey)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, selectedAccountKey)) return denyAccount();
     let lead = await getLead(leadChatId, selectedAccountKey);
     if (!lead) return tg('sendMessage', { chat_id: chatId, text: 'Lid topilmadi.' });
     if (data.startsWith('lead_pause:')) lead = await pauseLeadBot(leadChatId, selectedAccountKey, cb.from?.id, 'callback_pause') || lead;
@@ -6066,17 +6368,20 @@ async function handleCallback(cb) {
   }
   if (data.startsWith('archa:')) {
     const ak = data.split(':')[1];
-    if (!ownedAccountKeys.has(ak)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, ak)) return denyAccount();
+    await setSelectedAccountKey(chatId, ak, cb.from?.id);
     return sendArchivePeopleMenu(chatId, ak);
   }
   if (data.startsWith('archp:')) {
     const [, ak, targetChatId] = data.split(':');
-    if (!ownedAccountKeys.has(ak)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, ak)) return denyAccount();
+    await setSelectedAccountKey(chatId, ak, cb.from?.id);
     return sendArchivePersonEvents(chatId, ak, targetChatId);
   }
   if (data.startsWith('archv:')) {
     const [, ak, archiveId] = data.split(':');
-    if (!ownedAccountKeys.has(ak)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, ak)) return denyAccount();
+    await setSelectedAccountKey(chatId, ak, cb.from?.id);
     return sendArchiveFullDetail(chatId, ak, archiveId);
   }
   if (data === 'archive:deleted') return sendArchiveList(chatId, 'deleted', selectedAccountKey);
@@ -6086,9 +6391,9 @@ async function handleCallback(cb) {
   if (data.startsWith('account:')) {
     const key = data.split(':')[1];
     const allowedKey = await requirePublicAccountAccess(chatId, cb.from?.id, key);
-    if (!allowedKey) return tg('sendMessage', { chat_id: chatId, text: '⛔ Bu akkaunt sizga tegishli emas.' });
+    if (!allowedKey) return commandManagementDenied(chatId);
     const account = await getAccount(allowedKey);
-    await setSelectedAccountKey(chatId, account.account_key);
+    await setSelectedAccountKey(chatId, account.account_key, cb.from?.id);
     return tg('sendMessage', { chat_id: chatId, text: `✅ Akkaunt tanlandi: ${account.label || account.account_key}` });
   }
   if (data === 'outreach_menu') return sendOutreachMenu(chatId, selectedAccountKey);
@@ -6134,7 +6439,7 @@ async function handleCallback(cb) {
     const session = await getAdminSession(chatId);
     const payload = session?.payload || {};
     const targetAccountKey = payload.selected_account_key || selectedAccountKey;
-    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, targetAccountKey)) return denyAccount();
     if (!payload.step_key || !payload.template_key) return tg('sendMessage', { chat_id: chatId, text: 'Saqlanadigan flow preview topilmadi.' });
     await upsertFlowStep({
       accountKey: targetAccountKey,
@@ -6173,7 +6478,7 @@ async function handleCallback(cb) {
     const session = await getAdminSession(chatId);
     const payload = session?.payload || {};
     const targetAccountKey = payload.selected_account_key || selectedAccountKey;
-    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, targetAccountKey)) return denyAccount();
     const saved = await upsertAccountAiRule(targetAccountKey, payload.rule || {}, cb.from?.id);
     await clearSetupSession(chatId, targetAccountKey);
     return tg('sendMessage', { chat_id: chatId, text: `✅ AI qoida saqlandi: ${saved.rule_key}` });
@@ -6239,7 +6544,7 @@ async function handleCallback(cb) {
     const payload = session?.payload || {};
     if (!payload.template_key || !payload.edited_text) return tg('sendMessage', { chat_id: chatId, text: 'Saqlanadigan AI preview topilmadi.' });
     const targetAccountKey = payload.selected_account_key || selectedAccountKey;
-    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, targetAccountKey)) return denyAccount();
     await setTemplate(payload.template_key, payload.edited_text, targetAccountKey);
     await setAdminSession(chatId, 'account_selected', { selected_account_key: targetAccountKey });
     return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: ${targetAccountKey}/${payload.template_key}` });
@@ -6249,7 +6554,7 @@ async function handleCallback(cb) {
     const payload = session?.payload || {};
     if (!payload.template_key || !payload.edited_text) return tg('sendMessage', { chat_id: chatId, text: 'Saqlanadigan preview topilmadi.' });
     const targetAccountKey = payload.selected_account_key || selectedAccountKey;
-    if (!ownedAccountKeys.has(targetAccountKey)) return denyAccount();
+    if (!accountSetHas(ownedAccountKeys, targetAccountKey)) return denyAccount();
     await setTemplate(payload.template_key, payload.edited_text, targetAccountKey);
     await setAdminSession(chatId, 'account_selected', { selected_account_key: targetAccountKey });
     return tg('sendMessage', { chat_id: chatId, text: `✅ Saqlandi: ${targetAccountKey}/${payload.template_key}` });

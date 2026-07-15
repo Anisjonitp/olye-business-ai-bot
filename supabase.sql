@@ -529,6 +529,7 @@ create table if not exists bot_settings (
 
 create table if not exists admin_sessions (
   chat_id text primary key,
+  telegram_user_id text,
   mode text not null,
   account_key text,
   template_key text,
@@ -537,6 +538,7 @@ create table if not exists admin_sessions (
   updated_at timestamptz default now()
 );
 
+alter table admin_sessions add column if not exists telegram_user_id text;
 alter table admin_sessions add column if not exists account_key text;
 alter table admin_sessions add column if not exists template_key text;
 alter table admin_sessions add column if not exists step text;
@@ -771,6 +773,7 @@ create index if not exists account_custom_commands_archive_idx on account_custom
 create index if not exists custom_command_executions_account_idx on custom_command_executions(account_key, created_at desc);
 create index if not exists custom_command_executions_command_idx on custom_command_executions(account_key, command_key, created_at desc);
 create index if not exists admin_sessions_account_idx on admin_sessions(account_key, updated_at desc);
+create index if not exists admin_sessions_user_idx on admin_sessions(telegram_user_id, updated_at desc);
 create index if not exists account_setup_sessions_account_idx on account_setup_sessions(account_key, updated_at desc);
 create unique index if not exists account_ai_rules_unique_idx on account_ai_rules(account_key, rule_key);
 create index if not exists account_ai_rules_enabled_idx on account_ai_rules(account_key, is_enabled, step_key);
