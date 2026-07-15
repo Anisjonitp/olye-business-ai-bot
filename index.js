@@ -60,6 +60,7 @@ const ACCOUNT_NOT_SELECTED_TEXT = 'Akkaunt tanlanmagan. /menu orqali profilni ta
 const TEST_MODE = String(process.env.TEST_MODE || 'true') === 'true';
 const TEST_ADMIN_IDS = envIdSet(process.env.TEST_ADMIN_IDS || '');
 const TEST_LEAD_IDS = envIdSet(process.env.TEST_LEAD_IDS || '');
+const TEST_ALLOW_ADMIN_STARTED_LEADS = String(process.env.TEST_ALLOW_ADMIN_STARTED_LEADS || 'false') === 'true';
 const ADMIN_TAKEOVER_MINUTES = Number(process.env.ADMIN_TAKEOVER_MINUTES || 10);
 const DEFAULT_REACH_START_TEXT = 'Assalomu alaykum. Siz “O‘zbekiston Lider Yoshlari Ensiklopediyasi”ga kirish uchun ariza qoldirgansiz. Shunaqami?';
 
@@ -1091,7 +1092,7 @@ function enrichLeadPayload(patch = {}, existing = null) {
   const now = new Date().toISOString();
   const payload = { ...patch };
   if (Object.prototype.hasOwnProperty.call(payload, 'stage')) {
-    payload.current_stage = payload.stage;
+    if (!Object.prototype.hasOwnProperty.call(payload, 'current_stage')) payload.current_stage = payload.stage;
     if (!Object.prototype.hasOwnProperty.call(payload, 'previous_stage')) payload.previous_stage = existing?.stage || existing?.current_stage || null;
   }
   if (!Object.prototype.hasOwnProperty.call(payload, 'lead_chat_id') && (payload.chat_id || existing?.chat_id)) {
@@ -1223,6 +1224,15 @@ function isTestLeadAllowed(chatId, fromId = '') {
   return idSetHas(TEST_LEAD_IDS, chatId, fromId);
 }
 
+function isAdminStartedTestAllowed(lead = {}) {
+  if (!TEST_MODE || !TEST_ALLOW_ADMIN_STARTED_LEADS) return false;
+  return Boolean(
+    (lead.assigned_by_admin || lead.manually_started) &&
+    leadAssignmentActive(lead) &&
+    leadBotEnabled(lead)
+  );
+}
+
 function canAccountAutoReply(account = {}) {
   const normalized = normalizeAccount(account);
   return normalized.account_key !== UNKNOWN_ACCOUNT_KEY &&
@@ -1235,7 +1245,7 @@ function canAccountReach(account = {}) {
 }
 
 function leadAssignmentActive(lead = {}) {
-  return Boolean(lead.reach_sent || lead.outreach_sent || lead.assigned_by_admin || lead.manually_started);
+  return Boolean(lead.reach_sent || lead.outreach_sent || lead.assigned_by_reach || lead.assigned_by_admin || lead.manually_started);
 }
 
 function leadBotEnabled(lead = {}) {
@@ -1253,9 +1263,9 @@ function adminTakeoverActive(lead = {}) {
 async function canLeadAutoReply(lead = {}, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const account = typeof accountOrKey === 'object' ? normalizeAccount(accountOrKey) : await getAccount(accountOrKey || lead.account_key);
   if (!canAccountAutoReply(account)) return { ok: false, reason: 'account_bot_off' };
-  if (!isTestLeadAllowed(lead.chat_id || lead.lead_chat_id)) return { ok: false, reason: 'test_mode_blocked' };
   if (!leadAssignmentActive(lead)) return { ok: false, reason: 'no_outreach_session' };
   if (!leadBotEnabled(lead)) return { ok: false, reason: 'lead_auto_reply_off' };
+  if (!isTestLeadAllowed(lead.chat_id || lead.lead_chat_id) && !isAdminStartedTestAllowed(lead)) return { ok: false, reason: 'test_mode_blocked' };
   if (adminTakeoverActive(lead)) return { ok: false, reason: 'admin_takeover_active' };
   return { ok: true, reason: 'ok' };
 }
@@ -1330,6 +1340,34 @@ async function markProcessed(messageKey, chatId, accountOrKey = DEFAULT_ACCOUNT_
   if (!error) return true;
   if (error.code === '23505') return false;
   console.error('markProcessed:', error.message);
+  return true;
+}
+
+function isMissingTableError(error) {
+  const msg = String(error?.message || '');
+  return error?.code === '42P01' ||
+    error?.code === 'PGRST205' ||
+    error?.code === 'PGRST204' ||
+    msg.includes('does not exist') ||
+    msg.includes('schema cache');
+}
+
+async function markProcessedEvent({ accountKey: ak, updateId, messageId, eventType, chatId }) {
+  const normalizedAccountKey = accountKey(ak);
+  const normalizedUpdateId = String(updateId || `${eventType}:${normalizedAccountKey}:${chatId || ''}:${messageId || ''}`);
+  const normalizedMessageId = String(messageId || normalizedUpdateId);
+  const { error } = await supabase.from('processed_events').insert({
+    account_key: normalizedAccountKey,
+    update_id: normalizedUpdateId,
+    message_id: normalizedMessageId,
+    event_type: eventType
+  });
+  if (!error) return true;
+  if (error.code === '23505') return false;
+  if (isMissingTableError(error)) {
+    return markProcessed(`event:${normalizedAccountKey}:${eventType}:${normalizedUpdateId}:${normalizedMessageId}`, chatId || normalizedMessageId, normalizedAccountKey);
+  }
+  console.error('markProcessedEvent:', error.message);
   return true;
 }
 
@@ -2269,6 +2307,7 @@ async function resetMeChat({ chatId, businessConnectionId = null, from = null, a
   // business_leads yozuvini o‘chirmaymiz, chunki business_connection_id kerak bo‘lib qoladi.
   await accountLeadFilter(supabase.from('sent_actions').delete().eq('chat_id', id), accountKey);
   await accountLeadFilter(supabase.from('processed_messages').delete().eq('chat_id', id), accountKey);
+  await accountLeadFilter(supabase.from('processed_events').delete().like('update_id', `%:${id}:%`), accountKey);
   await accountLeadFilter(supabase.from('lead_events').delete().eq('chat_id', id), accountKey);
 
   const existing = await getLead(id, accountKey);
@@ -2441,6 +2480,134 @@ async function markOutreach({ chatId, businessConnectionId, from, text, messageI
   await logEvent(chatId, 'outreach_sent_detected', text, accountKey);
   await writeAuditLog({ accountKey, chatId, action: 'reach_sent', newValue: { message_id: messageId, text }, actorType: 'admin', actorId: from?.id });
   return true;
+}
+
+function detectAdminBusinessContextStage(text = '') {
+  const t = normalize(text);
+  const plain = t.replace(/'/g, '');
+  if (!t || t === 'media') return 'admin_manual_started';
+
+  const asksApplication =
+    (t.includes('ariza') && (t.includes('qoldirgansiz') || t.includes('qoldirgan') || t.includes('qoldirdingiz')) && (t.includes('shunaqami') || t.includes('shundaymi') || t.includes('togri') || t.includes("to'g'ri") || t.includes('to‘g‘ri')))
+    || (plain.includes('ozbekiston lider yoshlari ensiklopediyasi') && t.includes('ariza'));
+  if (asksApplication) return 'application_confirmation';
+
+  const asksBenefits =
+    (t.includes('foydali jihat') && (t.includes('malumot') || t.includes("ma'lumot") || t.includes('ma’lumot')) && (t.includes('egamisiz') || t.includes('xabardormisiz') || t.includes('bilasizmi')))
+    || ((t.includes('ensiklopediyamiz') || t.includes('ensiklopediya')) && (t.includes('foydali') || t.includes('batafsil')) && (t.includes('egamisiz') || t.includes('bilasizmi')));
+  if (asksBenefits) return 'benefits_intro';
+
+  if (includesAny(t, ['passport', 'pasport', 'hujjat', 'dokument', 'guvohnoma'])) return 'documents_requested';
+  if (includesAny(t, ['oferta', 'shartlarga roziman', 'yakuniy shart', 'kelishuv'])) return 'agreement_waiting';
+  if (includesAny(t, ['narx', 'qancha turadi', 'necha pul'])) return 'price';
+  if (includesAny(t, ['tolov', "to'lov", 'to‘lov', 'karta', 'pul otkaz', "pul o'tkaz", 'chek'])) return 'payment';
+  if (includesAny(t, ['assalomu', 'assalom', 'salom', 'yaxshimisiz', 'qalaysiz'])) return 'greeting_sent';
+  return 'admin_manual_started';
+}
+
+function stageForAdminBusinessContext(contextStage = '') {
+  if (contextStage === 'application_confirmation') return STAGE.ASKED_APPLICATION;
+  if (contextStage === 'benefits_intro') return STAGE.ASKED_INFO;
+  if (['price', 'payment', 'documents_requested', 'agreement_waiting'].includes(contextStage)) return STAGE.INFO_SENT_FINISHED;
+  return STAGE.OUTREACH_SENT;
+}
+
+function adminBusinessContextStopsBot(contextStage = '') {
+  return ['price', 'payment', 'documents_requested', 'agreement_waiting'].includes(contextStage);
+}
+
+function leadWasPausedOrFinished(lead = null) {
+  if (!lead) return false;
+  return Boolean(
+    STOP_REPLY_STAGES.has(lead.stage) ||
+    lead.status === 'manual_control' ||
+    lead.status === 'disabled' ||
+    lead.manual_only === true ||
+    lead.paused_at ||
+    lead.pause_reason
+  );
+}
+
+async function markManualBusinessReach({ chatId, businessConnectionId, leadProfile = {}, adminUser = {}, text = '', messageId = null, messageDate = null, accountKey = DEFAULT_ACCOUNT_KEY, edited = false }) {
+  const existing = await getLead(chatId, accountKey);
+  const adminText = text || '[media]';
+  const now = new Date().toISOString();
+  const sentAt = messageDate || now;
+  const contextStage = detectAdminBusinessContextStage(adminText);
+  const pausedOrFinished = leadWasPausedOrFinished(existing);
+  const terminalContext = adminBusinessContextStopsBot(contextStage);
+  const stage = pausedOrFinished ? (existing.stage || STAGE.PAUSED) : stageForAdminBusinessContext(contextStage);
+  const shouldEnableBot = !pausedOrFinished && !terminalContext;
+  const status = pausedOrFinished
+    ? (existing.status || 'manual_control')
+    : (terminalContext ? (contextStage === 'payment' || contextStage === 'price' ? 'payment_near' : 'needs_admin') : 'active');
+  const patch = {
+    account_key: accountKey,
+    chat_id: String(chatId),
+    lead_chat_id: String(chatId),
+    business_connection_id: businessConnectionId || existing?.business_connection_id || null,
+    first_name: existing?.first_name || leadProfile?.first_name || leadProfile?.title || null,
+    username: existing?.username || leadProfile?.username || null,
+    status,
+    stage,
+    current_stage: contextStage,
+    bot_enabled: shouldEnableBot,
+    bot_enabled_for_lead: shouldEnableBot,
+    manual_only: !shouldEnableBot,
+    outreach_sent: true,
+    reach_sent: true,
+    assigned_by_reach: true,
+    assigned_by_admin: true,
+    manually_started: true,
+    outreach_session_id: existing?.outreach_session_id || `manual_business_${localDateKey()}_${String(messageId || Date.now())}`,
+    outreach_message: adminText,
+    reach_message_text: adminText,
+    reach_message_id: messageId ? String(messageId) : null,
+    reach_batch_id: `manual_business_${localDateKey()}`,
+    outreach_at: existing?.outreach_at || sentAt,
+    reach_sent_at: existing?.reach_sent_at || sentAt,
+    first_admin_message: existing?.first_admin_message || adminText,
+    first_admin_message_at: existing?.first_admin_message_at || sentAt,
+    last_admin_message: adminText,
+    last_admin_message_at: sentAt,
+    last_actor: 'admin',
+    last_message_at: sentAt,
+    admin_active_until: null,
+    needs_human: terminalContext || pausedOrFinished ? true : false,
+    needs_human_reason: terminalContext ? `admin_context_${contextStage}` : (pausedOrFinished ? (existing?.needs_human_reason || 'lead_paused_or_finished') : null),
+    finished_at: terminalContext ? (existing?.finished_at || sentAt) : (pausedOrFinished ? (existing?.finished_at || null) : null)
+  };
+  if (shouldEnableBot) {
+    patch.paused_at = null;
+    patch.paused_by = null;
+    patch.pause_reason = null;
+  }
+
+  let lead = existing;
+  if (!lead) {
+    lead = await createLead({
+      chatId,
+      businessConnectionId,
+      from: leadProfile,
+      text: '',
+      stage,
+      status,
+      botEnabled: shouldEnableBot,
+      accountKey
+    });
+  }
+  lead = await updateLead(chatId, patch, accountKey) || lead;
+  await logEvent(chatId, edited ? 'admin_business_reach_edited' : `admin_business_reach_${contextStage}`, adminText, accountKey);
+  await writeAuditLog({
+    accountKey,
+    chatId,
+    action: edited ? 'admin_reach_edited' : 'admin_reach_started',
+    oldValue: existing ? { stage: existing.stage, current_stage: existing.current_stage, bot_enabled_for_lead: existing.bot_enabled_for_lead } : null,
+    newValue: { stage, current_stage: contextStage, message_id: messageId, bot_enabled_for_lead: shouldEnableBot },
+    actorType: 'admin',
+    actorId: adminUser?.id
+  });
+  return lead;
 }
 
 function detectAdminPromptStage(text = '') {
@@ -2817,6 +2984,12 @@ function classify(text = '', stage = STAGE.NEW) {
 // -------------------- Message handling --------------------
 function getMessageText(msg) {
   return msg?.text || msg?.caption || '';
+}
+
+function messageDateIso(msg = {}) {
+  const raw = Number(msg.edit_date || msg.date || 0);
+  if (!raw) return new Date().toISOString();
+  return new Date(raw * 1000).toISOString();
 }
 
 function isMediaOnly(msg) {
@@ -3303,7 +3476,11 @@ async function replyWhoami(msg, messageType = 'message') {
   }
 }
 
-async function handleBusinessMessage(msg) {
+function logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound, canAutoReply, blockReason }) {
+  console.log(`[BUSINESS_INCOMING] account_key=${ak} lead_chat_id=${chatId} lead_found=${leadFound ? 'true' : 'false'} can_auto_reply=${canAutoReply ? 'true' : 'false'} block_reason=${blockReason || 'ok'}`);
+}
+
+async function handleBusinessMessage(msg, options = {}) {
   const chatId = String(msg.chat?.id || '');
   if (!chatId) return;
   const businessConnectionId = msg.business_connection_id || msg.business_connection?.id || null;
@@ -3314,22 +3491,31 @@ async function handleBusinessMessage(msg) {
     await replyWhoami(msg, 'business_message');
     return;
   }
-  const key = `business:${ak}:${chatId}:${msg.message_id || msg.date || Date.now()}`;
   const direction = isAccountOwnerMessage(msg, account) ? 'outgoing' : 'incoming';
   if (direction === 'outgoing') await rememberAccountBusinessConnection(account, businessConnectionId);
-  await archiveBusinessMessage(msg, account, direction);
+  if (!options.skipArchive) await archiveBusinessMessage(msg, account, direction);
 
   if (ak === UNKNOWN_ACCOUNT_KEY) {
     await logIgnore(chatId, 'unmapped_business_connection_no_flow', businessConnectionId || '', ak);
     return;
   }
 
-  const firstTime = await markProcessed(key, chatId, ak);
+  const eventType = direction === 'outgoing'
+    ? (options.edited ? 'business_outgoing_edited' : 'business_outgoing')
+    : (options.edited ? 'business_incoming_edited' : 'business_incoming');
+  const firstTime = await markProcessedEvent({
+    accountKey: ak,
+    updateId: options.updateId || `${eventType}:${ak}:${chatId}:${msg.message_id || msg.date || Date.now()}`,
+    messageId: msg.message_id || msg.date || '',
+    eventType,
+    chatId
+  });
   if (!firstTime) {
-    await logIgnore(chatId, 'duplicate_message', key, ak);
+    await logIgnore(chatId, 'duplicate_message', `${eventType}:${msg.message_id || msg.date || ''}`, ak);
     return;
   }
   if (isBotMessage(msg)) return;
+  if (options.edited && direction !== 'outgoing') return;
 
   if (normalizeCommandWord(text.trim().split(/\s+/)[0]) === '/resetme') {
     await resetMeChat({ chatId, businessConnectionId, from: msg.from, accountKey: ak });
@@ -3341,31 +3527,49 @@ async function handleBusinessMessage(msg) {
     return;
   }
 
-  // Owner/admin outgoing message: remember outreach/context. Do not respond to the admin message itself.
+  // Owner/admin outgoing Business message starts an account-scoped manual reach.
+  // Do not respond to the admin message itself.
   if (isAccountOwnerMessage(msg, account)) {
-    const outreachMarked = text
-      ? await markOutreach({ chatId, businessConnectionId, from: msg.from, text, messageId: msg.message_id, accountKey: ak })
-      : false;
-    await syncAdminContext({ chatId, businessConnectionId, from: msg.from, text: text || '[media]', accountKey: ak, adminTakeover: !outreachMarked });
+    const assignedLead = await markManualBusinessReach({
+      chatId,
+      businessConnectionId,
+      leadProfile: msg.chat || {},
+      adminUser: msg.from || {},
+      text: text || (isMediaOnly(msg) ? '[media]' : ''),
+      messageId: msg.message_id,
+      messageDate: messageDateIso(msg),
+      accountKey: ak,
+      edited: Boolean(options.edited)
+    });
+    console.log(`[BUSINESS_OUTGOING] account_key=${ak} business_connection_id=${businessConnectionId || '-'} lead_chat_id=${chatId} message_id=${msg.message_id || '-'} assigned=${assignedLead ? 'true' : 'false'}`);
     return;
   }
 
   if (!canAccountAutoReply(account)) {
     await logIgnore(chatId, 'account_bot_off', businessConnectionId || '', ak);
+    logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: Boolean(await getLead(chatId, ak)), canAutoReply: false, blockReason: 'account_bot_off' });
     return;
   }
 
   const rawText = text || (isMediaOnly(msg) ? '[media]' : '');
+  const existingLead = await getLead(chatId, ak);
+  if (!existingLead) {
+    await logIgnore(chatId, 'no_outreach_session', rawText, ak);
+    logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: false, canAutoReply: false, blockReason: 'no_admin_started_lead' });
+    return;
+  }
   let lead = await upsertLeadBase({ chatId, businessConnectionId, from: msg.from, text: rawText, accountKey: ak });
   if (!lead) return;
 
   if (lead.stage === STAGE.INFO_SENT_FINISHED) {
     await logIgnore(chatId, 'old_finished_chat', rawText, ak);
+    logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: false, blockReason: 'old_finished_chat' });
     await handlePostFinishSignal(lead, msg, rawText);
     return;
   }
   if (lead.stage === STAGE.PAUSED || lead.stage === STAGE.DISABLED) {
     await logIgnore(chatId, 'blocked_stage', `${lead.stage}: ${rawText}`, ak);
+    logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: false, blockReason: 'blocked_stage' });
     return;
   }
 
@@ -3377,17 +3581,22 @@ async function handleBusinessMessage(msg) {
   const inActiveSession = hasActiveOutreachSession(lead, auto);
   if (AUTO_START_REQUIRE_OUTREACH && !inActiveSession && !leadAssignmentActive(lead)) {
     const resumed = await tryResumeFromContext(lead, rawText);
-    if (resumed.handled) return;
+    if (resumed.handled) {
+      logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: true, blockReason: 'context_resume' });
+      return;
+    }
     activeLead = resumed.lead || lead;
     await logIgnore(chatId, 'context_resume_not_detected', rawText, ak);
 
     if (!isAutoActive(auto)) {
       await logIgnore(chatId, 'auto_reply_off', rawText, ak);
+      logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: false, blockReason: 'auto_reply_off' });
       return;
     }
 
     await updateLead(chatId, { stage: STAGE.PENDING_APPROVAL, status: 'pending_approval', bot_enabled: false, bot_enabled_for_lead: false, needs_human: true, needs_human_reason: 'no_outreach_session' }, ak);
     await logIgnore(chatId, 'no_outreach_session', rawText, ak);
+    logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: false, blockReason: 'no_outreach_session' });
     return;
   }
 
@@ -3396,8 +3605,10 @@ async function handleBusinessMessage(msg) {
   const allowed = await canLeadAutoReply(activeLead, account);
   if (!allowed.ok) {
     await logIgnore(chatId, allowed.reason, `${activeLead.stage}: ${rawText}`, ak);
+    logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: false, blockReason: allowed.reason });
     return;
   }
+  logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: true, blockReason: 'ok' });
 
   if (text) {
     const customCommand = await findMatchingCustomCommand(ak, text);
@@ -3667,7 +3878,49 @@ async function sendAccountDebug(chatId, telegramUserId, selectedAccountKey = DEF
       `is_allowed_admin: ${allowedAdmin ? 'true' : 'false'}\n` +
       `is_allowed_account: ${allowedAccount ? 'true' : 'false'}\n` +
       `can_manage_account: ${canManage ? 'true' : 'false'}\n` +
-      `TEST_MODE: ${TEST_MODE ? 'true' : 'false'}`
+      `TEST_MODE: ${TEST_MODE ? 'true' : 'false'}\n` +
+      `TEST_ALLOW_ADMIN_STARTED_LEADS: ${TEST_ALLOW_ADMIN_STARTED_LEADS ? 'true' : 'false'}`
+  });
+}
+
+async function sendLeadDebug(chatId, telegramUserId, selectedAccountKey = DEFAULT_ACCOUNT_KEY, targetChatId = '') {
+  const allowedAccountKey = await getCommandManagementAccountKey(chatId, telegramUserId, selectedAccountKey);
+  if (!allowedAccountKey) {
+    return isAllowedAdminId(telegramUserId)
+      ? tg('sendMessage', { chat_id: chatId, text: ACCOUNT_NOT_SELECTED_TEXT })
+      : commandManagementDenied(chatId);
+  }
+  const target = String(targetChatId || '').trim();
+  if (!target) return tg('sendMessage', { chat_id: chatId, text: 'Format: /lead_debug CHAT_ID yoki /lead_debug account_key CHAT_ID' });
+  const account = await getAccount(allowedAccountKey);
+  const lead = await getLead(target, allowedAccountKey);
+  const allowed = lead ? await canLeadAutoReply(lead, account) : { ok: false, reason: 'lead_not_found' };
+  const testAllowed = lead
+    ? (isTestLeadAllowed(lead.chat_id || lead.lead_chat_id) || isAdminStartedTestAllowed(lead))
+    : isTestLeadAllowed(target);
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `lead_debug\n\n` +
+      `account_key: ${allowedAccountKey}\n` +
+      `chat_id: ${target}\n` +
+      `business_connection_id: ${lead?.business_connection_id || '-'}\n` +
+      `reach_sent: ${lead?.reach_sent || lead?.outreach_sent ? 'true' : 'false'}\n` +
+      `assigned_by_reach: ${lead?.assigned_by_reach ? 'true' : 'false'}\n` +
+      `assigned_by_admin: ${lead?.assigned_by_admin ? 'true' : 'false'}\n` +
+      `manually_started: ${lead?.manually_started ? 'true' : 'false'}\n` +
+      `bot_enabled_for_lead: ${lead ? (leadBotEnabled(lead) ? 'true' : 'false') : '-'}\n` +
+      `manual_only: ${lead?.manual_only ? 'true' : 'false'}\n` +
+      `current_stage: ${lead?.current_stage || lead?.stage || '-'}\n` +
+      `first_admin_message: ${short(lead?.first_admin_message || '-', 160)}\n` +
+      `last_admin_message: ${short(lead?.last_admin_message || '-', 160)}\n` +
+      `last_customer_message: ${short(lead?.last_customer_message || lead?.last_user_message || '-', 160)}\n` +
+      `last_bot_message: ${short(lead?.last_bot_message || '-', 160)}\n` +
+      `account_bot_enabled: ${canAccountAutoReply(account) ? 'true' : 'false'}\n` +
+      `account_reach_enabled: ${account.reach_enabled === false ? 'false' : 'true'}\n` +
+      `test_mode_allowed: ${testAllowed ? 'true' : 'false'}\n` +
+      `can_auto_reply: ${allowed.ok ? 'true' : 'false'}\n` +
+      `block_reason: ${allowed.reason || 'ok'}`
   });
 }
 
@@ -5493,6 +5746,16 @@ async function handleAdminMessage(msg) {
   };
 
   if (text === '/account_debug') return sendAccountDebug(chatId, from.id, selectedAccountKey);
+  if (text.startsWith('/lead_debug')) {
+    const parts = text.split(/\s+/).filter(Boolean);
+    const accounts = await getAccounts();
+    const maybeAccount = accounts.find(a => accountKeyMatches(a.account_key, parts[1]));
+    if (maybeAccount) {
+      if (!accountSetHas(ownedAccountKeys, maybeAccount.account_key)) return denyAccount();
+      return sendLeadDebug(chatId, from.id, maybeAccount.account_key, parts[2]);
+    }
+    return sendLeadDebug(chatId, from.id, selectedAccountKey, parts[1]);
+  }
   if (text === '/reach_start' || text.startsWith('/reach_start ')) {
     const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey, 1, ownedAccountKeys);
     if (parsed.denied) return commandManagementDenied(chatId);
@@ -6612,8 +6875,8 @@ app.get('/tick', async (_, res) => {
   res.json({ ok: true, ticked_at: new Date().toISOString() });
 });
 
-const BASIC_ALLOWED_UPDATES = ['message', 'callback_query', 'business_connection', 'business_message'];
-const FULL_ALLOWED_UPDATES = [...BASIC_ALLOWED_UPDATES, 'edited_business_message', 'deleted_business_messages'];
+const BASIC_ALLOWED_UPDATES = ['message', 'callback_query', 'business_connection', 'business_message', 'edited_business_message'];
+const FULL_ALLOWED_UPDATES = [...BASIC_ALLOWED_UPDATES, 'deleted_business_messages'];
 const ADMIN_ALLOWED_UPDATES = ['message', 'callback_query'];
 
 async function setWebhookResponse(req, res, allowedUpdates) {
@@ -6731,8 +6994,11 @@ app.post('/webhook', async (req, res) => {
       }
     }
     if (update.business_connection) await handleBusinessConnectionUpdate(update.business_connection);
-    if (update.business_message) await handleBusinessMessage(update.business_message);
-    if (update.edited_business_message) await archiveEditedBusinessMessage(update.edited_business_message);
+    if (update.business_message) await handleBusinessMessage(update.business_message, { updateId: update.update_id });
+    if (update.edited_business_message) {
+      await archiveEditedBusinessMessage(update.edited_business_message);
+      await handleBusinessMessage(update.edited_business_message, { updateId: update.update_id, edited: true, skipArchive: true });
+    }
     if (update.deleted_business_messages) await handleDeletedBusinessMessages(update.deleted_business_messages);
   } catch (err) {
     console.error('webhook processing error:', err);

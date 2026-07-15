@@ -16,6 +16,7 @@ Bu versiya ataylab sodda qilingan: bot faqat yangi outreach lidga ma’lumot ber
 
 - Kunlik Auto Outreach timer: masalan har kuni 07:00 da yoqiladi, 09:00 da o‘chadi.
 - Bir nechta Telegram Business/admin akkaunt: har akkaunt o‘z auto outreach session, daily auto, ro‘yxat va shablonlariga ega.
+- Admin Telegram Business orqali yangi odamga qo‘lda yozsa, shu chat account scope’da lead sifatida saqlanadi va bot keyingi javobni tayyor shablonlar bilan davom ettira oladi.
 - Telegram scheduled message bilan ishlash: scheduled xabarlarni 07:02 ga qo‘yish mumkin.
 - 07:00–07:15 oralig‘ida outreach aniqlanmasa admin ogohlantirish oladi.
 - Auto Outreach tugaganda admin chatga hisobot yuboriladi.
@@ -49,10 +50,13 @@ Muhim test-mode sozlamalari:
 TEST_MODE=true
 TEST_ADMIN_IDS=8254451152,8304283149
 TEST_LEAD_IDS=comma,separated,lead_chat_ids
+TEST_ALLOW_ADMIN_STARTED_LEADS=false
 ADMIN_TAKEOVER_MINUTES=10
 ```
 
 `TEST_LEAD_IDS` bo‘sh bo‘lsa va `TEST_MODE=true` bo‘lsa, mijozlarga avtomatik javob yuborilmaydi. Admin menyusi mavjud account ownership orqali ishlaydi; `TEST_ADMIN_IDS` to‘ldirilsa, admin menyu ham shu ro‘yxat bilan cheklanadi.
+
+`TEST_ALLOW_ADMIN_STARTED_LEADS=true` bo‘lsa, test rejimida ham faqat ruxsatli admin Telegram Business orqali qo‘lda boshlagan leadlar `TEST_LEAD_IDS` ro‘yxatisiz javob olishi mumkin. `reach_enabled` faqat birinchi outreach yuborishni boshqaradi; admin allaqachon qo‘lda yozgan leadning javobini bloklamaydi. `bot_enabled` va lead darajasidagi pause/manual-only flaglari baribir ustun turadi.
 
 ## Webhook ulash
 
