@@ -134,6 +134,9 @@ create table if not exists account_custom_commands (
   step_key text,
   ai_rule_key text,
   is_enabled boolean default true,
+  is_archived boolean default false,
+  archived_at timestamptz,
+  archived_by text,
   notify_admin boolean default false,
   stop_after_response boolean default true,
   sort_order integer default 100,
@@ -163,20 +166,6 @@ create table if not exists account_setup_sessions (
   step text,
   payload jsonb default '{}'::jsonb,
   updated_at timestamptz default now()
-);
-
-create table if not exists bot_wizard_sessions (
-  id uuid primary key default gen_random_uuid(),
-  bot_scope text not null default 'public',
-  telegram_user_id text not null,
-  chat_id text,
-  account_key text,
-  mode text not null,
-  step text not null,
-  payload jsonb default '{}'::jsonb,
-  created_at timestamptz default now(),
-  updated_at timestamptz default now(),
-  unique(bot_scope, telegram_user_id)
 );
 
 create table if not exists account_ai_rules (
@@ -298,6 +287,9 @@ alter table account_custom_commands add column if not exists flow_key text;
 alter table account_custom_commands add column if not exists step_key text;
 alter table account_custom_commands add column if not exists ai_rule_key text;
 alter table account_custom_commands add column if not exists is_enabled boolean default true;
+alter table account_custom_commands add column if not exists is_archived boolean default false;
+alter table account_custom_commands add column if not exists archived_at timestamptz;
+alter table account_custom_commands add column if not exists archived_by text;
 alter table account_custom_commands add column if not exists notify_admin boolean default false;
 alter table account_custom_commands add column if not exists stop_after_response boolean default true;
 alter table account_custom_commands add column if not exists sort_order integer default 100;
@@ -321,16 +313,6 @@ alter table account_setup_sessions add column if not exists mode text;
 alter table account_setup_sessions add column if not exists step text;
 alter table account_setup_sessions add column if not exists payload jsonb default '{}'::jsonb;
 alter table account_setup_sessions add column if not exists updated_at timestamptz default now();
-
-alter table bot_wizard_sessions add column if not exists bot_scope text default 'public';
-alter table bot_wizard_sessions add column if not exists telegram_user_id text;
-alter table bot_wizard_sessions add column if not exists chat_id text;
-alter table bot_wizard_sessions add column if not exists account_key text;
-alter table bot_wizard_sessions add column if not exists mode text;
-alter table bot_wizard_sessions add column if not exists step text;
-alter table bot_wizard_sessions add column if not exists payload jsonb default '{}'::jsonb;
-alter table bot_wizard_sessions add column if not exists created_at timestamptz default now();
-alter table bot_wizard_sessions add column if not exists updated_at timestamptz default now();
 
 alter table account_ai_rules add column if not exists account_key text;
 alter table account_ai_rules add column if not exists rule_key text;
@@ -655,12 +637,11 @@ create index if not exists platform_audit_logs_created_idx on platform_audit_log
 create index if not exists platform_audit_logs_account_idx on platform_audit_logs(target_account_key, created_at desc);
 create unique index if not exists account_custom_commands_unique_idx on account_custom_commands(account_key, command_key);
 create index if not exists account_custom_commands_enabled_idx on account_custom_commands(account_key, is_enabled, sort_order);
+create index if not exists account_custom_commands_archive_idx on account_custom_commands(account_key, is_archived, updated_at desc);
 create index if not exists custom_command_executions_account_idx on custom_command_executions(account_key, created_at desc);
 create index if not exists custom_command_executions_command_idx on custom_command_executions(account_key, command_key, created_at desc);
 create index if not exists admin_sessions_account_idx on admin_sessions(account_key, updated_at desc);
 create index if not exists account_setup_sessions_account_idx on account_setup_sessions(account_key, updated_at desc);
-create index if not exists idx_bot_wizard_sessions_scope_user on bot_wizard_sessions(bot_scope, telegram_user_id);
-create index if not exists bot_wizard_sessions_account_idx on bot_wizard_sessions(account_key, updated_at desc);
 create unique index if not exists account_ai_rules_unique_idx on account_ai_rules(account_key, rule_key);
 create index if not exists account_ai_rules_enabled_idx on account_ai_rules(account_key, is_enabled, step_key);
 
