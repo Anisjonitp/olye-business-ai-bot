@@ -72,7 +72,7 @@ Basic webhook:
 https://YOUR-RENDER-APP.onrender.com/set-webhook-basic
 ```
 
-Edit/delete arxiv update’lari uchun full webhook:
+`/set-webhook` edit/delete arxiv update’larini ham yoqadi. Alohida full endpoint ham mavjud:
 
 ```text
 https://YOUR-RENDER-APP.onrender.com/set-webhook-full
@@ -180,20 +180,17 @@ https://YOUR-RENDER-APP.onrender.com/tick
 
 Eski inglizcha buyruqlar ham backward compatibility uchun ishlashda davom etadi.
 
-## Dialog arxiv
+## Reach template orqali campaign
 
-Bot faqat Telegram Bot API orqali kelgan Business update’larni arxivlaydi. Private chatlarni ruxsatsiz o‘qimaydi yoki scrape qilmaydi.
+Admin Telegram Business orqali yuborgan outgoing xabar faqat account’ning `reply_templates` jadvalidagi faol reach keylaridan biriga normalize qilingan holda aynan teng kelsa campaign avtomatik ochiladi. Reach keylar: `reach_greeting`, `reach_start`, `outreach_start`, `application_confirmation`, `ask_application`.
 
-Media fayl metadata doim saqlanadi. Faylni Supabase Storage’ga yuklash optional:
+Matn trim qilinadi, kichik harfga o‘tkaziladi, bo‘sh joylar va apostrof/qo‘shtirnoq variantlari normallashtiriladi, yakundagi nuqta yoki undov e’tiborga olinmaydi. Semantic yoki taxminiy matching ishlatilmaydi. `second` akkaunti faqat o‘zining `second:` shablonlarini tekshiradi; legacy global template’lar faqat UZLYE uchun ishlatiladi.
 
-```text
-MEDIA_ARCHIVE_ENABLED=true
-MEDIA_ARCHIVE_DOWNLOAD=false
-MEDIA_ARCHIVE_MAX_BYTES=20000000
-SUPABASE_STORAGE_BUCKET=business-media-archive
-```
+## O‘chirilgan xabarlar arxivi
 
-`MEDIA_ARCHIVE_DOWNLOAD=false` bo‘lsa, bot faqat `file_id`, `file_unique_id` va metadata saqlaydi. Account sozlamasida `media_archive_download=true` qilinsa, ruxsat berilgan media Supabase Storage bucket’ga yuklanadi.
+Bot faqat Telegram Bot API orqali kelgan Business update’larni arxivlaydi. Private chatlarni ruxsatsiz o‘qimaydi yoki scrape qilmaydi. Har bir Business xabar uchun matn/caption, turi, `file_id`, yuboruvchi va composite scope saqlanadi; media faylning o‘zi Supabase Storage’ga yuklanmaydi.
+
+O‘chirilgan yozuvlar 20 kun, hali o‘chirilmagan vaqtinchalik cache 3 kun saqlanadi. Runtime scheduler cleanup’ni kuniga bir marta bajaradi.
 
 ## AI yordamchi funksiyalar
 

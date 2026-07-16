@@ -51,6 +51,8 @@ create table if not exists business_leads (
   admin_active_until timestamptz,
   followup_count integer default 0,
   opted_out boolean default false,
+  matched_template_key text,
+  campaign_started_automatically boolean default false,
   processing_lock_until timestamptz,
   processing_event_id text,
   last_message_at timestamptz default now(),
@@ -435,6 +437,8 @@ alter table business_leads add column if not exists campaign_trigger_text text;
 alter table business_leads add column if not exists campaign_stage text;
 alter table business_leads add column if not exists campaign_completed_at timestamptz;
 alter table business_leads add column if not exists campaign_expired_at timestamptz;
+alter table business_leads add column if not exists matched_template_key text;
+alter table business_leads add column if not exists campaign_started_automatically boolean default false;
 alter table business_leads add column if not exists processing_lock_until timestamptz;
 alter table business_leads add column if not exists processing_event_id text;
 alter table business_leads add column if not exists last_message_at timestamptz default now();
@@ -568,6 +572,9 @@ create table if not exists message_archive (
   text text,
   caption text,
   file_id text,
+  sender text,
+  sent_at timestamptz,
+  is_deleted boolean default false,
   file_unique_id text,
   file_name text,
   mime_type text,
@@ -680,6 +687,9 @@ alter table message_archive add column if not exists message_type text default '
 alter table message_archive add column if not exists text text;
 alter table message_archive add column if not exists caption text;
 alter table message_archive add column if not exists file_id text;
+alter table message_archive add column if not exists sender text;
+alter table message_archive add column if not exists sent_at timestamptz;
+alter table message_archive add column if not exists is_deleted boolean default false;
 alter table message_archive add column if not exists file_unique_id text;
 alter table message_archive add column if not exists file_name text;
 alter table message_archive add column if not exists mime_type text;
@@ -754,11 +764,31 @@ create index if not exists lead_notes_account_chat_idx on lead_notes(account_key
 create index if not exists processed_events_account_idx on processed_events(account_key, processed_at desc);
 create index if not exists processed_messages_account_idx on processed_messages(account_key);
 create index if not exists sent_actions_account_idx on sent_actions(account_key);
-create unique index if not exists message_archive_account_chat_message_idx on message_archive(account_key, chat_id, message_id);
+update message_archive
+set
+  sender = coalesce(sender, case when from_username is not null then '@' || from_username end, from_first_name, from_id),
+  sent_at = coalesce(sent_at, created_at),
+  is_deleted = coalesce(delete_detected, false)
+where sender is null
+   or sent_at is null
+   or is_deleted is distinct from coalesce(delete_detected, false);
+
+create unique index if not exists message_archive_scope_unique_idx
+  on message_archive(account_key, business_connection_id, chat_id, message_id);
+drop index if exists message_archive_account_chat_message_idx;
 create index if not exists message_archive_chat_idx on message_archive(chat_id);
 create index if not exists message_archive_message_idx on message_archive(message_id);
 create index if not exists message_archive_account_idx on message_archive(account_key);
 create index if not exists message_archive_deleted_idx on message_archive(deleted_at);
+create index if not exists message_archive_person_deleted_idx
+  on message_archive(account_key, business_connection_id, chat_id, deleted_at desc)
+  where is_deleted = true;
+create index if not exists message_archive_cache_cleanup_idx
+  on message_archive(created_at)
+  where is_deleted = false;
+create index if not exists message_archive_deleted_cleanup_idx
+  on message_archive(deleted_at)
+  where is_deleted = true;
 create index if not exists message_archive_edited_idx on message_archive(edited_at);
 create index if not exists message_archive_media_idx on message_archive(account_key, message_type) where file_id is not null;
 create index if not exists message_edit_history_chat_idx on message_edit_history(chat_id);

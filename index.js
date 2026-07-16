@@ -722,7 +722,7 @@ async function handleBusinessConnectionUpdate(connection = {}) {
           [{ text: '🚀 Boshlash', callback_data: 'outreach_menu' }],
           [{ text: '✏️ Shablonlar', callback_data: 'templates' }, { text: '🔁 Ketma-ketlik', callback_data: 'flow_menu' }],
           [{ text: '🧠 AI qoidalar', callback_data: 'rules_menu' }, { text: '⚙️ Sozlamalar', callback_data: 'settings' }],
-          [{ text: '🕵️ Arxiv', callback_data: 'archive_menu' }, { text: '📈 Hisobotlar', callback_data: 'report' }],
+          [{ text: '🗑 O‘chirilgan xabarlar', callback_data: 'archive_menu' }, { text: '📈 Hisobotlar', callback_data: 'report' }],
           [{ text: '🩺 Diagnostika', callback_data: 'diagnostics' }]
         ]
       }
@@ -755,16 +755,6 @@ async function findAccountForBusinessMessage(msg) {
   ));
   if (directSender) return directSender;
   if (businessConnectionId) {
-    let archiveQ = supabase.from('message_archive')
-      .select('account_key')
-      .eq('business_connection_id', businessConnectionId)
-      .order('created_at', { ascending: false })
-      .limit(1);
-    if (chatId) archiveQ = archiveQ.eq('chat_id', chatId);
-    const { data: archiveRows } = await archiveQ;
-    const archiveKey = archiveRows?.[0]?.account_key;
-    if (archiveKey) return accounts.find(a => a.account_key === archiveKey) || { ...DEFAULT_ACCOUNT, account_key: archiveKey };
-
     let q = supabase.from('business_leads')
       .select('account_key')
       .eq('business_connection_id', businessConnectionId)
@@ -796,15 +786,15 @@ async function findAccountByBusinessConnectionId(businessConnectionId) {
 }
 
 async function findArchivedMessage({ businessConnectionId = '', chatId = '', messageId = null, accountKey: ak = null }) {
-  if (!chatId || !messageId) return null;
+  if (!ak || !businessConnectionId || !chatId || !messageId) return null;
   let q = supabase.from('message_archive')
     .select('*')
+    .eq('account_key', ak)
+    .eq('business_connection_id', String(businessConnectionId))
     .eq('chat_id', String(chatId))
     .eq('message_id', messageId)
     .order('created_at', { ascending: false })
     .limit(1);
-  if (businessConnectionId) q = q.eq('business_connection_id', String(businessConnectionId));
-  if (ak) q = q.eq('account_key', ak);
   const { data, error } = await q;
   if (error) {
     console.error('findArchivedMessage:', error.message);
@@ -818,31 +808,31 @@ async function resolveArchiveAccount(update = {}, messageId = null, mode = 'dele
   const chatId = String(update.chat?.id || update.chat_id || '');
   const accounts = await getAccounts();
 
-  if (businessConnectionId && chatId && messageId) {
-    const archived = await findArchivedMessage({ businessConnectionId, chatId, messageId });
-    if (archived?.account_key) {
-      const account = accounts.find(a => a.account_key === archived.account_key) || { ...DEFAULT_ACCOUNT, account_key: archived.account_key };
-      return { account, archived, reason: 'message_archive_business_connection_chat_message' };
-    }
-  }
-
-  if (mode === 'edited' && chatId && messageId) {
-    const archived = await findArchivedMessage({ chatId, messageId });
-    if (archived?.account_key) {
-      const account = accounts.find(a => a.account_key === archived.account_key) || { ...DEFAULT_ACCOUNT, account_key: archived.account_key };
-      return { account, archived, reason: 'message_archive_chat_message' };
-    }
-  }
-
   const direct = await findAccountByBusinessConnectionId(businessConnectionId);
-  if (direct) return { account: direct, reason: 'business_connection_id_account_late' };
+  if (direct) {
+    const archived = await findArchivedMessage({
+      accountKey: direct.account_key,
+      businessConnectionId,
+      chatId,
+      messageId
+    });
+    return { account: direct, archived, reason: 'business_connection_id_account' };
+  }
 
   if (mode === 'edited') {
     const bySender = accounts.find(a => (
       (a.business_owner_id && update.from?.id && String(a.business_owner_id) === String(update.from.id)) ||
       (a.admin_chat_id && update.from?.id && String(a.admin_chat_id) === String(update.from.id))
     ));
-    if (bySender) return { account: bySender, reason: 'from_id_account' };
+    if (bySender) {
+      const archived = await findArchivedMessage({
+        accountKey: bySender.account_key,
+        businessConnectionId,
+        chatId,
+        messageId
+      });
+      return { account: bySender, archived, reason: 'from_id_account' };
+    }
   }
 
   await logEvent(chatId || 'unknown', 'archive_account_resolution_failed', JSON.stringify({
@@ -1074,7 +1064,9 @@ const OPTIONAL_LEAD_FIELDS = new Set([
   'followup_count',
   'opted_out',
   'processing_lock_until',
-  'processing_event_id'
+  'processing_event_id',
+  'matched_template_key',
+  'campaign_started_automatically'
 ]);
 
 function stripOptionalLeadFields(payload = {}) {
@@ -1357,6 +1349,8 @@ async function manuallyStartLeadBot(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, 
     campaign_started_by: actorId ? String(actorId) : 'admin',
     campaign_trigger_text: 'Admin tugma orqali campaign boshladi',
     campaign_stage: existing.stage || STAGE.OUTREACH_SENT,
+    matched_template_key: null,
+    campaign_started_automatically: false,
     campaign_completed_at: null,
     campaign_expired_at: null,
     bot_enabled: true,
@@ -1448,6 +1442,76 @@ async function getTemplate(key, accountOrKey = DEFAULT_ACCOUNT_KEY) {
     return null;
   }
   return data?.body || null;
+}
+
+const REACH_TEMPLATE_KEYS = [
+  'reach_greeting',
+  'reach_start',
+  'outreach_start',
+  'application_confirmation',
+  'ask_application'
+];
+
+function normalizeReachTemplateText(text = '') {
+  return String(text || '')
+    .normalize('NFKC')
+    .trim()
+    .toLowerCase()
+    .replace(/[’‘`ʻʼ]/g, "'")
+    .replace(/[“”«»]/g, '"')
+    .replace(/\s+/g, ' ')
+    .replace(/[.!]+\s*$/g, '')
+    .trim();
+}
+
+function activeReachTemplateBody(body = '') {
+  const text = String(body || '').trim();
+  return Boolean(text && text.toLowerCase() !== '[deleted]');
+}
+
+async function getActiveReachTemplates(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const ak = accountKey(accountOrKey);
+  const scopedKeys = REACH_TEMPLATE_KEYS.map(key => accountTemplateKey(ak, key));
+  const templates = [];
+  const { data: scopedRows, error: scopedError } = await supabase.from('reply_templates')
+    .select('key,title,body')
+    .eq('account_key', ak)
+    .in('key', scopedKeys);
+  if (scopedError) console.error('getActiveReachTemplates scoped:', scopedError.message);
+  for (const row of scopedRows || []) {
+    const key = String(row.key || '').startsWith(`${ak}:`)
+      ? String(row.key).slice(`${ak}:`.length)
+      : String(row.key || '');
+    if (REACH_TEMPLATE_KEYS.includes(key) && activeReachTemplateBody(row.body)) {
+      templates.push({ key, body: renderTemplate(row.body), source: 'account' });
+    }
+  }
+
+  // Legacy global templates belong only to the default UZLYE account.
+  if (normalizeAccountKey(ak) === DEFAULT_ACCOUNT_KEY) {
+    const { data: globalRows, error: globalError } = await supabase.from('reply_templates')
+      .select('key,title,body')
+      .is('account_key', null)
+      .in('key', REACH_TEMPLATE_KEYS);
+    if (globalError) console.error('getActiveReachTemplates global:', globalError.message);
+    for (const row of globalRows || []) {
+      const key = String(row.key || '');
+      if (REACH_TEMPLATE_KEYS.includes(key) && activeReachTemplateBody(row.body) && !templates.some(t => t.key === key)) {
+        templates.push({ key, body: renderTemplate(row.body), source: 'uzlye_legacy' });
+      }
+    }
+  }
+  return templates;
+}
+
+async function matchActiveReachTemplate(accountOrKey = DEFAULT_ACCOUNT_KEY, outgoingText = '') {
+  const normalizedOutgoing = normalizeReachTemplateText(outgoingText);
+  if (!normalizedOutgoing) return { matched: false, reason: 'empty_outgoing_text' };
+  const templates = await getActiveReachTemplates(accountOrKey);
+  const matched = templates.find(template => normalizeReachTemplateText(template.body) === normalizedOutgoing);
+  return matched
+    ? { matched: true, template: matched, reason: 'exact_normalized_template_match' }
+    : { matched: false, reason: templates.length ? 'no_exact_active_reach_template_match' : 'no_active_reach_templates' };
 }
 
 async function setTemplate(key, body, accountOrKey = null) {
@@ -2486,14 +2550,8 @@ function isGenericGreetingOnly(text = '') {
 
 async function isOutreachStartMessage({ accountKey, messageText, explicitStart = false }) {
   if (explicitStart) return true;
-  if (!messageText || isGenericGreetingOnly(messageText)) return false;
-  const reachText = await getReachStartTemplate(accountKey);
-  const templates = [
-    reachText,
-    await getTemplate('reach_greeting', accountKey),
-    await getTemplate('application_confirmation', accountKey)
-  ].filter(Boolean).map(normalizeOutreachText);
-  return templates.includes(normalizeOutreachText(messageText));
+  const match = await matchActiveReachTemplate(accountKey, messageText);
+  return match.matched;
 }
 
 async function markOutreach({ chatId, businessConnectionId, from, text, messageId = null, accountKey = DEFAULT_ACCOUNT_KEY }) {
@@ -2609,7 +2667,139 @@ function leadWasPausedOrFinished(lead = null) {
   );
 }
 
+function campaignStageForReachTemplate(templateKey = '') {
+  if (['application_confirmation', 'ask_application'].includes(templateKey)) return 'application_confirmation';
+  return 'greeting_sent';
+}
+
+function flowStageForReachTemplate(templateKey = '') {
+  return ['application_confirmation', 'ask_application'].includes(templateKey)
+    ? STAGE.ASKED_APPLICATION
+    : STAGE.OUTREACH_SENT;
+}
+
+async function startCampaignFromReachTemplate({
+  chatId,
+  businessConnectionId,
+  leadProfile = {},
+  adminUser = {},
+  text = '',
+  messageId = null,
+  messageDate = null,
+  accountKey = DEFAULT_ACCOUNT_KEY,
+  match
+}) {
+  const existing = await getLead(chatId, accountKey);
+  const now = new Date().toISOString();
+  const sentAt = messageDate || now;
+  const templateKey = match?.template?.key || null;
+  const flowStage = flowStageForReachTemplate(templateKey);
+  const campaignStage = campaignStageForReachTemplate(templateKey);
+  const sessionId = `template_match_${accountKey}_${Date.now()}`;
+
+  if (!existing) {
+    await createLead({
+      chatId,
+      businessConnectionId,
+      from: leadProfile,
+      text: '',
+      stage: flowStage,
+      status: 'active',
+      botEnabled: true,
+      accountKey
+    });
+  }
+
+  const lead = await updateLead(chatId, {
+    account_key: accountKey,
+    lead_chat_id: String(chatId),
+    business_connection_id: businessConnectionId || existing?.business_connection_id || null,
+    first_name: existing?.first_name || leadProfile?.first_name || leadProfile?.title || null,
+    username: existing?.username || leadProfile?.username || null,
+    status: 'active',
+    stage: flowStage,
+    current_stage: flowStage,
+    bot_enabled: true,
+    bot_enabled_for_lead: true,
+    manual_only: false,
+    outreach_sent: true,
+    reach_sent: true,
+    assigned_by_reach: true,
+    assigned_by_admin: true,
+    manually_started: false,
+    outreach_session_id: sessionId,
+    outreach_message: text,
+    outreach_at: now,
+    reach_sent_at: now,
+    reach_message_text: text,
+    reach_message_id: messageId ? String(messageId) : null,
+    reach_batch_id: sessionId,
+    campaign_active: true,
+    campaign_started_at: now,
+    campaign_started_by: adminUser?.id ? String(adminUser.id) : 'admin',
+    campaign_trigger_message_id: messageId ? String(messageId) : null,
+    campaign_trigger_text: text,
+    campaign_stage: campaignStage,
+    campaign_completed_at: null,
+    campaign_expired_at: null,
+    matched_template_key: templateKey,
+    campaign_started_automatically: true,
+    first_admin_message: text,
+    first_admin_message_at: sentAt,
+    last_admin_message: text,
+    last_admin_message_at: sentAt,
+    last_actor: 'admin',
+    last_message_at: sentAt,
+    admin_active_until: null,
+    needs_human: false,
+    needs_human_reason: null,
+    paused_at: null,
+    paused_by: null,
+    pause_reason: null
+  }, accountKey);
+  await logEvent(chatId, 'campaign_started_from_reach_template', JSON.stringify({
+    template_key: templateKey,
+    message_id: messageId || null,
+    campaign_stage: campaignStage
+  }), accountKey);
+  await writeAuditLog({
+    accountKey,
+    chatId,
+    action: 'campaign_started_automatically',
+    oldValue: existing ? { campaign_active: existing.campaign_active, stage: existing.stage } : null,
+    newValue: { template_key: templateKey, campaign_stage: campaignStage, message_id: messageId || null },
+    actorType: 'admin',
+    actorId: adminUser?.id
+  });
+  return lead;
+}
+
 async function markManualBusinessReach({ chatId, businessConnectionId, leadProfile = {}, adminUser = {}, text = '', messageId = null, messageDate = null, accountKey = DEFAULT_ACCOUNT_KEY, edited = false }) {
+  const reachMatch = edited
+    ? { matched: false, reason: 'edited_message_not_campaign_trigger' }
+    : await matchActiveReachTemplate(accountKey, text);
+  const account = await getAccount(accountKey);
+  if (reachMatch.matched && canAccountReach(account)) {
+    const lead = await startCampaignFromReachTemplate({
+      chatId,
+      businessConnectionId,
+      leadProfile,
+      adminUser,
+      text,
+      messageId,
+      messageDate,
+      accountKey,
+      match: reachMatch
+    });
+    return {
+      lead,
+      template_match: true,
+      matched_template_key: reachMatch.template.key,
+      campaign_started: true,
+      reason: reachMatch.reason
+    };
+  }
+
   const existing = await getLead(chatId, accountKey);
   const adminText = text || '[media]';
   const now = new Date().toISOString();
@@ -2666,7 +2856,13 @@ async function markManualBusinessReach({ chatId, businessConnectionId, leadProfi
     actorType: 'admin',
     actorId: adminUser?.id
   });
-  return lead;
+  return {
+    lead,
+    template_match: false,
+    matched_template_key: null,
+    campaign_started: false,
+    reason: reachMatch.matched ? 'account_reach_off' : reachMatch.reason
+  };
 }
 
 function detectAdminPromptStage(text = '') {
@@ -2862,10 +3058,51 @@ async function setDailyAuto(value, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   return next;
 }
 
+async function maybeCleanupMessageArchive() {
+  const today = localDateKey();
+  const stateKey = 'message_archive_cleanup';
+  const state = await getSetting(stateKey, {});
+  if (state?.last_cleanup_date === today) return;
+
+  const deletedCutoff = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString();
+  const cacheCutoff = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+  const [deletedResult, cacheResult] = await Promise.all([
+    supabase.from('message_archive')
+      .delete({ count: 'exact' })
+      .eq('is_deleted', true)
+      .lte('deleted_at', deletedCutoff),
+    supabase.from('message_archive')
+      .delete({ count: 'exact' })
+      .eq('is_deleted', false)
+      .lte('created_at', cacheCutoff)
+  ]);
+
+  const cleanupError = deletedResult.error || cacheResult.error;
+  if (cleanupError) throw cleanupError;
+  await setSetting(stateKey, {
+    last_cleanup_date: today,
+    deleted_removed: deletedResult.count || 0,
+    cache_removed: cacheResult.count || 0,
+    completed_at: new Date().toISOString()
+  });
+  await logEvent('system', 'message_archive_cleanup_completed', JSON.stringify({
+    deleted_removed: deletedResult.count || 0,
+    cache_removed: cacheResult.count || 0,
+    deleted_cutoff: deletedCutoff,
+    cache_cutoff: cacheCutoff
+  }));
+}
+
 async function runSchedulerTick(source = 'interval') {
   if (schedulerBusy) return;
   schedulerBusy = true;
   try {
+    try {
+      await maybeCleanupMessageArchive();
+    } catch (cleanupError) {
+      console.error('message archive cleanup error:', cleanupError);
+      await logEvent('system', 'message_archive_cleanup_error', cleanupError.message || String(cleanupError));
+    }
     const accounts = await getAccounts();
     for (const account of accounts) {
       await maybeStartDailyAuto(account.account_key);
@@ -3050,94 +3287,51 @@ function messageArchiveMeta(msg = {}) {
   if (!media) return { messageType: msg.caption ? 'text' : 'other' };
   return {
     messageType: media.messageType,
-    fileId: media.file?.file_id || null,
-    fileUniqueId: media.file?.file_unique_id || null,
-    fileName: media.file?.file_name || null,
-    mimeType: media.file?.mime_type || null,
-    fileSize: media.file?.file_size || null
+    fileId: media.file?.file_id || null
   };
+}
+
+function messageArchiveSender(source = {}) {
+  if (source.username) return `@${source.username}`;
+  return source.first_name || source.title || (source.id ? String(source.id) : null);
 }
 
 function messageArchivePayload(msg, account, direction, eventType = 'created') {
   const meta = messageArchiveMeta(msg);
+  const businessConnectionId = msg.business_connection_id || msg.business_connection?.id || account?.business_connection_id || 'unknown';
   return {
     account_key: account?.account_key || DEFAULT_ACCOUNT_KEY,
-    business_connection_id: msg.business_connection_id || msg.business_connection?.id || account?.business_connection_id || null,
+    business_connection_id: String(businessConnectionId),
     chat_id: String(msg.chat?.id || ''),
     message_id: msg.message_id || null,
-    from_id: msg.from?.id ? String(msg.from.id) : null,
-    from_username: msg.from?.username || null,
-    from_first_name: msg.from?.first_name || null,
+    sender: messageArchiveSender(msg.from || msg.chat || {}),
     direction,
     message_type: meta.messageType,
     text: msg.text || null,
     caption: msg.caption || null,
     file_id: meta.fileId || null,
-    file_unique_id: meta.fileUniqueId || null,
-    file_name: meta.fileName || null,
-    mime_type: meta.mimeType || null,
-    file_size: meta.fileSize || null,
-    raw_json: msg,
+    sent_at: msg.date ? new Date(Number(msg.date) * 1000).toISOString() : new Date().toISOString(),
+    is_deleted: false,
     last_event_type: eventType
   };
 }
 
-function archiveStoragePath(payload, filePath = '') {
-  const ext = filePath.includes('.') ? filePath.split('.').pop() : 'bin';
-  return `${payload.account_key}/${payload.chat_id}/${payload.message_id}_${payload.file_unique_id || payload.file_id}.${ext}`;
-}
-
-async function maybeArchiveMediaFile(payload) {
-  const downloadEnabled = payload.media_archive_download ?? MEDIA_ARCHIVE_DOWNLOAD;
-  const bucket = payload.storage_bucket || SUPABASE_STORAGE_BUCKET;
-  const maxBytes = Number(payload.media_archive_max_bytes || MEDIA_ARCHIVE_MAX_BYTES);
-  if (!downloadEnabled || !bucket || !payload.file_id) return {};
-  if (payload.file_size && Number(payload.file_size) > maxBytes) {
-    await logEvent(payload.chat_id, 'media_archive_download_skipped_large', `${payload.message_id}:${payload.file_size}`, payload.account_key);
-    return {};
-  }
-  try {
-    const file = await tg('getFile', { file_id: payload.file_id });
-    if (!file?.file_path) return {};
-    const fileRes = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
-    if (!fileRes.ok) throw new Error(`download failed ${fileRes.status}`);
-    const bytes = Buffer.from(await fileRes.arrayBuffer());
-    if (bytes.byteLength > maxBytes) {
-      await logEvent(payload.chat_id, 'media_archive_download_skipped_large', `${payload.message_id}:${bytes.byteLength}`, payload.account_key);
-      return {};
-    }
-    const storagePath = archiveStoragePath(payload, file.file_path);
-    const { error } = await supabase.storage.from(bucket).upload(storagePath, bytes, {
-      contentType: payload.mime_type || 'application/octet-stream',
-      upsert: true
-    });
-    if (error) throw error;
-    const { data } = supabase.storage.from(bucket).getPublicUrl(storagePath);
-    return { storage_path: storagePath, public_url: data?.publicUrl || null, storage_url: data?.publicUrl || null };
-  } catch (err) {
-    console.error('maybeArchiveMediaFile:', err.message);
-    await logEvent(payload.chat_id, 'media_archive_download_skipped', err.message || String(err), payload.account_key);
-    return {};
-  }
-}
-
 async function archiveBusinessMessage(msg, account, direction = 'unknown') {
-  if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false) return null;
+  if (direction !== 'incoming' && (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false)) return null;
   const payload = messageArchivePayload(msg, account, direction, 'created');
-  if (!payload.chat_id || !payload.message_id) return null;
-  if (payload.file_id && account?.media_archive_enabled === false) return null;
-  const storage = await maybeArchiveMediaFile({
-    ...payload,
-    media_archive_download: account?.media_archive_download,
-    media_archive_max_bytes: account?.media_archive_max_bytes,
-    storage_bucket: account?.storage_bucket
+  if (!payload.business_connection_id || !payload.chat_id || !payload.message_id) return null;
+  const existing = await findArchivedMessage({
+    accountKey: payload.account_key,
+    businessConnectionId: payload.business_connection_id,
+    chatId: payload.chat_id,
+    messageId: payload.message_id
   });
+  if (existing) return existing;
   const { data, error } = await supabase.from('message_archive').upsert({
     ...payload,
-    ...storage,
     delete_detected: false,
     last_event_type: 'created'
-  }, { onConflict: 'account_key,chat_id,message_id' }).select().maybeSingle();
+  }, { onConflict: 'account_key,business_connection_id,chat_id,message_id' }).select().maybeSingle();
   if (error) {
     console.error('archiveBusinessMessage:', error.message);
     await logEvent(payload.chat_id, 'message_archive_error', error.message, payload.account_key);
@@ -3151,8 +3345,7 @@ async function archiveEditedBusinessMessage(msg) {
   if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false || account?.track_edited_enabled === false) return;
   const direction = isOwnerMessage(msg) ? 'outgoing' : 'incoming';
   const payload = messageArchivePayload(msg, account, direction, 'edited');
-  if (!payload.chat_id || !payload.message_id) return;
-  if (payload.file_id && account?.media_archive_enabled === false) return;
+  if (!payload.business_connection_id || !payload.chat_id || !payload.message_id) return;
 
   const oldRow = resolved.archived || await findArchivedMessage({
     businessConnectionId: payload.business_connection_id,
@@ -3160,8 +3353,6 @@ async function archiveEditedBusinessMessage(msg) {
     messageId: payload.message_id,
     accountKey: payload.account_key
   });
-  const storage = oldRow?.storage_path ? {} : await maybeArchiveMediaFile(payload);
-
   await supabase.from('message_edit_history').insert({
     archive_id: oldRow?.id || null,
     account_key: payload.account_key,
@@ -3170,21 +3361,18 @@ async function archiveEditedBusinessMessage(msg) {
     old_text: oldRow?.text || null,
     new_text: payload.text || null,
     old_caption: oldRow?.caption || null,
-    new_caption: payload.caption || null,
-    old_raw_json: oldRow?.raw_json || null,
-    new_raw_json: msg
+    new_caption: payload.caption || null
   });
 
   const nextEditCount = Number(oldRow?.edit_count || 0) + 1;
   const { data: savedRow, error } = await supabase.from('message_archive').upsert({
     ...(oldRow || {}),
     ...payload,
-    ...storage,
     id: oldRow?.id,
     edited_at: new Date().toISOString(),
     edit_count: nextEditCount,
     last_event_type: 'edited'
-  }, { onConflict: 'account_key,chat_id,message_id' }).select().maybeSingle();
+  }, { onConflict: 'account_key,business_connection_id,chat_id,message_id' }).select().maybeSingle();
   if (error) console.error('archiveEditedBusinessMessage:', error.message);
 
   if (account.archive_notify_enabled !== false) await notifyEditedMessage(account, oldRow, savedRow || payload, resolved.reason);
@@ -3198,12 +3386,11 @@ function deletedMessageIds(update = {}) {
 async function handleDeletedBusinessMessages(update = {}) {
   const businessConnectionId = update.business_connection_id || update.business_connection?.id || null;
   const chatId = String(update.chat?.id || update.chat_id || '');
-  if (!chatId) return;
+  if (!chatId || !businessConnectionId) return;
   for (const messageId of deletedMessageIds(update)) {
     if (!messageId) continue;
     const resolved = await resolveArchiveAccount(update, messageId, 'deleted');
     const account = resolved.account;
-    if (!MEDIA_ARCHIVE_ENABLED || account?.archive_enabled === false || account?.track_deleted_enabled === false) continue;
     const ak = account.account_key;
     let oldRow = resolved.archived || await findArchivedMessage({
       businessConnectionId,
@@ -3211,50 +3398,40 @@ async function handleDeletedBusinessMessages(update = {}) {
       messageId,
       accountKey: ak
     });
-    if (!oldRow) {
-      oldRow = await findArchivedMessage({ businessConnectionId, chatId, messageId });
-    }
+    if (oldRow?.is_deleted === true || oldRow?.delete_detected === true) continue;
     const patch = {
       account_key: ak,
-      business_connection_id: businessConnectionId || oldRow?.business_connection_id || account.business_connection_id || null,
+      business_connection_id: String(businessConnectionId || oldRow?.business_connection_id || account.business_connection_id || 'unknown'),
       chat_id: chatId,
       message_id: messageId,
+      sender: oldRow?.sender || messageArchiveSender(update.chat || {}),
+      sent_at: oldRow?.sent_at || null,
+      direction: oldRow?.direction || 'incoming',
       deleted_at: new Date().toISOString(),
+      is_deleted: true,
       delete_detected: true,
       last_event_type: 'deleted'
     };
     const storedRow = oldRow?.account_key === ak ? oldRow : null;
     const carry = oldRow ? {
-      from_id: oldRow.from_id || null,
-      from_username: oldRow.from_username || null,
-      from_first_name: oldRow.from_first_name || null,
-      direction: oldRow.direction || 'unknown',
       message_type: oldRow.message_type || 'other',
       text: oldRow.text || null,
       caption: oldRow.caption || null,
-      file_id: oldRow.file_id || null,
-      file_unique_id: oldRow.file_unique_id || null,
-      file_name: oldRow.file_name || null,
-      mime_type: oldRow.mime_type || null,
-      file_size: oldRow.file_size || null,
-      storage_path: oldRow.storage_path || null,
-      storage_url: oldRow.storage_url || null,
-      public_url: oldRow.public_url || null,
-      raw_json: oldRow.raw_json || {}
+      file_id: oldRow.file_id || null
     } : {};
     const { data: savedRow, error } = await supabase.from('message_archive').upsert({
       ...(storedRow || {}),
       ...carry,
       ...patch,
       id: storedRow?.id
-    }, { onConflict: 'account_key,chat_id,message_id' }).select().maybeSingle();
+    }, { onConflict: 'account_key,business_connection_id,chat_id,message_id' }).select().maybeSingle();
     if (error) console.error('handleDeletedBusinessMessages:', error.message);
     if (account.archive_notify_enabled !== false) await notifyDeletedMessage(account, savedRow || (oldRow ? { ...oldRow, ...patch } : patch), resolved.reason);
   }
 }
 
 function archiveActor(row = {}) {
-  return row.from_username ? `@${row.from_username}` : (row.from_first_name || 'Foydalanuvchi');
+  return row.sender || (row.from_username ? `@${row.from_username}` : (row.from_first_name || 'Foydalanuvchi'));
 }
 
 function deletedItemLabel(messageType = 'text', full = false) {
@@ -3269,6 +3446,23 @@ function deletedItemLabel(messageType = 'text', full = false) {
   };
   if (full) return shortLabels[messageType] || 'xabarni';
   return shortLabels[messageType] || 'xabarni';
+}
+
+function archiveStoredContent(row = {}) {
+  const text = String(row.text || '').trim();
+  const caption = String(row.caption || '').trim();
+  if (text) return text;
+  if (caption) return caption;
+  const labels = {
+    voice: 'Ovozli xabar',
+    photo: 'Rasm',
+    video: 'Video',
+    video_note: 'Dumaloq video',
+    audio: 'Audio',
+    document: 'Hujjat',
+    sticker: 'Stiker'
+  };
+  return labels[row.message_type] || 'Xabar o‘chirilishidan oldin saqlanmagan';
 }
 
 async function notifyDeletedMessage(account, row, resolutionReason = '') {
@@ -3326,27 +3520,8 @@ async function notifyEditedMessage(account, oldRow, payload, resolutionReason = 
   }), account.account_key);
 }
 
-async function sendArchivedMediaToAdmin(account, row, caption = 'Media arxiv') {
-  if (!row?.file_id) return;
-  const adminChatId = await getAdminChatIdForAccount(account.account_key);
-  if (!adminChatId) return;
-  const payload = { chat_id: adminChatId, caption };
-  try {
-    if (row.message_type === 'photo') return await tg('sendPhoto', { ...payload, photo: row.file_id });
-    if (row.message_type === 'voice') return await tg('sendVoice', { ...payload, voice: row.file_id });
-    if (row.message_type === 'video_note') return await tg('sendVideoNote', { chat_id: adminChatId, video_note: row.file_id });
-    if (row.message_type === 'video') return await tg('sendVideo', { ...payload, video: row.file_id });
-    if (row.message_type === 'document') return await tg('sendDocument', { ...payload, document: row.file_id });
-    if (row.message_type === 'audio') return await tg('sendAudio', { ...payload, audio: row.file_id });
-    if (row.message_type === 'sticker') return await tg('sendSticker', { chat_id: adminChatId, sticker: row.file_id });
-  } catch (err) {
-    console.error('sendArchivedMediaToAdmin:', err.message);
-    await logEvent(row.chat_id || 'unknown', 'send_archived_media_failed', err.message || String(err), account.account_key);
-  }
-}
-
 async function getArchiveRowById(accountOrKey, id) {
-  let q = supabase.from('message_archive').select('*').eq('id', Number(id)).limit(1);
+  let q = supabase.from('message_archive').select('*').eq('id', String(id)).limit(1);
   q = archiveAccountFilter(q, accountOrKey);
   const { data, error } = await q.maybeSingle();
   if (error) {
@@ -3378,7 +3553,8 @@ async function sendArchiveFullDetail(chatId, accountOrKey, archiveId) {
   const row = await getArchiveRowById(account.account_key, archiveId);
   if (!row) return tg('sendMessage', { chat_id: chatId, text: 'Arxiv yozuvi topilmadi.' });
   const actor = archiveActor(row);
-  if (row.last_event_type === 'edited' || Number(row.edit_count || 0) > 0) {
+  const isDeleted = row.is_deleted === true || row.delete_detected === true;
+  if (!isDeleted && (row.last_event_type === 'edited' || Number(row.edit_count || 0) > 0)) {
     const hist = await latestEditHistory(account.account_key, row);
     await tg('sendMessage', {
       chat_id: chatId,
@@ -3393,17 +3569,16 @@ async function sendArchiveFullDetail(chatId, accountOrKey, archiveId) {
     return;
   }
   const item = deletedItemLabel(row.message_type, true);
-  const deletedText = row.text || row.caption || '';
+  const deletedText = archiveStoredContent(row);
   await tg('sendMessage', {
     chat_id: chatId,
     parse_mode: 'HTML',
     text:
       `🗑 <b>${html(actor)} ushbu ${html(item)} o‘chirdi</b>\n\n` +
       `Akkaunt: ${html(account.label || accountDisplayLabel(account.account_key))}` +
-      (deletedText ? `\n\nO‘chirilgan xabar:\n${html(short(deletedText, 1200))}` : '') +
+      `\n\nO‘chirilgan xabar:\n${html(short(deletedText, 1200))}` +
       `\n\nVaqt: ${row.deleted_at || '-'}`
   });
-  await sendArchivedMediaToAdmin(account, row, `O‘chirilgan ${row.message_type === 'photo' ? 'rasm' : 'media'} arxivi`);
 }
 
 function isOwnerMessage(msg) {
@@ -3521,13 +3696,13 @@ async function handleBusinessMessage(msg, options = {}) {
   const account = await findAccountForBusinessMessage(msg);
   const ak = account.account_key;
   const text = getMessageText(msg).trim();
+  const direction = isAccountOwnerMessage(msg, account) ? 'outgoing' : 'incoming';
+  if (direction === 'outgoing') await rememberAccountBusinessConnection(account, businessConnectionId);
+  if (!options.skipArchive) await archiveBusinessMessage(msg, account, direction);
   if (normalizeCommandWord(text.split(/\s+/)[0]) === '/whoami') {
     await replyWhoami(msg, 'business_message');
     return;
   }
-  const direction = isAccountOwnerMessage(msg, account) ? 'outgoing' : 'incoming';
-  if (direction === 'outgoing') await rememberAccountBusinessConnection(account, businessConnectionId);
-  if (!options.skipArchive) await archiveBusinessMessage(msg, account, direction);
 
   if (ak === UNKNOWN_ACCOUNT_KEY) {
     await logIgnore(chatId, 'unmapped_business_connection_no_flow', businessConnectionId || '', ak);
@@ -3564,7 +3739,7 @@ async function handleBusinessMessage(msg, options = {}) {
   // Owner/admin outgoing Business message starts an account-scoped manual reach.
   // Do not respond to the admin message itself.
   if (isAccountOwnerMessage(msg, account)) {
-    const assignedLead = await markManualBusinessReach({
+    const outgoingResult = await markManualBusinessReach({
       chatId,
       businessConnectionId,
       leadProfile: msg.chat || {},
@@ -3575,7 +3750,13 @@ async function handleBusinessMessage(msg, options = {}) {
       accountKey: ak,
       edited: Boolean(options.edited)
     });
-    console.log(`[BUSINESS_OUTGOING] account_key=${ak} business_connection_id=${businessConnectionId || '-'} lead_chat_id=${chatId} message_id=${msg.message_id || '-'} assigned=${assignedLead ? 'true' : 'false'}`);
+    console.log(
+      `[BUSINESS_OUTGOING] account_key=${ak} lead_chat_id=${chatId} message_id=${msg.message_id || '-'} ` +
+      `template_match=${outgoingResult?.template_match ? 'true' : 'false'} ` +
+      `matched_template_key=${outgoingResult?.matched_template_key || '-'} ` +
+      `campaign_started=${outgoingResult?.campaign_started ? 'true' : 'false'} ` +
+      `reason=${outgoingResult?.reason || '-'}`
+    );
     return;
   }
 
@@ -3877,11 +4058,9 @@ async function getReminderDue(limit = 50, accountOrKey = DEFAULT_ACCOUNT_KEY) {
 }
 
 async function getReachStartTemplate(accountOrKey = DEFAULT_ACCOUNT_KEY) {
-  for (const key of ['reach_start', 'outreach_start', 'ask_application']) {
-    const body = await getTemplate(key, accountOrKey);
-    if (body) return renderTemplate(body);
-  }
-  return DEFAULT_REACH_START_TEXT;
+  const templates = await getActiveReachTemplates(accountOrKey);
+  if (templates[0]?.body) return templates[0].body;
+  return normalizeAccountKey(accountKey(accountOrKey)) === DEFAULT_ACCOUNT_KEY ? DEFAULT_REACH_START_TEXT : null;
 }
 
 async function getReachCandidates(accountOrKey = DEFAULT_ACCOUNT_KEY, limit = 30) {
@@ -3946,6 +4125,10 @@ async function sendLeadDebug(chatId, telegramUserId, selectedAccountKey = DEFAUL
       `chat_id: ${target}\n` +
       `business_connection_id: ${lead?.business_connection_id || '-'}\n` +
       `reach_sent: ${lead?.reach_sent || lead?.outreach_sent ? 'true' : 'false'}\n` +
+      `campaign_active: ${lead?.campaign_active ? 'true' : 'false'}\n` +
+      `campaign_trigger_text: ${short(lead?.campaign_trigger_text || '-', 160)}\n` +
+      `matched_template_key: ${lead?.matched_template_key || '-'}\n` +
+      `campaign_started_automatically: ${lead?.campaign_started_automatically ? 'true' : 'false'}\n` +
       `assigned_by_reach: ${lead?.assigned_by_reach ? 'true' : 'false'}\n` +
       `assigned_by_admin: ${lead?.assigned_by_admin ? 'true' : 'false'}\n` +
       `manually_started: ${lead?.manually_started ? 'true' : 'false'}\n` +
@@ -3987,6 +4170,7 @@ async function sendReachStartPreview(chatId, telegramUserId, selectedAccountKey 
     account = await setAccountReachEnabled(allowedAccountKey, true, telegramUserId);
   }
   const reachText = await getReachStartTemplate(allowedAccountKey);
+  if (!reachText) return tg('sendMessage', { chat_id: chatId, text: 'Faol reach shabloni topilmadi. Avval reach_greeting, outreach_start yoki application_confirmation shablonini sozlang.' });
   const candidates = await getReachCandidates(allowedAccountKey, 50);
   await setAdminSession(chatId, 'reach_start_confirm', {
     telegram_user_id: String(telegramUserId || chatId),
@@ -4023,6 +4207,7 @@ async function executeReachStart(chatId, telegramUserId) {
   }
   if (account.reach_enabled === false) account = await setAccountReachEnabled(allowedAccountKey, true, telegramUserId);
   const reachText = payload.reach_text || await getReachStartTemplate(allowedAccountKey);
+  if (!reachText) return tg('sendMessage', { chat_id: chatId, text: 'Faol reach shabloni topilmadi.' });
   const candidates = await getReachCandidates(allowedAccountKey, 50);
   let sent = 0;
   let failed = 0;
@@ -4107,16 +4292,17 @@ function archiveAccountFilter(q, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   return accountLeadFilter(q, accountOrKey);
 }
 
-async function getArchiveRows(type, accountOrKey = DEFAULT_ACCOUNT_KEY, chatId = null, limit = 10) {
+async function getArchiveRows(type, accountOrKey = DEFAULT_ACCOUNT_KEY, chatId = null, limit = 10, businessConnectionId = null, offset = 0) {
   let q = supabase.from('message_archive')
-    .select('*')
-    .order('created_at', { ascending: false })
-    .limit(limit);
+    .select('*');
   q = archiveAccountFilter(q, accountOrKey);
   if (chatId) q = q.eq('chat_id', String(chatId));
-  if (type === 'deleted') q = q.eq('delete_detected', true).order('deleted_at', { ascending: false, nullsFirst: false });
+  if (businessConnectionId) q = q.eq('business_connection_id', String(businessConnectionId));
+  if (type === 'deleted') q = q.eq('is_deleted', true).eq('direction', 'incoming').order('deleted_at', { ascending: false, nullsFirst: false });
   if (type === 'edited') q = q.gt('edit_count', 0).order('edited_at', { ascending: false, nullsFirst: false });
-  if (type === 'media') q = q.not('file_id', 'is', null);
+  if (type === 'media') q = q.not('file_id', 'is', null).order('created_at', { ascending: false });
+  if (!['deleted', 'edited', 'media'].includes(type)) q = q.order('created_at', { ascending: false });
+  q = q.range(offset, offset + limit - 1);
   const { data, error } = await q;
   if (error) {
     console.error('getArchiveRows:', error.message);
@@ -4126,20 +4312,29 @@ async function getArchiveRows(type, accountOrKey = DEFAULT_ACCOUNT_KEY, chatId =
 }
 
 async function getArchivePeople(accountOrKey = DEFAULT_ACCOUNT_KEY, limit = 20) {
-  let q = supabase.from('message_archive')
-    .select('chat_id,from_username,from_first_name,created_at,deleted_at,edited_at')
-    .order('created_at', { ascending: false })
-    .limit(100);
-  q = archiveAccountFilter(q, accountOrKey);
-  const { data, error } = await q;
-  if (error) {
-    console.error('getArchivePeople:', error.message);
-    return [];
-  }
   const seen = new Map();
-  for (const row of data || []) {
-    if (!seen.has(row.chat_id)) seen.set(row.chat_id, row);
-    if (seen.size >= limit) break;
+  const pageSize = 200;
+  let offset = 0;
+  while (seen.size < limit) {
+    let q = supabase.from('message_archive')
+      .select('id,account_key,business_connection_id,chat_id,sender,from_username,from_first_name,created_at,deleted_at')
+      .eq('is_deleted', true)
+      .eq('direction', 'incoming')
+      .order('deleted_at', { ascending: false, nullsFirst: false })
+      .range(offset, offset + pageSize - 1);
+    q = archiveAccountFilter(q, accountOrKey);
+    const { data, error } = await q;
+    if (error) {
+      console.error('getArchivePeople:', error.message);
+      return [];
+    }
+    for (const row of data || []) {
+      const key = `${row.business_connection_id}:${row.chat_id}`;
+      if (!seen.has(key)) seen.set(key, row);
+      if (seen.size >= limit) break;
+    }
+    if ((data || []).length < pageSize) break;
+    offset += pageSize;
   }
   return [...seen.values()];
 }
@@ -4148,14 +4343,14 @@ async function sendArchivePeopleMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY)
   const account = await getAccount(accountOrKey);
   const people = await getArchivePeople(account.account_key);
   const rows = people.map(p => ([{
-    text: p.from_username ? `@${p.from_username}` : (p.from_first_name || String(p.chat_id)),
-    callback_data: `archp:${account.account_key}:${p.chat_id}`
+    text: p.sender || (p.from_username ? `@${p.from_username}` : (p.from_first_name || String(p.chat_id))),
+    callback_data: `archp:${account.account_key}:${p.id}`
   }]));
   if (!rows.length) rows.push([{ text: 'Hozircha arxiv yo‘q', callback_data: 'noop' }]);
   rows.push([{ text: '⬅️ Menyu', callback_data: 'menu' }]);
   return tg('sendMessage', {
     chat_id: chatId,
-    text: `Joriy akkaunt: ${account.label || accountDisplayLabel(account.account_key)}\n\n🕵️ Arxiv`,
+    text: `Joriy akkaunt: ${account.label || accountDisplayLabel(account.account_key)}\n\n🗑 O‘chirilgan xabarlar`,
     reply_markup: { inline_keyboard: rows }
   });
 }
@@ -4170,20 +4365,48 @@ function archiveEventLabel(row = {}) {
   return `${item} ${type}`;
 }
 
-async function sendArchivePersonEvents(chatId, accountOrKey, targetChatId) {
+function archiveEventButtonText(row = {}) {
+  const d = new Date(row.deleted_at || row.sent_at || row.created_at || Date.now());
+  const date = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
+  const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return `${date} ${time} — ${short(archiveStoredContent(row), 36)}`;
+}
+
+async function sendArchivePersonEvents(chatId, accountOrKey, profileArchiveId) {
   const account = await getAccount(accountOrKey);
-  const rows = await getArchiveRows('recent', account.account_key, targetChatId, 20);
-  const buttons = rows.map(r => {
-    const d = new Date(r.deleted_at || r.edited_at || r.created_at || Date.now());
-    const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-    return [{ text: `${time} — ${archiveEventLabel(r)}`, callback_data: `archv:${account.account_key}:${r.id}` }];
-  });
-  if (!buttons.length) buttons.push([{ text: 'Bu chatda arxiv topilmadi', callback_data: 'noop' }]);
+  const profile = await getArchiveRowById(account.account_key, profileArchiveId);
+  if (!profile) return tg('sendMessage', { chat_id: chatId, text: 'Foydalanuvchi arxivi topilmadi.' });
+  const rows = await getArchiveRows('deleted', account.account_key, profile.chat_id, 5, profile.business_connection_id);
+  const buttons = rows.map(r => ([{ text: archiveEventButtonText(r), callback_data: `archv:${account.account_key}:${r.id}` }]));
+  if (!buttons.length) buttons.push([{ text: 'Bu foydalanuvchida o‘chirilgan xabar yo‘q', callback_data: 'noop' }]);
+  buttons.push([{ text: 'Hammasini ko‘rish', callback_data: `archall:${account.account_key}:${profile.id}:0` }]);
   buttons.push([{ text: '⬅️ Arxiv', callback_data: `archa:${account.account_key}` }]);
-  const person = rows[0]?.from_username ? `@${rows[0].from_username}` : (rows[0]?.from_first_name || String(targetChatId));
+  const person = profile.sender || archiveActor(profile);
   return tg('sendMessage', {
     chat_id: chatId,
-    text: `Joriy akkaunt: ${account.label || accountDisplayLabel(account.account_key)}\n\n${person}`,
+    text: `Joriy akkaunt: ${account.label || accountDisplayLabel(account.account_key)}\n\n${person}\n\nO‘chirilgan xabarlar`,
+    reply_markup: { inline_keyboard: buttons }
+  });
+}
+
+async function sendArchiveAllDeleted(chatId, accountOrKey, profileArchiveId, page = 0) {
+  const account = await getAccount(accountOrKey);
+  const profile = await getArchiveRowById(account.account_key, profileArchiveId);
+  if (!profile) return tg('sendMessage', { chat_id: chatId, text: 'Foydalanuvchi arxivi topilmadi.' });
+  const pageSize = 20;
+  const safePage = Math.max(0, Number(page) || 0);
+  const fetched = await getArchiveRows('deleted', account.account_key, profile.chat_id, pageSize + 1, profile.business_connection_id, safePage * pageSize);
+  const hasNext = fetched.length > pageSize;
+  const rows = fetched.slice(0, pageSize);
+  const buttons = rows.map(r => ([{ text: archiveEventButtonText(r), callback_data: `archv:${account.account_key}:${r.id}` }]));
+  const paging = [];
+  if (safePage > 0) paging.push({ text: '⬅️ Oldingi', callback_data: `archall:${account.account_key}:${profile.id}:${safePage - 1}` });
+  if (hasNext) paging.push({ text: 'Keyingi ➡️', callback_data: `archall:${account.account_key}:${profile.id}:${safePage + 1}` });
+  if (paging.length) buttons.push(paging);
+  buttons.push([{ text: '⬅️ Foydalanuvchi', callback_data: `archp:${account.account_key}:${profile.id}` }]);
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `${profile.sender || archiveActor(profile)}\n\nBarcha o‘chirilgan xabarlar, ${safePage + 1}-sahifa`,
     reply_markup: { inline_keyboard: buttons }
   });
 }
@@ -4216,7 +4439,7 @@ async function sendArchiveMenu(chatId, accountKeys = null) {
   rows.push([{ text: '⬅️ Menyu', callback_data: 'menu' }]);
   return tg('sendMessage', {
     chat_id: chatId,
-    text: accounts.length ? '🕵️ Arxiv\n\nAkkauntni tanlang.' : '🕵️ Arxiv\n\nSizga biriktirilgan akkaunt yo‘q.',
+    text: accounts.length ? '🗑 O‘chirilgan xabarlar\n\nAkkauntni tanlang.' : '🗑 O‘chirilgan xabarlar\n\nSizga biriktirilgan akkaunt yo‘q.',
     reply_markup: { inline_keyboard: rows }
   });
 }
@@ -4588,7 +4811,7 @@ async function sendAccountStatus(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   });
 }
 
-const TEMPLATE_MENU_KEYS = ['ask_application', 'ask_info', 'known_info_preface', 'unknown_info_preface', 'short_intro', 'full_intro', 'offer_end', 'application_link_reply', 'offer_followup'];
+const TEMPLATE_MENU_KEYS = ['reach_greeting', 'reach_start', 'outreach_start', 'application_confirmation', 'ask_application', 'ask_info', 'known_info_preface', 'unknown_info_preface', 'short_intro', 'full_intro', 'offer_end', 'application_link_reply', 'offer_followup'];
 
 async function sendTemplatesMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const templateKeys = await listAccountTemplateKeys(accountOrKey);
@@ -5674,31 +5897,52 @@ async function sendPlatformArchivePeopleMenu(chatId, accountOrKey = DEFAULT_ACCO
   const account = await getAccount(accountOrKey);
   const people = await getArchivePeople(account.account_key);
   const rows = people.map(p => ([{
-    text: p.from_username ? `@${p.from_username}` : (p.from_first_name || String(p.chat_id)),
-    callback_data: `platform_archp:${account.account_key}:${p.chat_id}`
+    text: p.sender || (p.from_username ? `@${p.from_username}` : (p.from_first_name || String(p.chat_id))),
+    callback_data: `platform_archp:${account.account_key}:${p.id}`
   }]));
   if (!rows.length) rows.push([{ text: 'Hozircha arxiv yo‘q', callback_data: 'platform_noop' }]);
   rows.push([{ text: '⬅️ Akkaunt', callback_data: `platform_account:${account.account_key}` }]);
   return adminTg('sendMessage', {
     chat_id: chatId,
-    text: `🧭 Platform Admin Bot\n\n🕵️ Arxiv\nAkkaunt: ${account.label || account.account_key}`,
+    text: `🧭 Platform Admin Bot\n\n🗑 O‘chirilgan xabarlar\nAkkaunt: ${account.label || account.account_key}`,
     reply_markup: { inline_keyboard: rows }
   });
 }
 
-async function sendPlatformArchivePersonEvents(chatId, accountOrKey, targetChatId) {
+async function sendPlatformArchivePersonEvents(chatId, accountOrKey, profileArchiveId) {
   const account = await getAccount(accountOrKey);
-  const rows = await getArchiveRows('recent', account.account_key, targetChatId, 20);
-  const buttons = rows.map(r => {
-    const d = new Date(r.deleted_at || r.edited_at || r.created_at || Date.now());
-    const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-    return [{ text: `${time} — ${archiveEventLabel(r)}`, callback_data: `platform_archv:${account.account_key}:${r.id}` }];
-  });
-  if (!buttons.length) buttons.push([{ text: 'Bu chatda arxiv topilmadi', callback_data: 'platform_noop' }]);
+  const profile = await getArchiveRowById(account.account_key, profileArchiveId);
+  if (!profile) return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nFoydalanuvchi arxivi topilmadi.' });
+  const rows = await getArchiveRows('deleted', account.account_key, profile.chat_id, 5, profile.business_connection_id);
+  const buttons = rows.map(r => ([{ text: archiveEventButtonText(r), callback_data: `platform_archv:${account.account_key}:${r.id}` }]));
+  if (!buttons.length) buttons.push([{ text: 'Bu foydalanuvchida o‘chirilgan xabar yo‘q', callback_data: 'platform_noop' }]);
+  buttons.push([{ text: 'Hammasini ko‘rish', callback_data: `platform_archall:${account.account_key}:${profile.id}:0` }]);
   buttons.push([{ text: '⬅️ Arxiv', callback_data: `platform_archive:${account.account_key}` }]);
   return adminTg('sendMessage', {
     chat_id: chatId,
-    text: `🧭 Platform Admin Bot\n\n${targetChatId}`,
+    text: `🧭 Platform Admin Bot\n\n${profile.sender || archiveActor(profile)}\n\nO‘chirilgan xabarlar`,
+    reply_markup: { inline_keyboard: buttons }
+  });
+}
+
+async function sendPlatformArchiveAllDeleted(chatId, accountOrKey, profileArchiveId, page = 0) {
+  const account = await getAccount(accountOrKey);
+  const profile = await getArchiveRowById(account.account_key, profileArchiveId);
+  if (!profile) return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nFoydalanuvchi arxivi topilmadi.' });
+  const pageSize = 20;
+  const safePage = Math.max(0, Number(page) || 0);
+  const fetched = await getArchiveRows('deleted', account.account_key, profile.chat_id, pageSize + 1, profile.business_connection_id, safePage * pageSize);
+  const hasNext = fetched.length > pageSize;
+  const rows = fetched.slice(0, pageSize);
+  const buttons = rows.map(r => ([{ text: archiveEventButtonText(r), callback_data: `platform_archv:${account.account_key}:${r.id}` }]));
+  const paging = [];
+  if (safePage > 0) paging.push({ text: '⬅️ Oldingi', callback_data: `platform_archall:${account.account_key}:${profile.id}:${safePage - 1}` });
+  if (hasNext) paging.push({ text: 'Keyingi ➡️', callback_data: `platform_archall:${account.account_key}:${profile.id}:${safePage + 1}` });
+  if (paging.length) buttons.push(paging);
+  buttons.push([{ text: '⬅️ Foydalanuvchi', callback_data: `platform_archp:${account.account_key}:${profile.id}` }]);
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: `🧭 Platform Admin Bot\n\n${profile.sender || archiveActor(profile)}\n\nBarcha o‘chirilgan xabarlar, ${safePage + 1}-sahifa`,
     reply_markup: { inline_keyboard: buttons }
   });
 }
@@ -5719,7 +5963,7 @@ async function sendPlatformArchiveFullDetail(chatId, accountOrKey, archiveId) {
     `Created: ${row.created_at || '-'}\n` +
     `Edited: ${row.edited_at || '-'}\n` +
     `Deleted: ${row.deleted_at || '-'}\n\n` +
-    `${row.text || row.caption || '-'}`;
+    `${archiveStoredContent(row)}`;
   return adminTg('sendMessage', { chat_id: chatId, text: short(text, 3500) });
 }
 
@@ -5770,8 +6014,12 @@ async function handlePlatformCallback(cb) {
   if (data.startsWith('platform_testcommand:')) return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\nTest command:\n/testcommand ${data.split(':')[1]} TEXT` });
   if (data.startsWith('platform_testai:')) return adminTg('sendMessage', { chat_id: chatId, text: `🧭 Platform Admin Bot\n\nTest AI:\n/testai ${data.split(':')[1]} STEP_KEY TEXT` });
   if (data.startsWith('platform_archp:')) {
-    const [, ak, targetChatId] = data.split(':');
-    return sendPlatformArchivePersonEvents(chatId, ak, targetChatId);
+    const [, ak, profileArchiveId] = data.split(':');
+    return sendPlatformArchivePersonEvents(chatId, ak, profileArchiveId);
+  }
+  if (data.startsWith('platform_archall:')) {
+    const [, ak, profileArchiveId, page] = data.split(':');
+    return sendPlatformArchiveAllDeleted(chatId, ak, profileArchiveId, page);
   }
   if (data.startsWith('platform_archv:')) {
     const [, ak, archiveId] = data.split(':');
@@ -6731,10 +6979,16 @@ async function handleCallback(cb) {
     return sendArchivePeopleMenu(chatId, ak);
   }
   if (data.startsWith('archp:')) {
-    const [, ak, targetChatId] = data.split(':');
+    const [, ak, profileArchiveId] = data.split(':');
     if (!accountSetHas(ownedAccountKeys, ak)) return denyAccount();
     await setSelectedAccountKey(chatId, ak, cb.from?.id);
-    return sendArchivePersonEvents(chatId, ak, targetChatId);
+    return sendArchivePersonEvents(chatId, ak, profileArchiveId);
+  }
+  if (data.startsWith('archall:')) {
+    const [, ak, profileArchiveId, page] = data.split(':');
+    if (!accountSetHas(ownedAccountKeys, ak)) return denyAccount();
+    await setSelectedAccountKey(chatId, ak, cb.from?.id);
+    return sendArchiveAllDeleted(chatId, ak, profileArchiveId, page);
   }
   if (data.startsWith('archv:')) {
     const [, ak, archiveId] = data.split(':');
@@ -6994,7 +7248,7 @@ async function setWebhookResponse(req, res, allowedUpdates) {
   }
 }
 
-app.get('/set-webhook', async (req, res) => setWebhookResponse(req, res, BASIC_ALLOWED_UPDATES));
+app.get('/set-webhook', async (req, res) => setWebhookResponse(req, res, FULL_ALLOWED_UPDATES));
 app.get('/set-webhook-basic', async (req, res) => setWebhookResponse(req, res, BASIC_ALLOWED_UPDATES));
 app.get('/set-webhook-full', async (req, res) => setWebhookResponse(req, res, FULL_ALLOWED_UPDATES));
 
