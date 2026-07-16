@@ -427,6 +427,14 @@ alter table business_leads add column if not exists needs_human_reason text;
 alter table business_leads add column if not exists admin_active_until timestamptz;
 alter table business_leads add column if not exists followup_count integer default 0;
 alter table business_leads add column if not exists opted_out boolean default false;
+alter table business_leads add column if not exists campaign_active boolean default false;
+alter table business_leads add column if not exists campaign_started_at timestamptz;
+alter table business_leads add column if not exists campaign_started_by text;
+alter table business_leads add column if not exists campaign_trigger_message_id text;
+alter table business_leads add column if not exists campaign_trigger_text text;
+alter table business_leads add column if not exists campaign_stage text;
+alter table business_leads add column if not exists campaign_completed_at timestamptz;
+alter table business_leads add column if not exists campaign_expired_at timestamptz;
 alter table business_leads add column if not exists processing_lock_until timestamptz;
 alter table business_leads add column if not exists processing_event_id text;
 alter table business_leads add column if not exists last_message_at timestamptz default now();
@@ -736,6 +744,7 @@ create unique index if not exists business_leads_account_chat_unique_idx on busi
 create index if not exists business_leads_account_stage_idx on business_leads(account_key, stage);
 create index if not exists business_leads_account_status_idx on business_leads(account_key, status);
 create index if not exists business_leads_account_outreach_idx on business_leads(account_key, outreach_session_id);
+create index if not exists business_leads_campaign_idx on business_leads(account_key, campaign_active, campaign_stage);
 create index if not exists business_leads_account_reach_idx on business_leads(account_key, reach_sent, assigned_by_admin, manually_started);
 create index if not exists business_leads_processing_lock_idx on business_leads(account_key, processing_lock_until);
 create index if not exists reply_templates_account_idx on reply_templates(account_key);
@@ -894,3 +903,24 @@ on conflict (key) do nothing;
 insert into reply_templates (key, title, body) values
 ('offer_followup', 'Oferta eslatma', 'Tanishib chiqdingizmi? Biz sizni kutyapmiz.')
 on conflict (key) do nothing;
+
+-- Safe campaign backfill:
+-- Do NOT turn every old lead on. Only recently contacted, unfinished active outreach leads remain active.
+update business_leads
+set
+  campaign_active = true,
+  campaign_started_at = coalesce(campaign_started_at, reach_sent_at, outreach_at, updated_at, now()),
+  campaign_started_by = coalesce(campaign_started_by, 'safe_backfill'),
+  campaign_trigger_message_id = coalesce(campaign_trigger_message_id, reach_message_id),
+  campaign_trigger_text = coalesce(campaign_trigger_text, reach_message_text, outreach_message),
+  campaign_stage = coalesce(campaign_stage, stage),
+  bot_enabled_for_lead = true,
+  manual_only = false
+where campaign_active is distinct from true
+  and (reach_sent = true or outreach_sent = true)
+  and coalesce(reach_sent_at, outreach_at, updated_at) >= now() - interval '14 days'
+  and finished_at is null
+  and coalesce(opted_out, false) = false
+  and coalesce(manual_only, false) = false
+  and stage in ('outreach_sent', 'asked_application', 'asked_info', 'pending_approval')
+  and coalesce(status, 'active') not in ('disabled', 'hard_reject', 'manual_control', 'paused', 'info_sent', 'tanishdim', 'payment_near', 'reminder_sent', 'application_link_sent');

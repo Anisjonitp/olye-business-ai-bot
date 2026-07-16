@@ -32,10 +32,10 @@ const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 5000);
 const AUTO_START_REQUIRE_OUTREACH = String(process.env.AUTO_START_REQUIRE_OUTREACH || 'true') === 'true';
 const AUTO_OUTREACH_DEFAULT_HOURS = Number(process.env.AUTO_OUTREACH_DEFAULT_HOURS || 2);
 const OUTREACH_GREETING_REQUIRED = String(process.env.OUTREACH_GREETING_REQUIRED || 'true') === 'true';
-// Agar Telegram scheduled/outgoing xabarni outreach sifatida ko‘rmasa ham,
-// bot mijoz javobidan yoki adminning oxirgi xabaridan vaziyatni aniqlab davom ettiradi.
-const CONTEXT_RESUME_ENABLED = String(process.env.CONTEXT_RESUME_ENABLED || 'true') === 'true';
+// Context resume is allowed only inside explicit active campaigns.
+const CONTEXT_RESUME_ENABLED = String(process.env.CONTEXT_RESUME_ENABLED || 'false') === 'true';
 const CONTEXT_RESUME_FROM_USER_CONFIRM = String(process.env.CONTEXT_RESUME_FROM_USER_CONFIRM || 'true') === 'true';
+const CAMPAIGN_ACTIVE_DAYS = Number(process.env.CAMPAIGN_ACTIVE_DAYS || 14);
 const DAILY_DEFAULT_START = process.env.DAILY_AUTO_START || '07:00';
 const DAILY_DEFAULT_DURATION_HOURS = Number(process.env.DAILY_AUTO_DURATION_HOURS || 2);
 const LOCAL_UTC_OFFSET_HOURS = Number(process.env.LOCAL_UTC_OFFSET_HOURS || 5);
@@ -1094,6 +1094,7 @@ function enrichLeadPayload(patch = {}, existing = null) {
   if (Object.prototype.hasOwnProperty.call(payload, 'stage')) {
     if (!Object.prototype.hasOwnProperty.call(payload, 'current_stage')) payload.current_stage = payload.stage;
     if (!Object.prototype.hasOwnProperty.call(payload, 'previous_stage')) payload.previous_stage = existing?.stage || existing?.current_stage || null;
+    if (!Object.prototype.hasOwnProperty.call(payload, 'campaign_stage')) payload.campaign_stage = payload.stage;
   }
   if (!Object.prototype.hasOwnProperty.call(payload, 'lead_chat_id') && (payload.chat_id || existing?.chat_id)) {
     payload.lead_chat_id = String(payload.chat_id || existing.chat_id);
@@ -1255,6 +1256,29 @@ function leadBotEnabled(lead = {}) {
   return botEnabled && lead.manual_only !== true;
 }
 
+function campaignExpired(lead = {}) {
+  if (!lead?.campaign_active || !lead.campaign_started_at) return false;
+  return Date.now() - new Date(lead.campaign_started_at).getTime() > CAMPAIGN_ACTIVE_DAYS * 86400000;
+}
+
+async function expireCampaignIfNeeded(lead = {}) {
+  if (!campaignExpired(lead)) return lead;
+  return updateLead(lead.chat_id, {
+    campaign_active: false,
+    campaign_expired_at: new Date().toISOString(),
+    bot_enabled: false,
+    bot_enabled_for_lead: false,
+    campaign_active: false,
+    campaign_stage: STAGE.PAUSED,
+    campaign_completed_at: new Date().toISOString(),
+    manual_only: true,
+    status: lead.status === 'active' ? 'manual_control' : lead.status,
+    pause_reason: 'campaign_expired',
+    needs_human: true,
+    needs_human_reason: 'campaign_expired'
+  }, lead.account_key) || lead;
+}
+
 function adminTakeoverActive(lead = {}) {
   if (!lead.admin_active_until) return false;
   return new Date(lead.admin_active_until).getTime() > Date.now();
@@ -1263,6 +1287,8 @@ function adminTakeoverActive(lead = {}) {
 async function canLeadAutoReply(lead = {}, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const account = typeof accountOrKey === 'object' ? normalizeAccount(accountOrKey) : await getAccount(accountOrKey || lead.account_key);
   if (!canAccountAutoReply(account)) return { ok: false, reason: 'account_bot_off' };
+  if (lead.campaign_active !== true) return { ok: false, reason: 'campaign_inactive' };
+  if (campaignExpired(lead)) return { ok: false, reason: 'campaign_expired' };
   if (!leadAssignmentActive(lead)) return { ok: false, reason: 'no_outreach_session' };
   if (!leadBotEnabled(lead)) return { ok: false, reason: 'lead_auto_reply_off' };
   if (!isTestLeadAllowed(lead.chat_id || lead.lead_chat_id) && !isAdminStartedTestAllowed(lead)) return { ok: false, reason: 'test_mode_blocked' };
@@ -1274,6 +1300,9 @@ async function pauseLeadBot(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, actorId 
   const patch = {
     bot_enabled: false,
     bot_enabled_for_lead: false,
+    campaign_active: false,
+    campaign_stage: STAGE.PAUSED,
+    campaign_completed_at: new Date().toISOString(),
     paused_at: new Date().toISOString(),
     paused_by: actorId ? String(actorId) : null,
     pause_reason: reason
@@ -1316,9 +1345,20 @@ async function setLeadManualOnly(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, act
 async function manuallyStartLeadBot(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, actorId = '') {
   const existing = await getLead(chatId, accountOrKey);
   if (!existing) return null;
+  const now = new Date().toISOString();
   const lead = await updateLead(chatId, {
     assigned_by_admin: true,
     manually_started: true,
+    outreach_sent: true,
+    reach_sent: true,
+    outreach_session_id: existing.outreach_session_id || `manual_start_${localDateKey()}_${Date.now()}`,
+    campaign_active: true,
+    campaign_started_at: now,
+    campaign_started_by: actorId ? String(actorId) : 'admin',
+    campaign_trigger_text: 'Admin tugma orqali campaign boshladi',
+    campaign_stage: existing.stage || STAGE.OUTREACH_SENT,
+    campaign_completed_at: null,
+    campaign_expired_at: null,
     bot_enabled: true,
     bot_enabled_for_lead: true,
     manual_only: false,
@@ -1327,7 +1367,7 @@ async function manuallyStartLeadBot(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, 
     pause_reason: null,
     admin_active_until: null
   }, accountOrKey);
-  await writeAuditLog({ accountKey: accountOrKey, chatId, action: 'lead_assigned', oldValue: false, newValue: true, actorType: 'admin', actorId });
+  await writeAuditLog({ accountKey: accountOrKey, chatId, action: 'campaign_started', oldValue: false, newValue: true, actorType: 'admin', actorId });
   return lead;
 }
 
@@ -2285,6 +2325,9 @@ async function finishAfterInfo(lead) {
     status: 'info_sent',
     bot_enabled: false,
     bot_enabled_for_lead: false,
+    campaign_active: false,
+    campaign_stage: STAGE.INFO_SENT_FINISHED,
+    campaign_completed_at: new Date().toISOString(),
     finished_at: new Date().toISOString()
   }, lead.account_key);
   await sendAdmin(
@@ -2321,6 +2364,13 @@ async function resetMeChat({ chatId, businessConnectionId = null, from = null, a
     bot_enabled: true,
     bot_enabled_for_lead: true,
     manual_only: false,
+    campaign_active: true,
+    campaign_started_at: new Date().toISOString(),
+    campaign_started_by: 'resetme',
+    campaign_trigger_text: '/resetme test reset',
+    campaign_stage: STAGE.OUTREACH_SENT,
+    campaign_completed_at: null,
+    campaign_expired_at: null,
     assigned_by_admin: true,
     manually_started: true,
     outreach_sent: true,
@@ -2353,6 +2403,9 @@ async function stopLead(lead, reason = 'stopped') {
     status: reason,
     bot_enabled: false,
     bot_enabled_for_lead: false,
+    campaign_active: false,
+    campaign_stage: STAGE.DISABLED,
+    campaign_completed_at: new Date().toISOString(),
     manual_only: true,
     paused_at: new Date().toISOString(),
     pause_reason: reason,
@@ -2416,15 +2469,31 @@ function isAutoActive(auto) {
 }
 
 function hasActiveOutreachSession(lead, auto) {
-  return Boolean(isAutoActive(auto) && lead?.outreach_sent && lead?.outreach_session_id && lead.outreach_session_id === auto.session_id);
+  return Boolean(isAutoActive(auto) && lead?.campaign_active === true && lead?.outreach_sent && lead?.outreach_session_id && lead.outreach_session_id === auto.session_id);
 }
 
-function looksLikeOutreachGreeting(text = '') {
-  const t = normalize(text);
-  if (!t) return false;
-  if (!t.includes('assalomu') && !t.includes('assalom') && !t.includes('salom')) return false;
-  if (t.includes('maqola tayyor') || t.includes('chek') || t.includes('karta') || t.includes('tolov') || t.includes('to‘lov')) return false;
-  return t.includes('yaxshimisiz') || t.includes('qalaysiz') || t.includes('yaxshilarmi') || t.length < 110;
+function normalizeOutreachText(text = '') {
+  return normalize(text)
+    .replace(/[“”"'.!?,:;()\-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isGenericGreetingOnly(text = '') {
+  const t = normalizeOutreachText(text);
+  return ['assalomu alaykum', 'assalom', 'salom', 'yaxshimisiz', 'va alaykum assalom', 'valaykum assalom'].includes(t);
+}
+
+async function isOutreachStartMessage({ accountKey, messageText, explicitStart = false }) {
+  if (explicitStart) return true;
+  if (!messageText || isGenericGreetingOnly(messageText)) return false;
+  const reachText = await getReachStartTemplate(accountKey);
+  const templates = [
+    reachText,
+    await getTemplate('reach_greeting', accountKey),
+    await getTemplate('application_confirmation', accountKey)
+  ].filter(Boolean).map(normalizeOutreachText);
+  return templates.includes(normalizeOutreachText(messageText));
 }
 
 async function markOutreach({ chatId, businessConnectionId, from, text, messageId = null, accountKey = DEFAULT_ACCOUNT_KEY }) {
@@ -2439,9 +2508,13 @@ async function markOutreach({ chatId, businessConnectionId, from, text, messageI
   }
   const auto = await getAutoOutreach(accountKey);
   if (!isAutoActive(auto)) return false;
-  if (OUTREACH_GREETING_REQUIRED && !looksLikeOutreachGreeting(text)) return false;
+  if (!(await isOutreachStartMessage({ accountKey, messageText: text }))) {
+    await logEvent(chatId, 'manual_admin_message_not_outreach', text || '[media]', accountKey);
+    return false;
+  }
 
   const existing = await getLead(chatId, accountKey);
+  const now = new Date().toISOString();
   const patch = {
     account_key: accountKey,
     business_connection_id: businessConnectionId || existing?.business_connection_id || null,
@@ -2457,13 +2530,21 @@ async function markOutreach({ chatId, businessConnectionId, from, text, messageI
     assigned_by_reach: true,
     assigned_by_admin: false,
     manually_started: false,
+    campaign_active: true,
+    campaign_started_at: now,
+    campaign_started_by: from?.id ? String(from.id) : 'outreach_template',
+    campaign_trigger_message_id: messageId ? String(messageId) : null,
+    campaign_trigger_text: text,
+    campaign_stage: STAGE.OUTREACH_SENT,
+    campaign_completed_at: null,
+    campaign_expired_at: null,
     outreach_session_id: auto.session_id,
     outreach_message: text,
     reach_message_text: text,
     reach_message_id: messageId ? String(messageId) : null,
     reach_batch_id: auto.session_id,
-    outreach_at: new Date().toISOString(),
-    reach_sent_at: new Date().toISOString(),
+    outreach_at: now,
+    reach_sent_at: now,
     last_admin_message: text,
     first_admin_message: existing?.first_admin_message || text,
     first_admin_message_at: existing?.first_admin_message_at || new Date().toISOString(),
@@ -2534,13 +2615,8 @@ async function markManualBusinessReach({ chatId, businessConnectionId, leadProfi
   const now = new Date().toISOString();
   const sentAt = messageDate || now;
   const contextStage = detectAdminBusinessContextStage(adminText);
-  const pausedOrFinished = leadWasPausedOrFinished(existing);
-  const terminalContext = adminBusinessContextStopsBot(contextStage);
-  const stage = pausedOrFinished ? (existing.stage || STAGE.PAUSED) : stageForAdminBusinessContext(contextStage);
-  const shouldEnableBot = !pausedOrFinished && !terminalContext;
-  const status = pausedOrFinished
-    ? (existing.status || 'manual_control')
-    : (terminalContext ? (contextStage === 'payment' || contextStage === 'price' ? 'payment_near' : 'needs_admin') : 'active');
+  const stage = existing?.stage || STAGE.NEW;
+  const status = existing?.status || 'manual_control';
   const patch = {
     account_key: accountKey,
     chat_id: String(chatId),
@@ -2551,37 +2627,20 @@ async function markManualBusinessReach({ chatId, businessConnectionId, leadProfi
     status,
     stage,
     current_stage: contextStage,
-    bot_enabled: shouldEnableBot,
-    bot_enabled_for_lead: shouldEnableBot,
-    manual_only: !shouldEnableBot,
-    outreach_sent: true,
-    reach_sent: true,
-    assigned_by_reach: true,
-    assigned_by_admin: true,
-    manually_started: true,
-    outreach_session_id: existing?.outreach_session_id || `manual_business_${localDateKey()}_${String(messageId || Date.now())}`,
-    outreach_message: adminText,
-    reach_message_text: adminText,
-    reach_message_id: messageId ? String(messageId) : null,
-    reach_batch_id: `manual_business_${localDateKey()}`,
-    outreach_at: existing?.outreach_at || sentAt,
-    reach_sent_at: existing?.reach_sent_at || sentAt,
+    bot_enabled: existing?.bot_enabled ?? false,
+    bot_enabled_for_lead: existing?.bot_enabled_for_lead ?? false,
+    manual_only: existing?.manual_only ?? true,
+    campaign_active: existing?.campaign_active ?? false,
     first_admin_message: existing?.first_admin_message || adminText,
     first_admin_message_at: existing?.first_admin_message_at || sentAt,
     last_admin_message: adminText,
     last_admin_message_at: sentAt,
     last_actor: 'admin',
     last_message_at: sentAt,
-    admin_active_until: null,
-    needs_human: terminalContext || pausedOrFinished ? true : false,
-    needs_human_reason: terminalContext ? `admin_context_${contextStage}` : (pausedOrFinished ? (existing?.needs_human_reason || 'lead_paused_or_finished') : null),
-    finished_at: terminalContext ? (existing?.finished_at || sentAt) : (pausedOrFinished ? (existing?.finished_at || null) : null)
+    admin_active_until: new Date(Date.now() + ADMIN_TAKEOVER_MINUTES * 60000).toISOString(),
+    needs_human: true,
+    needs_human_reason: existing?.needs_human_reason || 'manual_admin_message'
   };
-  if (shouldEnableBot) {
-    patch.paused_at = null;
-    patch.paused_by = null;
-    patch.pause_reason = null;
-  }
 
   let lead = existing;
   if (!lead) {
@@ -2592,18 +2651,18 @@ async function markManualBusinessReach({ chatId, businessConnectionId, leadProfi
       text: '',
       stage,
       status,
-      botEnabled: shouldEnableBot,
+      botEnabled: false,
       accountKey
     });
   }
   lead = await updateLead(chatId, patch, accountKey) || lead;
-  await logEvent(chatId, edited ? 'admin_business_reach_edited' : `admin_business_reach_${contextStage}`, adminText, accountKey);
+  await logEvent(chatId, edited ? 'manual_admin_message_edited' : 'manual_admin_message', adminText, accountKey);
   await writeAuditLog({
     accountKey,
     chatId,
-    action: edited ? 'admin_reach_edited' : 'admin_reach_started',
+    action: edited ? 'manual_admin_message_edited' : 'manual_admin_message',
     oldValue: existing ? { stage: existing.stage, current_stage: existing.current_stage, bot_enabled_for_lead: existing.bot_enabled_for_lead } : null,
-    newValue: { stage, current_stage: contextStage, message_id: messageId, bot_enabled_for_lead: shouldEnableBot },
+    newValue: { stage, current_stage: contextStage, message_id: messageId, campaign_active: patch.campaign_active },
     actorType: 'admin',
     actorId: adminUser?.id
   });
@@ -2635,7 +2694,6 @@ function detectAdminPromptStage(text = '') {
 
 async function syncAdminContext({ chatId, businessConnectionId, from, text, accountKey = DEFAULT_ACCOUNT_KEY, adminTakeover = true }) {
   const existing = await getLead(chatId, accountKey);
-  const detectedStage = detectAdminPromptStage(text);
   const now = new Date().toISOString();
   const activeUntil = adminTakeover ? new Date(Date.now() + ADMIN_TAKEOVER_MINUTES * 60000).toISOString() : null;
   const basePatch = {
@@ -2652,46 +2710,21 @@ async function syncAdminContext({ chatId, businessConnectionId, from, text, acco
     last_message_at: now
   };
 
-  if (!detectedStage) {
-    if (existing) await updateLead(chatId, basePatch, accountKey);
-    else {
-      await createLead({ chatId, businessConnectionId, from, text, stage: STAGE.NEW, status: 'active', botEnabled: false, accountKey });
-      await updateLead(chatId, {
-        ...basePatch,
-        bot_enabled: false,
-        bot_enabled_for_lead: false,
-        manual_only: true,
-        assigned_by_admin: true,
-        needs_human: true,
-        needs_human_reason: 'admin_manual_context'
-      }, accountKey);
-    }
-    await logEvent(chatId, 'admin_context_saved', text || '[media]', accountKey);
-    await writeAuditLog({ accountKey, chatId, action: 'lead_assigned', newValue: 'manual_context', actorType: 'admin', actorId: from?.id });
-    return;
-  }
-
-  const patch = {
-    ...basePatch,
-    stage: detectedStage,
-    status: detectedStage === STAGE.INFO_SENT_FINISHED ? 'info_sent' : 'active',
-    bot_enabled: detectedStage !== STAGE.INFO_SENT_FINISHED,
-    bot_enabled_for_lead: detectedStage !== STAGE.INFO_SENT_FINISHED,
-    manual_only: detectedStage === STAGE.INFO_SENT_FINISHED,
-    assigned_by_admin: true,
-    outreach_session_id: existing?.outreach_session_id || `admin_context_${localDateKey()}_${Date.now()}`,
-    outreach_message: text || '[admin prompt]',
-    outreach_at: existing?.outreach_at || new Date().toISOString(),
-    finished_at: detectedStage === STAGE.INFO_SENT_FINISHED ? (existing?.finished_at || new Date().toISOString()) : null
-  };
-
-  if (existing) await updateLead(chatId, patch, accountKey);
+  if (existing) await updateLead(chatId, basePatch, accountKey);
   else {
-    await createLead({ chatId, businessConnectionId, from, text, stage: detectedStage, status: patch.status, botEnabled: patch.bot_enabled, accountKey });
-    await updateLead(chatId, patch, accountKey);
+    await createLead({ chatId, businessConnectionId, from, text, stage: STAGE.NEW, status: 'manual_control', botEnabled: false, accountKey });
+    await updateLead(chatId, {
+      ...basePatch,
+      bot_enabled: false,
+      bot_enabled_for_lead: false,
+      manual_only: true,
+      campaign_active: false,
+      needs_human: true,
+      needs_human_reason: 'manual_admin_message'
+    }, accountKey);
   }
-  await logEvent(chatId, `admin_context_stage_${detectedStage}`, text || '[media]', accountKey);
-  await writeAuditLog({ accountKey, chatId, action: 'lead_assigned', newValue: detectedStage, actorType: 'admin', actorId: from?.id });
+  await logEvent(chatId, 'manual_admin_message', text || '[media]', accountKey);
+  await writeAuditLog({ accountKey, chatId, action: 'manual_admin_message', newValue: 'history_only', actorType: 'admin', actorId: from?.id });
 }
 
 function strongUserApplicationAnswer(text = '') {
@@ -2708,6 +2741,7 @@ function strongUserApplicationAnswer(text = '') {
 
 async function tryResumeFromContext(lead, text) {
   if (!CONTEXT_RESUME_ENABLED || !lead) return { handled: false, lead };
+  if (lead.campaign_active !== true) return { handled: false, lead };
   const lastAdminStage = detectAdminPromptStage(lead.last_admin_message || '');
   let assumedStage = lastAdminStage;
   let reason = lastAdminStage ? 'last_admin_message' : '';
@@ -3560,6 +3594,7 @@ async function handleBusinessMessage(msg, options = {}) {
   }
   let lead = await upsertLeadBase({ chatId, businessConnectionId, from: msg.from, text: rawText, accountKey: ak });
   if (!lead) return;
+  lead = await expireCampaignIfNeeded(lead);
 
   if (lead.stage === STAGE.INFO_SENT_FINISHED) {
     await logIgnore(chatId, 'old_finished_chat', rawText, ak);
@@ -3638,6 +3673,11 @@ async function handlePostFinishSignal(lead, msg, rawText) {
     patch.status = 'disabled';
     patch.stage = STAGE.DISABLED;
     patch.bot_enabled = false;
+    patch.bot_enabled_for_lead = false;
+    patch.campaign_active = false;
+    patch.campaign_stage = STAGE.DISABLED;
+    patch.campaign_completed_at = new Date().toISOString();
+    patch.pause_reason = 'hard_reject_after_info';
   }
   await updateLead(lead.chat_id, patch, lead.account_key);
   await logEvent(lead.chat_id, `post_finish_${intent}`, text || '[media]', lead.account_key);
@@ -4016,6 +4056,14 @@ async function executeReachStart(chatId, telegramUserId) {
         bot_enabled: true,
         bot_enabled_for_lead: true,
         manual_only: false,
+        campaign_active: true,
+        campaign_started_at: new Date().toISOString(),
+        campaign_started_by: telegramUserId ? String(telegramUserId) : 'reach_start',
+        campaign_trigger_message_id: result?.message_id ? String(result.message_id) : null,
+        campaign_trigger_text: reachText,
+        campaign_stage: STAGE.OUTREACH_SENT,
+        campaign_completed_at: null,
+        campaign_expired_at: null,
         reach_sent: true,
         outreach_sent: true,
         assigned_by_reach: true,
@@ -5465,6 +5513,9 @@ const COMMAND_ALIASES_UZ = new Map(Object.entries({
   '/arxivyo_debug': '/archive_route_debug',
   '/arxivyoldebug': '/archive_route_debug',
   '/testxabar': '/testnotify',
+  '/lidboshlash': '/lead_start',
+  '/lidstop': '/lead_stop',
+  '/liddebug': '/lead_debug',
   '/shablonol': '/gettemplate',
   '/shablonsozla': '/settemplate',
   '/lidochir': '/leadsoff',
@@ -5755,6 +5806,41 @@ async function handleAdminMessage(msg) {
       return sendLeadDebug(chatId, from.id, maybeAccount.account_key, parts[2]);
     }
     return sendLeadDebug(chatId, from.id, selectedAccountKey, parts[1]);
+  }
+  if (text.startsWith('/lead_start ')) {
+    const parts = text.split(/\s+/).filter(Boolean);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return commandManagementDenied(chatId);
+    const targetChatId = parts[parsed.nextIndex];
+    if (!targetChatId) return tg('sendMessage', { chat_id: chatId, text: 'Format: /lead_start CHAT_ID yoki /lead_start ACCOUNT_KEY CHAT_ID' });
+    await setSelectedAccountKey(chatId, parsed.accountKey, from.id);
+    return tg('sendMessage', {
+      chat_id: chatId,
+      text: `Bu lid uchun yangi ensiklopediya suhbatini boshlaysizmi?\n\nAkkaunt: ${parsed.accountKey}\nChat ID: ${targetChatId}`,
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '✅ Ha, boshlash', callback_data: `lead_start:${targetChatId}` },
+          { text: '❌ Bekor qilish', callback_data: 'menu' }
+        ]]
+      }
+    });
+  }
+  if (text.startsWith('/lead_stop ')) {
+    const parts = text.split(/\s+/).filter(Boolean);
+    const parsed = await parseOptionalAccountArg(parts, selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return commandManagementDenied(chatId);
+    const targetChatId = parts[parsed.nextIndex];
+    if (!targetChatId) return tg('sendMessage', { chat_id: chatId, text: 'Format: /lead_stop CHAT_ID yoki /lead_stop ACCOUNT_KEY CHAT_ID' });
+    const lead = await setLeadManualOnly(targetChatId, parsed.accountKey, from.id);
+    if (lead) {
+      await updateLead(targetChatId, {
+        campaign_active: false,
+        campaign_stage: lead.stage || null,
+        campaign_completed_at: new Date().toISOString(),
+        campaign_expired_at: null
+      }, parsed.accountKey);
+    }
+    return tg('sendMessage', { chat_id: chatId, text: lead ? `⛔ Campaign to‘xtatildi: ${parsed.accountKey}/${targetChatId}` : 'Lid topilmadi.' });
   }
   if (text === '/reach_start' || text.startsWith('/reach_start ')) {
     const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey, 1, ownedAccountKeys);
@@ -6295,6 +6381,15 @@ async function handleAdminMessage(msg) {
       manual_only: false,
       assigned_by_admin: true,
       manually_started: true,
+      outreach_sent: true,
+      reach_sent: true,
+      campaign_active: true,
+      campaign_started_at: new Date().toISOString(),
+      campaign_started_by: from.id ? String(from.id) : 'reset',
+      campaign_trigger_text: '/reset',
+      campaign_stage: STAGE.OUTREACH_SENT,
+      campaign_completed_at: null,
+      campaign_expired_at: null,
       finished_at: null,
       admin_active_until: null
     }, selectedAccountKey);
@@ -6846,7 +6941,8 @@ async function handleCallback(cb) {
 async function leadCardText(lead) {
   const auto = await getAutoOutreach(lead.account_key);
   const lastIgnore = await getLastIgnoreReason(lead.chat_id, lead.account_key);
-  return `👤 Lid\nAkkaunt: ${lead.account_key || DEFAULT_ACCOUNT_KEY}\nIsm: ${lead.first_name || '-'}\nUsername: ${lead.username ? '@' + lead.username : '-'}\nChat ID: ${lead.chat_id}\nAuto Reply: ${isAutoActive(auto) ? 'ON' : 'OFF'}\nActive session: ${auto?.session_id || '-'}\nReach sent: ${lead.reach_sent || lead.outreach_sent ? 'true' : 'false'}\nReach text: ${short(lead.reach_message_text || lead.outreach_message || '-', 120)}\nAssigned by admin: ${lead.assigned_by_admin ? 'true' : 'false'}\nManually started: ${lead.manually_started ? 'true' : 'false'}\nStatus: ${lead.status}\nStage: ${lead.stage || lead.current_stage || '-'}\nBot enabled: ${leadBotEnabled(lead) ? 'true' : 'false'}\nManual only: ${lead.manual_only ? 'true' : 'false'}\nLast intent: ${lead.last_intent || '-'} ${lead.last_intent_confidence != null ? `(${lead.last_intent_confidence})` : ''}\nNeeds human: ${lead.needs_human ? 'true' : 'false'}\nLast user message: ${lead.last_customer_message || lead.last_user_message || '-'}\nLast admin message: ${lead.last_admin_message || '-'}\nLast bot message: ${lead.last_bot_message || '-'}\nLast ignore reason: ${lastIgnore ? `${lastIgnore.event_type} (${lastIgnore.created_at})` : '-'}`;
+  const allowed = await canLeadAutoReply(lead, lead.account_key);
+  return `👤 Lid\nAkkaunt: ${lead.account_key || DEFAULT_ACCOUNT_KEY}\nIsm: ${lead.first_name || '-'}\nUsername: ${lead.username ? '@' + lead.username : '-'}\nChat ID: ${lead.chat_id}\nAuto Reply: ${isAutoActive(auto) ? 'ON' : 'OFF'}\nActive session: ${auto?.session_id || '-'}\nReach sent: ${lead.reach_sent || lead.outreach_sent ? 'true' : 'false'}\nReach text: ${short(lead.reach_message_text || lead.outreach_message || '-', 120)}\nAssigned by admin: ${lead.assigned_by_admin ? 'true' : 'false'}\nManually started: ${lead.manually_started ? 'true' : 'false'}\nCampaign active: ${lead.campaign_active ? 'true' : 'false'}\nCampaign started at: ${lead.campaign_started_at || '-'}\nCampaign started by: ${lead.campaign_started_by || '-'}\nCampaign trigger text: ${short(lead.campaign_trigger_text || '-', 120)}\nCampaign stage: ${lead.campaign_stage || '-'}\nCampaign expired at: ${lead.campaign_expired_at || '-'}\nCan auto reply: ${allowed.ok ? 'true' : 'false'}\nBlock reason: ${allowed.reason || '-'}\nStatus: ${lead.status}\nStage: ${lead.stage || lead.current_stage || '-'}\nBot enabled: ${leadBotEnabled(lead) ? 'true' : 'false'}\nManual only: ${lead.manual_only ? 'true' : 'false'}\nLast intent: ${lead.last_intent || '-'} ${lead.last_intent_confidence != null ? `(${lead.last_intent_confidence})` : ''}\nNeeds human: ${lead.needs_human ? 'true' : 'false'}\nLast user message: ${lead.last_customer_message || lead.last_user_message || '-'}\nLast admin message: ${lead.last_admin_message || '-'}\nLast bot message: ${lead.last_bot_message || '-'}\nLast ignore reason: ${lastIgnore ? `${lastIgnore.event_type} (${lastIgnore.created_at})` : '-'}`;
 }
 
 async function sendLeadStatus(chatId, lead) {
