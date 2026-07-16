@@ -55,9 +55,29 @@ FLOW_BUILDER_ENABLED=false
 SUBSCRIPTION_ENFORCEMENT_ENABLED=false
 SAAS_TEST_USER_IDS=
 PLATFORM_SUPER_ADMIN_IDS=
+TRIAL_DAYS=3
+PLATFORM_SUPPORT_CONTACT=
 ```
 
 Bu flaglar `false` bo‘lsa, mavjud UZLYE va ikkinchi account eski `account_key` routing, template, flow, lead va timer oqimida ishlashda davom etadi. PHASE 1 migration mavjud accountlarni internal workspace sifatida bog‘laydi, ammo runtime oqimini yangi subscription qoidalariga o‘tkazmaydi.
+
+### PHASE 2: trial, PRO va subscription guard
+
+Supabase SQL Editor’da avval `migrations/20260716_phase2_subscriptions.sql` migrationini bir marta Run qiling. Migration mavjud `subscriptions` va `subscription_payments` jadvallarini xavfsiz kengaytiradi, trial grant tarixi va admin interaction sessionlarini qo‘shadi. UZLYE hamda ikkinchi amaldagi account `is_platform_internal=true`, `status=pro`, `subscription_ends_at=null` holatida qoladi.
+
+Production rollout uchun avval kodni flaglar o‘chiq holatda deploy qiling. Migration va Admin Bot tarif amallari tekshirilgach test muhitida quyidagilar yoqiladi:
+
+```text
+SAAS_PLATFORM_ENABLED=true
+SUBSCRIPTION_ENFORCEMENT_ENABLED=true
+TRIAL_DAYS=3
+```
+
+`canWorkspaceAutomate()` incoming auto-reply, reach campaign, manual campaign start, timer, follow-up, sequence va AI oldidan subscriptionni qayta tekshiradi. Oddiy workspace faqat muddati tugamagan `trial` yoki `pro` holatida ishlaydi; expired holatda `subscription_expired` yoziladi. Arxiv ma’lumotlari o‘chirilmaydi va owner menyusi ochiq qoladi.
+
+Admin Botda `/subscriptions`, `/trials`, `/pros`, `/expired` va `/subscription ACCOUNT_KEY` buyruqlari mavjud. `💎 PRO qilish` oqimida 30/90/180/365 kun yoki muddatsiz internal access tanlanadi, summa sifatida `0` ham qabul qilinadi, ixtiyoriy izohdan keyin tasdiq so‘raladi. PRO faollashtirish va muddat qo‘shish payment yozuvi hamda platform audit yaratadi.
+
+Public botdagi `💎 Tarif` tugmasi workspace planini, statusini, trial/PRO tugash vaqtini va qolgan muddatni ko‘rsatadi. Scheduler trial tugashiga 24 soat, 6 soat qolganda va trial tugaganda notificationni faqat bir marta yuboradi.
 
 Muhim test-mode sozlamalari:
 

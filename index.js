@@ -53,6 +53,8 @@ const FLOW_BUILDER_ENABLED = String(process.env.FLOW_BUILDER_ENABLED || 'false')
 const SUBSCRIPTION_ENFORCEMENT_ENABLED = String(process.env.SUBSCRIPTION_ENFORCEMENT_ENABLED || 'false') === 'true';
 const SAAS_TEST_USER_IDS = envIdSet(process.env.SAAS_TEST_USER_IDS || '');
 const PLATFORM_SUPER_ADMIN_IDS = envIdSet(process.env.PLATFORM_SUPER_ADMIN_IDS || process.env.PLATFORM_OWNER_IDS || '');
+const TRIAL_DAYS = Math.max(1, Number(process.env.TRIAL_DAYS || 3));
+const PLATFORM_SUPPORT_CONTACT = process.env.PLATFORM_SUPPORT_CONTACT || '';
 const AI_INTENT_ENABLED = String(process.env.AI_INTENT_ENABLED || 'true') === 'true';
 const AI_TEMPLATE_EDITOR_ENABLED = String(process.env.AI_TEMPLATE_EDITOR_ENABLED || 'true') === 'true';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
@@ -102,7 +104,16 @@ const IGNORE_REASONS = [
   'old_finished_chat',
   'blocked_stage',
   'duplicate_message',
-  'context_resume_not_detected'
+  'context_resume_not_detected',
+  'subscription_pending',
+  'subscription_expired',
+  'subscription_suspended',
+  'subscription_blocked',
+  'subscription_cancelled',
+  'subscription_context_missing',
+  'workspace_suspended',
+  'workspace_blocked',
+  'business_account_disconnected'
 ];
 const buffers = new Map();
 let schedulerBusy = false;
@@ -434,6 +445,136 @@ function canManageSubscription(context = {}) {
 
 function canOperateLeads(context = {}) {
   return Boolean(context.is_platform_super_admin || context.permissions?.includes('leads:operate'));
+}
+
+function subscriptionResultRow(data) {
+  return Array.isArray(data) ? (data[0] || null) : (data || null);
+}
+
+function subscriptionExpiryAt(subscription = {}) {
+  if (subscription.status === 'trial') return subscription.trial_ends_at || null;
+  if (subscription.status === 'pro') return subscription.subscription_ends_at || null;
+  return null;
+}
+
+function subscriptionIsInternal(context = {}) {
+  return context.workspace?.is_platform_internal === true || context.subscription?.is_platform_internal === true;
+}
+
+async function expireSubscriptionIfDue(context = {}, source = 'automation_guard') {
+  const subscription = context.subscription;
+  if (!subscription?.id || subscriptionIsInternal(context)) return subscription || null;
+  if (!['trial', 'pro'].includes(subscription.status)) return subscription;
+  const expiryAt = subscriptionExpiryAt(subscription);
+  if (!expiryAt || new Date(expiryAt).getTime() > Date.now()) return subscription;
+
+  const now = new Date().toISOString();
+  let updateQuery = supabase.from('subscriptions')
+    .update({
+      status: 'expired',
+      status_reason: subscription.status === 'trial' ? 'trial_expired' : 'pro_expired',
+      last_status_changed_at: now,
+      last_expired_at: now,
+      updated_at: now
+    })
+    .eq('id', subscription.id)
+    .eq('status', subscription.status);
+  updateQuery = subscription.status === 'trial'
+    ? updateQuery.lte('trial_ends_at', now)
+    : updateQuery.lte('subscription_ends_at', now);
+  const { data, error } = await updateQuery
+    .select('*')
+    .maybeSingle();
+  if (error) {
+    console.error('[SUBSCRIPTION] expire:', error.message);
+    return { ...subscription, status: 'expired', status_reason: 'subscription_expired' };
+  }
+  let expired = data || null;
+  if (!expired) {
+    const { data: latest } = await supabase.from('subscriptions').select('*').eq('id', subscription.id).maybeSingle();
+    expired = latest || subscription;
+  }
+  if (data) {
+    await logPlatformAudit({
+      action: subscription.status === 'trial' ? 'trial_expired' : 'pro_expired',
+      targetAccountKey: context.canonical_account_key,
+      workspaceId: context.workspace_id,
+      accountId: context.account_id,
+      actorRole: 'system',
+      entityType: 'subscription',
+      entityId: subscription.id,
+      beforeJson: { status: subscription.status, expires_at: expiryAt },
+      afterJson: { status: 'expired', source }
+    });
+  }
+  return expired;
+}
+
+async function rememberSubscriptionBlock(context = {}, reason = '') {
+  if (!context.account_id || !reason) return;
+  const { error } = await supabase.from('workspace_business_accounts')
+    .update({
+      last_subscription_block_reason: reason,
+      last_subscription_blocked_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', context.account_id);
+  if (error && !isMissingTableError(error)) console.error('[SUBSCRIPTION] block reason:', error.message);
+}
+
+async function canWorkspaceAutomate({ accountOrKey = DEFAULT_ACCOUNT_KEY, businessConnectionId = '', action = 'automation' } = {}) {
+  if (!SAAS_PLATFORM_ENABLED || !SUBSCRIPTION_ENFORCEMENT_ENABLED) {
+    return { ok: true, reason: 'subscription_enforcement_disabled', context: null };
+  }
+
+  const context = await resolveTenantContext({
+    accountKey: accountKey(accountOrKey),
+    businessConnectionId
+  });
+  if (!context.workspace_id || !context.account_id) {
+    return { ok: false, reason: 'subscription_context_missing', context };
+  }
+
+  const workspaceStatus = String(context.workspace?.status || 'active').toLowerCase();
+  if (workspaceStatus === 'blocked') {
+    await rememberSubscriptionBlock(context, 'workspace_blocked');
+    return { ok: false, reason: 'workspace_blocked', context };
+  }
+  if (workspaceStatus !== 'active') {
+    await rememberSubscriptionBlock(context, 'workspace_suspended');
+    return { ok: false, reason: 'workspace_suspended', context };
+  }
+
+  const businessStatus = String(context.workspaceAccount?.status || 'pending').toLowerCase();
+  if (['disconnected', 'revoked', 'error'].includes(businessStatus) || (businessStatus !== 'connected' && !subscriptionIsInternal(context))) {
+    await rememberSubscriptionBlock(context, 'business_account_disconnected');
+    return { ok: false, reason: 'business_account_disconnected', context };
+  }
+
+  const subscription = await expireSubscriptionIfDue(context, action);
+  context.subscription = subscription;
+  const status = String(subscription?.status || 'pending').toLowerCase();
+
+  if (subscriptionIsInternal(context) && status === 'pro') {
+    return { ok: true, reason: 'platform_internal', context };
+  }
+  if (status === 'trial' && subscription?.trial_ends_at && new Date(subscription.trial_ends_at).getTime() > Date.now()) {
+    return { ok: true, reason: 'trial_active', context };
+  }
+  if (status === 'pro' && (!subscription?.subscription_ends_at || new Date(subscription.subscription_ends_at).getTime() > Date.now())) {
+    return { ok: true, reason: 'pro_active', context };
+  }
+
+  const reasonByStatus = {
+    expired: 'subscription_expired',
+    suspended: 'subscription_suspended',
+    blocked: 'subscription_blocked',
+    cancelled: 'subscription_cancelled',
+    pending: 'subscription_pending'
+  };
+  const reason = reasonByStatus[status] || 'subscription_pending';
+  await rememberSubscriptionBlock(context, reason);
+  return { ok: false, reason, context };
 }
 
 function commandManagementTargetAccountKey(accountOrKey = DEFAULT_ACCOUNT_KEY) {
@@ -1042,9 +1183,22 @@ function isSaasTester(telegramUserId) {
   return SAAS_TEST_USER_IDS.size > 0 && SAAS_TEST_USER_IDS.has(String(telegramUserId || '').trim());
 }
 
-async function logPlatformAudit({ adminUserId, adminUsername, action, targetAccountKey, beforeJson, afterJson }) {
+async function logPlatformAudit({
+  adminUserId,
+  adminUsername,
+  action,
+  targetAccountKey,
+  beforeJson,
+  afterJson,
+  workspaceId,
+  accountId,
+  actorUserId,
+  actorRole,
+  entityType,
+  entityId
+}) {
   try {
-    await supabase.from('platform_audit_logs').insert({
+    const payload = {
       admin_user_id: String(adminUserId || ''),
       admin_username: String(adminUsername || ''),
       action: String(action || ''),
@@ -1052,7 +1206,15 @@ async function logPlatformAudit({ adminUserId, adminUsername, action, targetAcco
       before_json: beforeJson || {},
       after_json: afterJson || {},
       created_at: new Date().toISOString()
-    });
+    };
+    if (workspaceId) payload.workspace_id = workspaceId;
+    if (accountId) payload.account_id = accountId;
+    if (actorUserId) payload.actor_user_id = actorUserId;
+    if (actorRole) payload.actor_role = actorRole;
+    if (entityType) payload.entity_type = entityType;
+    if (entityId) payload.entity_id = String(entityId);
+    const { error } = await supabase.from('platform_audit_logs').insert(payload);
+    if (error) console.error('logPlatformAudit:', error.message);
   } catch (err) {
     console.error('logPlatformAudit:', err.message);
   }
@@ -1414,6 +1576,12 @@ function adminTakeoverActive(lead = {}) {
 async function canLeadAutoReply(lead = {}, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const account = typeof accountOrKey === 'object' ? normalizeAccount(accountOrKey) : await getAccount(accountOrKey || lead.account_key);
   if (!canAccountAutoReply(account)) return { ok: false, reason: 'account_bot_off' };
+  const subscriptionAccess = await canWorkspaceAutomate({
+    accountOrKey: account,
+    businessConnectionId: lead.business_connection_id || account.business_connection_id,
+    action: 'lead_auto_reply'
+  });
+  if (!subscriptionAccess.ok) return subscriptionAccess;
   if (lead.campaign_active !== true) return { ok: false, reason: 'campaign_inactive' };
   if (campaignExpired(lead)) return { ok: false, reason: 'campaign_expired' };
   if (!leadAssignmentActive(lead)) return { ok: false, reason: 'no_outreach_session' };
@@ -1472,6 +1640,15 @@ async function setLeadManualOnly(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, act
 async function manuallyStartLeadBot(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, actorId = '') {
   const existing = await getLead(chatId, accountOrKey);
   if (!existing) return null;
+  const subscriptionAccess = await canWorkspaceAutomate({
+    accountOrKey,
+    businessConnectionId: existing.business_connection_id,
+    action: 'manual_campaign_start'
+  });
+  if (!subscriptionAccess.ok) {
+    await logIgnore(chatId, subscriptionAccess.reason, 'manual_campaign_start', accountOrKey);
+    return { ...existing, automation_block_reason: subscriptionAccess.reason };
+  }
   const now = new Date().toISOString();
   const lead = await updateLead(chatId, {
     assigned_by_admin: true,
@@ -2639,6 +2816,15 @@ async function enableAutoOutreach(hours, source = 'manual', accountOrKey = DEFAU
     await logEvent('system', 'reach_off', `auto outreach start skipped: ${source}`, ak);
     return { enabled: false, account_key: ak, reason: 'reach_off', source, disabled_at: Date.now() };
   }
+  const subscriptionAccess = await canWorkspaceAutomate({
+    accountOrKey: account,
+    businessConnectionId: account.business_connection_id,
+    action: 'auto_outreach_start'
+  });
+  if (!subscriptionAccess.ok) {
+    await logEvent('system', subscriptionAccess.reason, `auto outreach start skipped: ${source}`, ak);
+    return { enabled: false, account_key: ak, reason: subscriptionAccess.reason, source, disabled_at: Date.now() };
+  }
   const now = Date.now();
   const until = now + hours * 60 * 60 * 1000;
   const sessionId = `outreach_${ak}_${localDateKey()}_${now}`;
@@ -2693,6 +2879,15 @@ async function markOutreach({ chatId, businessConnectionId, from, text, messageI
   const account = await getAccount(accountKey);
   if (!canAccountReach(account)) {
     await logIgnore(chatId, 'reach_off', text, account.account_key);
+    return false;
+  }
+  const subscriptionAccess = await canWorkspaceAutomate({
+    accountOrKey: account,
+    businessConnectionId,
+    action: 'scheduled_reach'
+  });
+  if (!subscriptionAccess.ok) {
+    await logIgnore(chatId, subscriptionAccess.reason, text, account.account_key);
     return false;
   }
   if (!isTestLeadAllowed(chatId)) {
@@ -2914,25 +3109,35 @@ async function markManualBusinessReach({ chatId, businessConnectionId, leadProfi
     ? { matched: false, reason: 'edited_message_not_campaign_trigger' }
     : await matchActiveReachTemplate(accountKey, text);
   const account = await getAccount(accountKey);
+  let automationBlockReason = null;
   if (reachMatch.matched && canAccountReach(account)) {
-    const lead = await startCampaignFromReachTemplate({
-      chatId,
+    const subscriptionAccess = await canWorkspaceAutomate({
+      accountOrKey: account,
       businessConnectionId,
-      leadProfile,
-      adminUser,
-      text,
-      messageId,
-      messageDate,
-      accountKey,
-      match: reachMatch
+      action: 'business_reach_campaign_start'
     });
-    return {
-      lead,
-      template_match: true,
-      matched_template_key: reachMatch.template.key,
-      campaign_started: true,
-      reason: reachMatch.reason
-    };
+    if (subscriptionAccess.ok) {
+      const lead = await startCampaignFromReachTemplate({
+        chatId,
+        businessConnectionId,
+        leadProfile,
+        adminUser,
+        text,
+        messageId,
+        messageDate,
+        accountKey,
+        match: reachMatch
+      });
+      return {
+        lead,
+        template_match: true,
+        matched_template_key: reachMatch.template.key,
+        campaign_started: true,
+        reason: reachMatch.reason
+      };
+    }
+    automationBlockReason = subscriptionAccess.reason;
+    await logIgnore(chatId, subscriptionAccess.reason, text, accountKey);
   }
 
   const existing = await getLead(chatId, accountKey);
@@ -2993,10 +3198,10 @@ async function markManualBusinessReach({ chatId, businessConnectionId, leadProfi
   });
   return {
     lead,
-    template_match: false,
-    matched_template_key: null,
+    template_match: reachMatch.matched,
+    matched_template_key: reachMatch.matched ? reachMatch.template?.key || null : null,
     campaign_started: false,
-    reason: reachMatch.matched ? 'account_reach_off' : reachMatch.reason
+    reason: automationBlockReason || (reachMatch.matched ? 'account_reach_off' : reachMatch.reason)
   };
 }
 
@@ -3193,6 +3398,146 @@ async function setDailyAuto(value, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   return next;
 }
 
+async function getSubscriptionWorkspaceMeta(workspaceId) {
+  const { data: workspace, error: workspaceError } = await supabase.from('workspaces')
+    .select('*')
+    .eq('id', workspaceId)
+    .maybeSingle();
+  if (workspaceError) {
+    console.error('[SUBSCRIPTION] workspace meta:', workspaceError.message);
+    return null;
+  }
+  const { data: workspaceAccounts, error: accountError } = await supabase.from('workspace_business_accounts')
+    .select('*')
+    .eq('workspace_id', workspaceId)
+    .order('created_at', { ascending: true })
+    .limit(1);
+  if (accountError) console.error('[SUBSCRIPTION] account meta:', accountError.message);
+  return { workspace, workspaceAccount: workspaceAccounts?.[0] || null };
+}
+
+async function getWorkspaceOwnerTelegramId(workspace = {}) {
+  let platformUserId = workspace.owner_user_id || null;
+  if (!platformUserId && workspace.id) {
+    const { data } = await supabase.from('workspace_members')
+      .select('user_id')
+      .eq('workspace_id', workspace.id)
+      .eq('role', 'owner')
+      .eq('is_active', true)
+      .limit(1);
+    platformUserId = data?.[0]?.user_id || null;
+  }
+  if (!platformUserId) return null;
+  const { data, error } = await supabase.from('platform_users')
+    .select('telegram_user_id')
+    .eq('id', platformUserId)
+    .maybeSingle();
+  if (error) {
+    console.error('[SUBSCRIPTION] owner lookup:', error.message);
+    return null;
+  }
+  return data?.telegram_user_id || null;
+}
+
+async function claimSubscriptionNotification(subscriptionId, field) {
+  const allowedFields = new Set(['trial_24h_notified_at', 'trial_6h_notified_at', 'trial_expired_notified_at']);
+  if (!allowedFields.has(field)) return null;
+  const claimedAt = new Date().toISOString();
+  const { data, error } = await supabase.from('subscriptions')
+    .update({ [field]: claimedAt, updated_at: claimedAt })
+    .eq('id', subscriptionId)
+    .is(field, null)
+    .select('id')
+    .maybeSingle();
+  if (error) {
+    console.error('[SUBSCRIPTION] notification claim:', error.message);
+    return null;
+  }
+  return data ? claimedAt : null;
+}
+
+async function releaseSubscriptionNotificationClaim(subscriptionId, field, claimedAt) {
+  const allowedFields = new Set(['trial_24h_notified_at', 'trial_6h_notified_at', 'trial_expired_notified_at']);
+  if (!allowedFields.has(field) || !claimedAt) return;
+  const { error } = await supabase.from('subscriptions')
+    .update({ [field]: null, updated_at: new Date().toISOString() })
+    .eq('id', subscriptionId)
+    .eq(field, claimedAt);
+  if (error) console.error('[SUBSCRIPTION] notification release:', error.message);
+}
+
+async function sendTrialLifecycleNotification({ subscription, workspace, kind }) {
+  const fieldByKind = {
+    '24h': 'trial_24h_notified_at',
+    '6h': 'trial_6h_notified_at',
+    expired: 'trial_expired_notified_at'
+  };
+  const field = fieldByKind[kind];
+  if (!field || subscription?.[field]) return false;
+  const claimedAt = await claimSubscriptionNotification(subscription.id, field);
+  if (!claimedAt) return false;
+  const telegramUserId = await getWorkspaceOwnerTelegramId(workspace);
+  if (!telegramUserId) {
+    await releaseSubscriptionNotificationClaim(subscription.id, field, claimedAt);
+    return false;
+  }
+  const workspaceName = workspace.name || workspace.workspace_key || 'Workspace';
+  const textByKind = {
+    '24h': `⏳ ${workspaceName}\n\nTrial tugashiga 24 soatdan kam vaqt qoldi. Uzluksiz ishlash uchun PRO tarifni faollashtiring.`,
+    '6h': `⚠️ ${workspaceName}\n\nTrial tugashiga 6 soatdan kam vaqt qoldi. PRO tarif uchun administrator bilan bog‘laning.`,
+    expired: `❌ ${workspaceName}\n\nSinov muddatingiz tugadi. Avtomatik javob, reach va follow-up to‘xtatildi. PRO tarifni faollashtirish uchun administrator bilan bog‘laning.`
+  };
+  try {
+    await tg('sendMessage', { chat_id: telegramUserId, text: textByKind[kind] });
+    return true;
+  } catch (error) {
+    console.error('[SUBSCRIPTION] trial notification:', error.message);
+    await releaseSubscriptionNotificationClaim(subscription.id, field, claimedAt);
+    return false;
+  }
+}
+
+async function processSubscriptionLifecycle() {
+  if (!SAAS_PLATFORM_ENABLED) return;
+  const { data, error } = await supabase.from('subscriptions')
+    .select('*')
+    .in('status', ['trial', 'pro'])
+    .eq('is_platform_internal', false)
+    .limit(1000);
+  if (error) {
+    if (!isMissingTableError(error)) console.error('[SUBSCRIPTION] lifecycle:', error.message);
+    return;
+  }
+
+  for (const subscription of data || []) {
+    const meta = await getSubscriptionWorkspaceMeta(subscription.workspace_id);
+    if (!meta?.workspace) continue;
+    const context = {
+      workspace_id: subscription.workspace_id,
+      account_id: meta.workspaceAccount?.id || null,
+      canonical_account_key: meta.workspaceAccount?.existing_account_key || null,
+      workspace: meta.workspace,
+      workspaceAccount: meta.workspaceAccount,
+      subscription
+    };
+    const expiryAt = subscriptionExpiryAt(subscription);
+    const remainingMs = expiryAt ? new Date(expiryAt).getTime() - Date.now() : Number.POSITIVE_INFINITY;
+    if (remainingMs <= 0) {
+      const expired = await expireSubscriptionIfDue(context, 'scheduler');
+      if (subscription.status === 'trial' && expired?.status === 'expired') {
+        await sendTrialLifecycleNotification({ subscription: expired, workspace: meta.workspace, kind: 'expired' });
+      }
+      continue;
+    }
+    if (subscription.status !== 'trial') continue;
+    if (remainingMs <= 6 * 3600000) {
+      await sendTrialLifecycleNotification({ subscription, workspace: meta.workspace, kind: '6h' });
+    } else if (remainingMs <= 24 * 3600000) {
+      await sendTrialLifecycleNotification({ subscription, workspace: meta.workspace, kind: '24h' });
+    }
+  }
+}
+
 async function cleanupExpiredMessageArchives() {
   const today = localDateKey();
   const stateKey = 'message_archive_cleanup';
@@ -3245,6 +3590,12 @@ async function runSchedulerTick(source = 'interval') {
       console.error('[ARCHIVE_CLEANUP] error:', cleanupError);
       await logEvent('system', 'message_archive_cleanup_error', cleanupError.message || String(cleanupError));
     }
+    try {
+      await processSubscriptionLifecycle();
+    } catch (subscriptionError) {
+      console.error('[SUBSCRIPTION] lifecycle error:', subscriptionError);
+      await logEvent('system', 'subscription_lifecycle_error', subscriptionError.message || String(subscriptionError));
+    }
     const accounts = await getAccounts();
     for (const account of accounts) {
       await maybeStartDailyAuto(account.account_key);
@@ -3293,6 +3644,7 @@ async function maybeStartDailyAuto(accountOrKey = DEFAULT_ACCOUNT_KEY) {
 
   const hours = Number(daily.duration_hours || DAILY_DEFAULT_DURATION_HOURS);
   const auto = await enableAutoOutreach(hours, 'daily', ak);
+  if (!auto.enabled) return;
   await setDailyAuto({ last_started_date: today }, ak);
   await sendAdmin(
     `📣 <b>Kunlik Auto Outreach yoqildi</b>\n\n` +
@@ -3797,6 +4149,14 @@ async function sendArchiveFullDetail(chatId, accountOrKey, archiveId) {
 }
 
 async function resendArchivedMedia(chatId, row) {
+  const subscriptionAccess = await canWorkspaceAutomate({
+    accountOrKey: row?.account_key || DEFAULT_ACCOUNT_KEY,
+    businessConnectionId: row?.business_connection_id || '',
+    action: 'archive_media_restore'
+  });
+  if (!subscriptionAccess.ok) {
+    return tg('sendMessage', { chat_id: chatId, text: `Media qayta tiklanmadi: ${subscriptionAccess.reason}` });
+  }
   const methods = {
     photo: ['sendPhoto', 'photo'],
     video: ['sendVideo', 'video'],
@@ -4004,6 +4364,23 @@ async function handleBusinessMessage(msg, options = {}) {
     return;
   }
 
+  const subscriptionAccess = await canWorkspaceAutomate({
+    accountOrKey: account,
+    businessConnectionId,
+    action: 'business_incoming_auto_reply'
+  });
+  if (!subscriptionAccess.ok) {
+    await logIgnore(chatId, subscriptionAccess.reason, businessConnectionId || '', ak);
+    logBusinessIncomingDecision({
+      accountKey: ak,
+      chatId,
+      leadFound: Boolean(await getLead(chatId, ak)),
+      canAutoReply: false,
+      blockReason: subscriptionAccess.reason
+    });
+    return;
+  }
+
   const rawText = text || (isMediaOnly(msg) ? '[media]' : '');
   const existingLead = await getLead(chatId, ak);
   if (!existingLead) {
@@ -4131,9 +4508,20 @@ async function processLeadBatch(initialLead, texts) {
   }
   const text = texts.join('\n').trim();
   const ruleIntent = classify(text, lead.stage);
-  const aiDecision = ruleIntent === 'unclear' || ['rahmat', 'raxmat', 'qiziqdim', 'tushunarli', 'mayli', 'boladi', 'bo‘ladi', 'ok', 'ho‘p', "ho'p"].some(x => normalize(text).includes(x))
-    ? await classifyWithAI(lead, text, ruleIntent)
-    : null;
+  const shouldUseAi = ruleIntent === 'unclear' || ['rahmat', 'raxmat', 'qiziqdim', 'tushunarli', 'mayli', 'boladi', 'bo‘ladi', 'ok', 'ho‘p', "ho'p"].some(x => normalize(text).includes(x));
+  let aiDecision = null;
+  if (shouldUseAi) {
+    const aiAccess = await canWorkspaceAutomate({
+      accountOrKey: lead.account_key,
+      businessConnectionId: lead.business_connection_id,
+      action: 'ai_intent'
+    });
+    if (!aiAccess.ok) {
+      await logIgnore(lead.chat_id, aiAccess.reason, 'ai_intent', lead.account_key);
+      return;
+    }
+    aiDecision = await classifyWithAI(lead, text, ruleIntent);
+  }
   if (aiDecision && Number(aiDecision.confidence || 0) < 0.65) {
     await updateLead(lead.chat_id, {
       last_user_message: text,
@@ -4463,6 +4851,16 @@ async function executeReachStart(chatId, telegramUserId) {
     if (!isTestLeadAllowed(lead.chat_id)) {
       skipped += 1;
       await logIgnore(lead.chat_id, 'test_mode_blocked', 'manual_reach_start', allowedAccountKey);
+      continue;
+    }
+    const subscriptionAccess = await canWorkspaceAutomate({
+      accountOrKey: account,
+      businessConnectionId: lead.business_connection_id,
+      action: 'manual_bulk_reach'
+    });
+    if (!subscriptionAccess.ok) {
+      skipped += 1;
+      await logIgnore(lead.chat_id, subscriptionAccess.reason, 'manual_reach_start', allowedAccountKey);
       continue;
     }
     try {
@@ -5552,6 +5950,478 @@ async function sendDashboard(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, fromId 
   });
 }
 
+async function sendUserTariff(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, telegramUserId = chatId) {
+  const account = await getAccount(accountOrKey);
+  const ownedAccounts = await getPublicOwnedAccounts(chatId, telegramUserId);
+  if (!ownedAccounts.some(owned => accountKeyMatches(owned.account_key, account.account_key))) {
+    return commandManagementDenied(chatId);
+  }
+  const resolved = await resolveWorkspaceByAccountKey(account.account_key);
+  if (!resolved?.workspaceAccount) {
+    return tg('sendMessage', { chat_id: chatId, text: 'Tarif ma’lumoti hozircha topilmadi.' });
+  }
+  const context = await getWorkspaceSubscriptionContext(resolved.workspaceAccount.workspace_id);
+  if (!context) return tg('sendMessage', { chat_id: chatId, text: 'Tarif ma’lumoti hozircha topilmadi.' });
+  const subscription = context.subscription || { plan_code: 'trial', status: 'pending' };
+  const expiredText = subscription.status === 'expired'
+    ? '\n\nSinov yoki PRO muddatingiz tugadi. PRO tarifni faollashtirish uchun administrator bilan bog‘laning.'
+    : '';
+  const supportText = PLATFORM_SUPPORT_CONTACT ? `\nAdministrator: ${PLATFORM_SUPPORT_CONTACT}` : '';
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `💎 Tarif\n\n` +
+      `Workspace: ${context.workspace.name || '-'}\n` +
+      `Akkaunt: ${account.label || account.account_key}\n` +
+      `Plan: ${subscription.plan_code || '-'}\n` +
+      `Holat: ${subscription.status || 'pending'}\n` +
+      `Trial tugashi: ${formatSubscriptionDate(subscription.trial_ends_at)}\n` +
+      `PRO tugashi: ${formatSubscriptionDate(subscription.subscription_ends_at)}\n` +
+      `Qolgan vaqt: ${subscriptionRemainingText(subscription)}` +
+      expiredText + supportText,
+    reply_markup: { inline_keyboard: [[{ text: '⬅️ Menyu', callback_data: 'menu' }]] }
+  });
+}
+
+function formatSubscriptionDate(value) {
+  if (!value) return '-';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString('uz-UZ', { timeZone: PLATFORM_DEFAULT_TIMEZONE });
+}
+
+function subscriptionRemainingText(subscription = {}) {
+  if (subscription.is_platform_internal && subscription.status === 'pro') return 'Muddatsiz internal access';
+  const expiryAt = subscriptionExpiryAt(subscription);
+  if (!expiryAt) return subscription.status === 'pro' ? 'Muddatsiz' : '-';
+  const remainingMs = new Date(expiryAt).getTime() - Date.now();
+  if (remainingMs <= 0) return 'Tugagan';
+  const days = Math.floor(remainingMs / 86400000);
+  const hours = Math.floor((remainingMs % 86400000) / 3600000);
+  return `${days} kun ${hours} soat`;
+}
+
+async function getWorkspaceSubscriptionContext(workspaceId) {
+  const meta = await getSubscriptionWorkspaceMeta(workspaceId);
+  if (!meta?.workspace) return null;
+  const { data: subscription, error } = await supabase.from('subscriptions')
+    .select('*')
+    .eq('workspace_id', workspaceId)
+    .maybeSingle();
+  if (error) {
+    console.error('[SUBSCRIPTION] detail:', error.message);
+    return null;
+  }
+  const context = {
+    workspace_id: workspaceId,
+    account_id: meta.workspaceAccount?.id || null,
+    canonical_account_key: meta.workspaceAccount?.existing_account_key || null,
+    workspace: meta.workspace,
+    workspaceAccount: meta.workspaceAccount,
+    subscription: subscription || null
+  };
+  if (subscription) context.subscription = await expireSubscriptionIfDue(context, 'admin_view');
+  return context;
+}
+
+async function sendPlatformSubscriptionMenu(chatId) {
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: '🧭 Platform Admin Bot\n\n💎 Tarif va subscription boshqaruvi',
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '👥 Barcha workspace’lar', callback_data: 'platform_subscriptions:all' }],
+        [{ text: '🆕 Kutilayotganlar', callback_data: 'platform_subscriptions:pending' }],
+        [{ text: '🧪 Trial', callback_data: 'platform_subscriptions:trial' }],
+        [{ text: '💎 PRO', callback_data: 'platform_subscriptions:pro' }],
+        [{ text: '⏳ Muddati tugayotganlar', callback_data: 'platform_subscriptions:expiring' }],
+        [{ text: '❌ Muddati tugaganlar', callback_data: 'platform_subscriptions:expired' }],
+        [{ text: '🚫 Bloklanganlar', callback_data: 'platform_subscriptions:blocked' }],
+        [{ text: '⬅️ Orqaga', callback_data: 'platform_main' }]
+      ]
+    }
+  });
+}
+
+async function sendPlatformSubscriptionList(chatId, filter = 'all') {
+  let query = supabase.from('subscriptions').select('*').order('updated_at', { ascending: false }).limit(100);
+  if (['pending', 'trial', 'pro', 'expired'].includes(filter)) query = query.eq('status', filter);
+  if (filter === 'expiring') query = query.in('status', ['trial', 'pro']);
+  const { data, error } = await query;
+  if (error) {
+    return adminTg('sendMessage', { chat_id: chatId, text: `Subscription ro‘yxati o‘qilmadi: ${error.message}` });
+  }
+
+  const rows = [];
+  for (const subscription of data || []) {
+    const context = await getWorkspaceSubscriptionContext(subscription.workspace_id);
+    if (!context) continue;
+    const current = context.subscription || subscription;
+    const workspaceStatus = String(context.workspace.status || 'active');
+    if (['pending', 'trial', 'pro', 'expired'].includes(filter) && current.status !== filter) continue;
+    if (filter === 'expiring') {
+      const expiryAt = subscriptionExpiryAt(current);
+      const remainingMs = expiryAt ? new Date(expiryAt).getTime() - Date.now() : Number.POSITIVE_INFINITY;
+      if (remainingMs <= 0 || remainingMs > 7 * 86400000) continue;
+    }
+    if (filter === 'blocked' && !['blocked', 'suspended', 'cancelled'].includes(current.status) && !['blocked', 'suspended'].includes(workspaceStatus)) continue;
+    const label = `${context.workspace.name || context.workspace.workspace_key} | ${current.plan_code || '-'}:${current.status || 'pending'}`;
+    rows.push([{ text: short(label, 56), callback_data: `platform_subscription:${context.workspace_id}` }]);
+  }
+  if (!rows.length) rows.push([{ text: 'Ro‘yxat bo‘sh', callback_data: 'platform_noop' }]);
+  rows.push([{ text: '⬅️ Tariflar', callback_data: 'platform_subscriptions' }]);
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: `🧭 Platform Admin Bot\n\nSubscriptionlar: ${filter}`,
+    reply_markup: { inline_keyboard: rows }
+  });
+}
+
+async function sendPlatformSubscriptionDetail(chatId, workspaceId) {
+  const context = await getWorkspaceSubscriptionContext(workspaceId);
+  if (!context) return adminTg('sendMessage', { chat_id: chatId, text: 'Workspace yoki subscription topilmadi.' });
+  const subscription = context.subscription || { status: 'pending', plan_code: 'trial' };
+  const account = context.workspaceAccount;
+  const ownerTelegramId = await getWorkspaceOwnerTelegramId(context.workspace);
+  const leadCount = account?.existing_account_key ? await countLeads(null, account.existing_account_key) : 0;
+  const buttons = [];
+  if (!subscriptionIsInternal(context)) {
+    buttons.push([{ text: '💎 PRO qilish / muddat qo‘shish', callback_data: `sub_pro:${workspaceId}` }]);
+    buttons.push([{ text: `⏳ Trial +${TRIAL_DAYS} kun`, callback_data: `sub_trial:${workspaceId}` }]);
+    buttons.push([{ text: '❌ Subscriptionni tugatish', callback_data: `sub_expire:${workspaceId}` }]);
+  }
+  if (context.workspace.status === 'active') {
+    buttons.push([{ text: '⏸ Workspace’ni to‘xtatish', callback_data: `sub_suspend:${workspaceId}` }]);
+  } else {
+    buttons.push([{ text: '▶️ Workspace’ni yoqish', callback_data: `sub_resume:${workspaceId}` }]);
+  }
+  if (account?.existing_account_key) buttons.push([{ text: '🏢 Akkaunt kartasi', callback_data: `platform_account:${account.existing_account_key}` }]);
+  buttons.push([{ text: '⬅️ Subscriptionlar', callback_data: 'platform_subscriptions' }]);
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `🧭 Platform Admin Bot\n\n` +
+      `Workspace: ${context.workspace.name || '-'}\n` +
+      `Workspace ID: ${workspaceId}\n` +
+      `Workspace status: ${context.workspace.status || 'active'}\n` +
+      `Owner Telegram ID: ${ownerTelegramId || '-'}\n` +
+      `Account: ${account?.existing_account_key || '-'}\n` +
+      `Business: ${account?.status || '-'}\n` +
+      `Plan: ${subscription.plan_code || '-'}\n` +
+      `Status: ${subscription.status || 'pending'}\n` +
+      `Trial start: ${formatSubscriptionDate(subscription.trial_started_at)}\n` +
+      `Trial end: ${formatSubscriptionDate(subscription.trial_ends_at)}\n` +
+      `PRO start: ${formatSubscriptionDate(subscription.subscription_started_at)}\n` +
+      `PRO end: ${formatSubscriptionDate(subscription.subscription_ends_at)}\n` +
+      `Qolgan vaqt: ${subscriptionRemainingText(subscription)}\n` +
+      `Internal: ${subscriptionIsInternal(context) ? 'true' : 'false'}\n` +
+      `Lidlar: ${leadCount}\n` +
+      `Sabab: ${subscription.status_reason || '-'}`,
+    reply_markup: { inline_keyboard: buttons }
+  });
+}
+
+async function getPlatformInteractionSession(telegramUserId) {
+  const { data, error } = await supabase.from('interaction_sessions')
+    .select('*')
+    .eq('telegram_user_id', String(telegramUserId))
+    .eq('bot_role', 'ADMIN_BOT')
+    .maybeSingle();
+  if (error) {
+    if (!isMissingTableError(error)) console.error('getPlatformInteractionSession:', error.message);
+    return null;
+  }
+  if (!data) return null;
+  if (new Date(data.expires_at).getTime() <= Date.now()) {
+    await clearPlatformInteractionSession(telegramUserId);
+    return null;
+  }
+  return data;
+}
+
+async function setPlatformInteractionSession({ telegramUserId, workspaceId, accountId = null, mode, step, payload = {} }) {
+  const now = new Date().toISOString();
+  const { data, error } = await supabase.from('interaction_sessions').upsert({
+    telegram_user_id: String(telegramUserId),
+    workspace_id: workspaceId,
+    account_id: accountId,
+    bot_role: 'ADMIN_BOT',
+    mode,
+    step,
+    payload,
+    expires_at: new Date(Date.now() + 45 * 60000).toISOString(),
+    updated_at: now
+  }, { onConflict: 'telegram_user_id,bot_role' }).select().maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function clearPlatformInteractionSession(telegramUserId) {
+  const { error } = await supabase.from('interaction_sessions')
+    .delete()
+    .eq('telegram_user_id', String(telegramUserId))
+    .eq('bot_role', 'ADMIN_BOT');
+  if (error && !isMissingTableError(error)) console.error('clearPlatformInteractionSession:', error.message);
+}
+
+async function sendProActivationPreview(chatId, session) {
+  const context = await getWorkspaceSubscriptionContext(session.workspace_id);
+  if (!context) return adminTg('sendMessage', { chat_id: chatId, text: 'Workspace topilmadi.' });
+  const payload = session.payload || {};
+  const current = context.subscription || {};
+  const internalAccess = payload.internal_access === true;
+  const durationDays = Number(payload.duration_days || 0);
+  const currentEnd = current.status === 'pro' && current.subscription_ends_at && new Date(current.subscription_ends_at).getTime() > Date.now()
+    ? new Date(current.subscription_ends_at)
+    : new Date();
+  const newEnd = internalAccess ? null : new Date(currentEnd.getTime() + durationDays * 86400000).toISOString();
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text:
+      `💎 PRO tasdiqlash\n\n` +
+      `Workspace: ${context.workspace.name}\n` +
+      `Oldingi tarif: ${current.plan_code || '-'} / ${current.status || 'pending'}\n` +
+      `Yangi tarif: PRO ${internalAccess ? 'muddatsiz internal' : `${durationDays} kun`}\n` +
+      `Tugash: ${formatSubscriptionDate(newEnd)}\n` +
+      `Summa: ${Number(payload.payment_amount || 0)} UZS\n` +
+      `Izoh: ${payload.payment_note || '-'}\n` +
+      `Admin: ${session.telegram_user_id}`,
+    reply_markup: {
+      inline_keyboard: [[
+        { text: '✅ Tasdiqlash', callback_data: `sub_confirm:${session.workspace_id}` },
+        { text: '❌ Bekor qilish', callback_data: 'sub_cancel' }
+      ]]
+    }
+  });
+}
+
+async function handlePlatformSubscriptionSessionInput(msg, session) {
+  if (!session || session.mode !== 'subscription_pro') return false;
+  const chatId = String(msg.chat?.id || '');
+  const text = String(msg.text || '').trim();
+  if (session.step === 'amount') {
+    const amount = Number(text.replace(/\s+/g, '').replace(',', '.'));
+    if (!Number.isFinite(amount) || amount < 0) {
+      await adminTg('sendMessage', { chat_id: chatId, text: 'Summani 0 yoki musbat raqamda yuboring.' });
+      return true;
+    }
+    await setPlatformInteractionSession({
+      telegramUserId: msg.from.id,
+      workspaceId: session.workspace_id,
+      accountId: session.account_id,
+      mode: session.mode,
+      step: 'note',
+      payload: { ...(session.payload || {}), payment_amount: amount }
+    });
+    await adminTg('sendMessage', { chat_id: chatId, text: 'Ichki izohni yuboring. Izoh kerak bo‘lmasa /skip yozing.' });
+    return true;
+  }
+  if (session.step === 'note') {
+    const next = await setPlatformInteractionSession({
+      telegramUserId: msg.from.id,
+      workspaceId: session.workspace_id,
+      accountId: session.account_id,
+      mode: session.mode,
+      step: 'confirm',
+      payload: { ...(session.payload || {}), payment_note: text === '/skip' ? '' : text }
+    });
+    await sendProActivationPreview(chatId, next);
+    return true;
+  }
+  return false;
+}
+
+async function notifyWorkspaceOwner(workspace = {}, text = '') {
+  const telegramUserId = await getWorkspaceOwnerTelegramId(workspace);
+  if (!telegramUserId) return false;
+  try {
+    await tg('sendMessage', { chat_id: telegramUserId, text });
+    return true;
+  } catch (error) {
+    console.error('[SUBSCRIPTION] owner notification:', error.message);
+    return false;
+  }
+}
+
+async function beginPlatformProActivation(chatId, adminUser, workspaceId) {
+  const context = await getWorkspaceSubscriptionContext(workspaceId);
+  if (!context) return adminTg('sendMessage', { chat_id: chatId, text: 'Workspace topilmadi.' });
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: `💎 PRO muddati\n\nWorkspace: ${context.workspace.name}`,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '30 kun', callback_data: `sub_days:30:${workspaceId}` }, { text: '90 kun', callback_data: `sub_days:90:${workspaceId}` }],
+        [{ text: '180 kun', callback_data: `sub_days:180:${workspaceId}` }, { text: '365 kun', callback_data: `sub_days:365:${workspaceId}` }],
+        [{ text: 'Muddatsiz internal', callback_data: `sub_days:0:${workspaceId}` }],
+        [{ text: '❌ Bekor qilish', callback_data: 'sub_cancel' }]
+      ]
+    }
+  });
+}
+
+async function beginPlatformProAmount(chatId, adminUser, workspaceId, durationDays) {
+  const context = await getWorkspaceSubscriptionContext(workspaceId);
+  if (!context) return adminTg('sendMessage', { chat_id: chatId, text: 'Workspace topilmadi.' });
+  const allowedDurations = new Set([0, 30, 90, 180, 365]);
+  if (!allowedDurations.has(durationDays)) return adminTg('sendMessage', { chat_id: chatId, text: 'PRO muddati noto‘g‘ri.' });
+  await setPlatformInteractionSession({
+    telegramUserId: adminUser.id,
+    workspaceId,
+    accountId: context.account_id,
+    mode: 'subscription_pro',
+    step: 'amount',
+    payload: {
+      duration_days: durationDays,
+      internal_access: durationDays === 0,
+      previous_status: context.subscription?.status || 'pending',
+      previous_plan_code: context.subscription?.plan_code || 'trial'
+    }
+  });
+  return adminTg('sendMessage', {
+    chat_id: chatId,
+    text: 'To‘lov summasini yuboring. Bonus yoki bepul faollashtirish uchun 0 yuborish mumkin.'
+  });
+}
+
+async function confirmPlatformProActivation(chatId, adminUser, workspaceId) {
+  const session = await getPlatformInteractionSession(adminUser.id);
+  if (!session || session.mode !== 'subscription_pro' || session.step !== 'confirm' || session.workspace_id !== workspaceId) {
+    return adminTg('sendMessage', { chat_id: chatId, text: 'PRO tasdiqlash sessiyasi topilmadi yoki eskirgan.' });
+  }
+  const context = await getWorkspaceSubscriptionContext(workspaceId);
+  if (!context) return adminTg('sendMessage', { chat_id: chatId, text: 'Workspace topilmadi.' });
+  const before = context.subscription || {};
+  const payload = session.payload || {};
+  const { data, error } = await supabase.rpc('activate_workspace_pro', {
+    p_workspace_id: workspaceId,
+    p_duration_days: Number(payload.duration_days || 0),
+    p_admin_telegram_user_id: String(adminUser.id),
+    p_payment_amount: Number(payload.payment_amount || 0),
+    p_payment_currency: 'UZS',
+    p_payment_note: payload.payment_note || null,
+    p_payment_reference: `admin:${adminUser.id}:${Date.now()}`,
+    p_internal_access: payload.internal_access === true
+  });
+  if (error) return adminTg('sendMessage', { chat_id: chatId, text: `PRO faollashtirilmadi: ${error.message}` });
+  const after = subscriptionResultRow(data) || {};
+  await logPlatformAudit({
+    adminUserId: adminUser.id,
+    adminUsername: adminUser.username,
+    action: before.status === 'pro' ? 'pro_extended' : 'pro_activated',
+    targetAccountKey: context.canonical_account_key,
+    workspaceId,
+    accountId: context.account_id,
+    actorRole: 'super_admin',
+    entityType: 'subscription',
+    entityId: after.id || before.id,
+    beforeJson: before,
+    afterJson: after
+  });
+  await clearPlatformInteractionSession(adminUser.id);
+  await notifyWorkspaceOwner(
+    context.workspace,
+    `💎 ${context.workspace.name}\n\nPRO tarif faollashtirildi. Holat: ${after.status || 'pro'}. Tugash: ${formatSubscriptionDate(after.subscription_ends_at)}.`
+  );
+  await adminTg('sendMessage', { chat_id: chatId, text: '✅ PRO tarif faollashtirildi.' });
+  return sendPlatformSubscriptionDetail(chatId, workspaceId);
+}
+
+async function extendPlatformTrial(chatId, adminUser, workspaceId) {
+  const context = await getWorkspaceSubscriptionContext(workspaceId);
+  if (!context) return adminTg('sendMessage', { chat_id: chatId, text: 'Workspace topilmadi.' });
+  const before = context.subscription || {};
+  const { data, error } = await supabase.rpc('extend_workspace_trial', {
+    p_workspace_id: workspaceId,
+    p_days: TRIAL_DAYS,
+    p_activated_by: String(adminUser.id)
+  });
+  if (error) return adminTg('sendMessage', { chat_id: chatId, text: `Trial uzaytirilmadi: ${error.message}` });
+  const after = subscriptionResultRow(data) || {};
+  await logPlatformAudit({
+    adminUserId: adminUser.id,
+    adminUsername: adminUser.username,
+    action: 'trial_extended',
+    targetAccountKey: context.canonical_account_key,
+    workspaceId,
+    accountId: context.account_id,
+    actorRole: 'super_admin',
+    entityType: 'subscription',
+    entityId: after.id || before.id,
+    beforeJson: before,
+    afterJson: after
+  });
+  await notifyWorkspaceOwner(context.workspace, `⏳ ${context.workspace.name}\n\nTrial ${TRIAL_DAYS} kunga uzaytirildi. Yangi tugash vaqti: ${formatSubscriptionDate(after.trial_ends_at)}.`);
+  await adminTg('sendMessage', { chat_id: chatId, text: `✅ Trial ${TRIAL_DAYS} kunga uzaytirildi.` });
+  return sendPlatformSubscriptionDetail(chatId, workspaceId);
+}
+
+async function expirePlatformSubscription(chatId, adminUser, workspaceId) {
+  const context = await getWorkspaceSubscriptionContext(workspaceId);
+  if (!context) return adminTg('sendMessage', { chat_id: chatId, text: 'Workspace topilmadi.' });
+  const before = context.subscription || {};
+  const { data, error } = await supabase.rpc('expire_workspace_subscription', {
+    p_workspace_id: workspaceId,
+    p_activated_by: String(adminUser.id),
+    p_reason: 'admin_expired'
+  });
+  if (error) return adminTg('sendMessage', { chat_id: chatId, text: `Subscription tugatilmadi: ${error.message}` });
+  const after = subscriptionResultRow(data) || {};
+  await logPlatformAudit({
+    adminUserId: adminUser.id,
+    adminUsername: adminUser.username,
+    action: 'subscription_expired_by_admin',
+    targetAccountKey: context.canonical_account_key,
+    workspaceId,
+    accountId: context.account_id,
+    actorRole: 'super_admin',
+    entityType: 'subscription',
+    entityId: after.id || before.id,
+    beforeJson: before,
+    afterJson: after
+  });
+  await notifyWorkspaceOwner(context.workspace, `❌ ${context.workspace.name}\n\nSubscription administrator tomonidan tugatildi. PRO tarif uchun administrator bilan bog‘laning.`);
+  await adminTg('sendMessage', { chat_id: chatId, text: '✅ Subscription expired holatiga o‘tkazildi.' });
+  return sendPlatformSubscriptionDetail(chatId, workspaceId);
+}
+
+async function setPlatformWorkspaceStatus(chatId, adminUser, workspaceId, status) {
+  if (!['active', 'suspended'].includes(status)) return;
+  const context = await getWorkspaceSubscriptionContext(workspaceId);
+  if (!context) return adminTg('sendMessage', { chat_id: chatId, text: 'Workspace topilmadi.' });
+  const { data, error } = await supabase.from('workspaces')
+    .update({ status, updated_at: new Date().toISOString() })
+    .eq('id', workspaceId)
+    .select('*')
+    .maybeSingle();
+  if (error) return adminTg('sendMessage', { chat_id: chatId, text: `Workspace holati o‘zgarmadi: ${error.message}` });
+  await logPlatformAudit({
+    adminUserId: adminUser.id,
+    adminUsername: adminUser.username,
+    action: status === 'active' ? 'workspace_resumed' : 'workspace_suspended',
+    targetAccountKey: context.canonical_account_key,
+    workspaceId,
+    accountId: context.account_id,
+    actorRole: 'super_admin',
+    entityType: 'workspace',
+    entityId: workspaceId,
+    beforeJson: { status: context.workspace.status },
+    afterJson: { status: data.status }
+  });
+  await adminTg('sendMessage', { chat_id: chatId, text: status === 'active' ? '✅ Workspace yoqildi.' : '⏸ Workspace to‘xtatildi.' });
+  return sendPlatformSubscriptionDetail(chatId, workspaceId);
+}
+
+async function countSubscriptionsByStatus(status) {
+  const { count, error } = await supabase.from('subscriptions')
+    .select('*', { count: 'exact', head: true })
+    .eq('status', status);
+  if (error) {
+    if (!isMissingTableError(error)) console.error('countSubscriptionsByStatus:', error.message);
+    return 0;
+  }
+  return count || 0;
+}
+
 async function sendPlatformDashboard(chatId) {
   const accounts = (await getAccounts()).filter(a => a.account_key !== UNKNOWN_ACCOUNT_KEY);
   const activeAccounts = accounts.filter(a => a.bot_enabled !== false).length;
@@ -5570,6 +6440,9 @@ async function sendPlatformDashboard(chatId) {
   const deletedTrackingAccounts = accounts.filter(a => a.track_deleted_enabled !== false).length;
   const aiToday = await countAiDecisionsToday();
   const humanNeededToday = await countLeads(q => q.in('status', ['needs_admin', 'pending_approval']).gte('last_message_at', `${localDateKey()}T00:00:00+00:00`));
+  const trialSubscriptions = await countSubscriptionsByStatus('trial');
+  const proSubscriptions = await countSubscriptionsByStatus('pro');
+  const expiredSubscriptions = await countSubscriptionsByStatus('expired');
   return adminTg('sendMessage', {
     chat_id: chatId,
     parse_mode: 'HTML',
@@ -5579,6 +6452,9 @@ async function sendPlatformDashboard(chatId) {
       `Jami ulangan akkauntlar: ${accounts.length}\n` +
       `Aktiv akkauntlar: ${activeAccounts}\n` +
       `Bloklangan akkauntlar: ${suspendedAccounts}\n` +
+      `Trial workspace’lar: ${trialSubscriptions}\n` +
+      `PRO workspace’lar: ${proSubscriptions}\n` +
+      `Expired workspace’lar: ${expiredSubscriptions}\n` +
       `Bugun arxivlangan xabarlar: ${archivedToday}\n` +
       `Bugun tahrirlanganlar: ${editedToday}\n` +
       `Bugun o‘chirilganlar: ${deletedToday}\n` +
@@ -5595,6 +6471,7 @@ async function sendPlatformDashboard(chatId) {
       `Edited tracking: ${editedTrackingAccounts}`,
     reply_markup: {
       inline_keyboard: [
+        [{ text: '💎 Tariflar', callback_data: 'platform_subscriptions' }],
         [{ text: '👥 Akkauntlar', callback_data: 'platform_accounts' }],
         [{ text: '🧩 Buyruqlar', callback_data: 'platform_commands' }],
         [{ text: '📈 Bugungi hisobot', callback_data: 'platform_today_report' }],
@@ -5617,7 +6494,9 @@ async function sendPlatformAccounts(chatId) {
 
 async function sendPlatformAccountDetail(chatId, accountKey) {
   const account = await getAccount(accountKey);
+  const tenant = await resolveWorkspaceByAccountKey(account.account_key);
   const rows = [
+    ...(tenant?.workspaceAccount ? [[{ text: '💎 Tarif', callback_data: `platform_subscription:${tenant.workspaceAccount.workspace_id}` }]] : []),
     [{ text: '🧩 Buyruqlar', callback_data: `platform_commands:${account.account_key}` }],
     [{ text: '🕵️ Arxiv', callback_data: `platform_archive:${account.account_key}` }],
     [{ text: '🕵️ Arxiv sozlamalari', callback_data: `platform_archive_settings:${account.account_key}` }],
@@ -5679,14 +6558,21 @@ async function sendPlatformMainMenu(chatId) {
     reply_markup: {
       inline_keyboard: [
         [{ text: '📊 Umumiy dashboard', callback_data: 'platform_main' }],
-        [{ text: '👥 Akkauntlar', callback_data: 'platform_accounts' }],
+        [{ text: '👥 Foydalanuvchilar', callback_data: 'platform_subscriptions:all' }],
+        [{ text: '🧪 Trial foydalanuvchilar', callback_data: 'platform_subscriptions:trial' }],
+        [{ text: '💎 PRO foydalanuvchilar', callback_data: 'platform_subscriptions:pro' }],
+        [{ text: '⏳ Muddati tugayotganlar', callback_data: 'platform_subscriptions:expiring' }],
+        [{ text: '❌ Muddati tugaganlar', callback_data: 'platform_subscriptions:expired' }],
+        [{ text: '🚫 Bloklanganlar', callback_data: 'platform_subscriptions:blocked' }],
+        [{ text: '🏢 Workspace va tariflar', callback_data: 'platform_subscriptions' }],
+        [{ text: '🔗 Business akkauntlar', callback_data: 'platform_accounts' }],
         [{ text: '🧩 Buyruqlar', callback_data: 'platform_commands' }],
         [{ text: '🔁 Flowlar', callback_data: 'platform_flow' }],
         [{ text: '✏️ Shablonlar', callback_data: 'platform_templates' }],
         [{ text: '🧠 AI qoidalar', callback_data: 'platform_ai' }],
         [{ text: '🕵️ Arxiv sozlamalari', callback_data: 'platform_archive_settings' }],
         [{ text: '📈 Hisobotlar', callback_data: 'platform_reports' }],
-        [{ text: '🚫 Bloklanganlar', callback_data: 'platform_suspended' }],
+        [{ text: '⛔ Bot o‘chirilgan akkauntlar', callback_data: 'platform_suspended' }],
         [{ text: '🧾 Audit log', callback_data: 'platform_audit' }],
         [{ text: '🩺 Diagnostika', callback_data: 'platform_diagnostics' }]
       ]
@@ -5949,6 +6835,7 @@ async function sendPlatformTestNotification(chatId, accountKey, adminUser = {}) 
 function mainMenuKeyboard(showAccounts = false, showCommands = false, account = null) {
   const rows = [
       [{ text: '👤 Akkaunt tanlash', callback_data: 'accounts' }],
+      [{ text: '💎 Tarif', callback_data: 'tariff' }],
       [{ text: '✏️ Shablonlar', callback_data: 'templates' }],
       [{ text: '🔁 Ketma-ketlik', callback_data: 'flow_menu' }],
       [{ text: '🧠 AI qoidalar', callback_data: 'rules_menu' }],
@@ -6021,6 +6908,12 @@ const COMMAND_ALIASES_UZ = new Map(Object.entries({
   '/reachyoq': '/reachon',
   '/reachochir': '/reachoff',
   '/sozlamalar': '/settings',
+  '/tarif': '/tariff',
+  '/tariflar': '/subscriptions',
+  '/triallar': '/trials',
+  '/prolar': '/pros',
+  '/muddatitugagan': '/expired',
+  '/obuna': '/subscription',
   '/suniyintellekt': '/ai',
   '/aiholati': '/aistatus',
   '/qoidatest': '/testrule',
@@ -6098,7 +6991,7 @@ function normalizeAdminCommand(rawText = '') {
 async function requirePlatformOwnerForAdminBot(msgOrCallback, context) {
   const from = msgOrCallback?.from || {};
   if (!PLATFORM_ADMIN_ENABLED) return false;
-  if (await isPlatformOwner(from.id)) return true;
+  if (await isPlatformSuperAdmin(from.id)) return true;
   await logPlatformUnauthorizedAttempt(from.id, context, from.username || '');
   const chatId = msgOrCallback?.message?.chat?.id || msgOrCallback?.chat?.id;
   if (chatId) await adminTg('sendMessage', { chat_id: chatId, text: '⛔ Sizda platforma admin ruxsati yo‘q.' });
@@ -6119,9 +7012,25 @@ async function handlePlatformAdminMessage(msg) {
   if (text === '/audit') return sendPlatformAuditLog(chatId);
   if (text === '/reportall') return sendReportAllPlatform(chatId);
   if (text === '/commands') return sendPlatformCommands(chatId);
-  if (text === '/cancel') return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nBekor qilindi.' });
+  if (text === '/subscriptions') return sendPlatformSubscriptionMenu(chatId);
+  if (text === '/trials') return sendPlatformSubscriptionList(chatId, 'trial');
+  if (text === '/pros') return sendPlatformSubscriptionList(chatId, 'pro');
+  if (text === '/expired') return sendPlatformSubscriptionList(chatId, 'expired');
+  if (text === '/cancel') {
+    await clearPlatformInteractionSession(from.id);
+    return adminTg('sendMessage', { chat_id: chatId, text: '🧭 Platform Admin Bot\n\nBekor qilindi.' });
+  }
+
+  const interactionSession = await getPlatformInteractionSession(from.id);
+  if (interactionSession && await handlePlatformSubscriptionSessionInput(msg, interactionSession)) return;
 
   if (text.startsWith('/account ')) return sendPlatformAccountDetail(chatId, text.split(/\s+/)[1]);
+  if (text.startsWith('/subscription ')) {
+    const resolved = await resolveWorkspaceByAccountKey(text.split(/\s+/)[1]);
+    return resolved?.workspaceAccount
+      ? sendPlatformSubscriptionDetail(chatId, resolved.workspaceAccount.workspace_id)
+      : adminTg('sendMessage', { chat_id: chatId, text: 'Workspace topilmadi.' });
+  }
   if (text.startsWith('/commands ')) return sendPlatformCommands(chatId, text.split(/\s+/)[1]);
   if (text.startsWith('/command ')) {
     const [, ak, commandKey] = text.split(/\s+/);
@@ -6305,6 +7214,57 @@ async function handlePlatformCallback(cb) {
   try { await adminTg('answerCallbackQuery', { callback_query_id: cb.id }); } catch {}
   if (!chatId) return;
   if (!(await requirePlatformOwnerForAdminBot(cb, `callback:${data}`))) return;
+
+  if (data === 'sub_cancel') {
+    await clearPlatformInteractionSession(from.id);
+    return adminTg('sendMessage', { chat_id: chatId, text: 'Bekor qilindi.' });
+  }
+  if (data === 'platform_subscriptions') return sendPlatformSubscriptionMenu(chatId);
+  if (data.startsWith('platform_subscriptions:')) return sendPlatformSubscriptionList(chatId, data.split(':')[1] || 'all');
+  if (data.startsWith('platform_subscription:')) return sendPlatformSubscriptionDetail(chatId, data.split(':')[1]);
+  if (data.startsWith('sub_pro:')) return beginPlatformProActivation(chatId, from, data.split(':')[1]);
+  if (data.startsWith('sub_days:')) {
+    const [, days, workspaceId] = data.split(':');
+    return beginPlatformProAmount(chatId, from, workspaceId, Number(days));
+  }
+  if (data.startsWith('sub_confirm:')) return confirmPlatformProActivation(chatId, from, data.split(':')[1]);
+  if (data.startsWith('sub_trial:')) {
+    const workspaceId = data.split(':')[1];
+    return adminTg('sendMessage', {
+      chat_id: chatId,
+      text: `Trialni ${TRIAL_DAYS} kunga uzaytirishni tasdiqlaysizmi?`,
+      reply_markup: { inline_keyboard: [[
+        { text: '✅ Tasdiqlash', callback_data: `sub_trial_confirm:${workspaceId}` },
+        { text: '❌ Bekor qilish', callback_data: 'sub_cancel' }
+      ]] }
+    });
+  }
+  if (data.startsWith('sub_trial_confirm:')) return extendPlatformTrial(chatId, from, data.split(':')[1]);
+  if (data.startsWith('sub_expire:')) {
+    const workspaceId = data.split(':')[1];
+    return adminTg('sendMessage', {
+      chat_id: chatId,
+      text: 'Subscriptionni expired holatiga o‘tkazishni tasdiqlaysizmi?',
+      reply_markup: { inline_keyboard: [[
+        { text: '✅ Tasdiqlash', callback_data: `sub_expire_confirm:${workspaceId}` },
+        { text: '❌ Bekor qilish', callback_data: 'sub_cancel' }
+      ]] }
+    });
+  }
+  if (data.startsWith('sub_expire_confirm:')) return expirePlatformSubscription(chatId, from, data.split(':')[1]);
+  if (data.startsWith('sub_suspend:')) {
+    const workspaceId = data.split(':')[1];
+    return adminTg('sendMessage', {
+      chat_id: chatId,
+      text: 'Workspace avtomatik funksiyalarini to‘xtatishni tasdiqlaysizmi?',
+      reply_markup: { inline_keyboard: [[
+        { text: '✅ To‘xtatish', callback_data: `sub_suspend_confirm:${workspaceId}` },
+        { text: '❌ Bekor qilish', callback_data: 'sub_cancel' }
+      ]] }
+    });
+  }
+  if (data.startsWith('sub_suspend_confirm:')) return setPlatformWorkspaceStatus(chatId, from, data.split(':')[1], 'suspended');
+  if (data.startsWith('sub_resume:')) return setPlatformWorkspaceStatus(chatId, from, data.split(':')[1], 'active');
 
   if (data === 'platform_noop') return;
   if (data === 'platform_main') return sendPlatformDashboard(chatId);
@@ -6535,6 +7495,7 @@ async function handleAdminMessage(msg) {
   }
 
   if (text === '/start' || text === '/menu') return sendDashboard(chatId, selectedAccountKey, from.id);
+  if (text === '/tariff') return sendUserTariff(chatId, selectedAccountKey, from.id);
   if (text === '/whoami') return replyWhoami(msg, 'message');
   if (text === '/resetme') {
     await resetMeChat({ chatId, from: msg.from, accountKey: selectedAccountKey });
@@ -6978,7 +7939,10 @@ async function autoOn(chatId, hours, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const account = await getAccount(accountOrKey);
   const value = await enableAutoOutreach(hours, 'manual', account.account_key);
   if (!value.enabled) {
-    return tg('sendMessage', { chat_id: chatId, text: `⛔ Auto Outreach yoqilmadi: bot yoki reach o‘chirilgan (${account.label || account.account_key}).` });
+    return tg('sendMessage', {
+      chat_id: chatId,
+      text: `⛔ Auto Outreach yoqilmadi: ${value.reason || 'bot_or_reach_off'} (${account.label || account.account_key}).`
+    });
   }
   return tg('sendMessage', {
     chat_id: chatId,
@@ -7191,6 +8155,7 @@ async function handleCallback(cb) {
 
   if (data === 'menu' || data === 'noop') return sendDashboard(chatId, selectedAccountKey, cb.from?.id);
   if (data === 'accounts') return sendAccountsMenu(chatId, cb.from?.id);
+  if (data === 'tariff') return sendUserTariff(chatId, selectedAccountKey, cb.from?.id);
   if (data.startsWith('account_bot:')) {
     const allowedAccountKey = await getCommandManagementAccountKey(chatId, cb.from?.id, selectedAccountKey);
     if (!allowedAccountKey) return commandManagementDenied(chatId);
@@ -7261,7 +8226,16 @@ async function handleCallback(cb) {
     if (data.startsWith('lead_pause:')) lead = await pauseLeadBot(leadChatId, selectedAccountKey, cb.from?.id, 'callback_pause') || lead;
     else if (data.startsWith('lead_resume:')) lead = await resumeLeadBot(leadChatId, selectedAccountKey, cb.from?.id) || lead;
     else if (data.startsWith('lead_manual:')) lead = await setLeadManualOnly(leadChatId, selectedAccountKey, cb.from?.id) || lead;
-    else if (data.startsWith('lead_start:')) lead = await manuallyStartLeadBot(leadChatId, selectedAccountKey, cb.from?.id) || lead;
+    else if (data.startsWith('lead_start:')) {
+      const started = await manuallyStartLeadBot(leadChatId, selectedAccountKey, cb.from?.id);
+      if (started?.automation_block_reason) {
+        return tg('sendMessage', {
+          chat_id: chatId,
+          text: `Campaign boshlanmadi: ${started.automation_block_reason}`
+        });
+      }
+      lead = started || lead;
+    }
     else if (data.startsWith('lead_reset_confirm:')) {
       return tg('sendMessage', {
         chat_id: chatId,
