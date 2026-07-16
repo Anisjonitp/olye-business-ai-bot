@@ -77,7 +77,9 @@ create table if not exists bot_accounts (
   reach_enabled boolean default true,
   followup_enabled boolean default true,
   archive_enabled boolean default true,
-  archive_notify_enabled boolean default true,
+  track_deleted_enabled boolean default true,
+  track_edited_enabled boolean default true,
+  archive_notify_enabled boolean default false,
   reports_enabled boolean default true,
   custom_commands_enabled boolean default true,
   ai_rules_enabled boolean default true,
@@ -249,7 +251,8 @@ alter table bot_accounts add column if not exists followup_enabled boolean defau
 alter table bot_accounts add column if not exists archive_enabled boolean default true;
 alter table bot_accounts add column if not exists track_deleted_enabled boolean default true;
 alter table bot_accounts add column if not exists track_edited_enabled boolean default true;
-alter table bot_accounts add column if not exists archive_notify_enabled boolean default true;
+alter table bot_accounts add column if not exists archive_notify_enabled boolean default false;
+alter table bot_accounts alter column archive_notify_enabled set default false;
 alter table bot_accounts add column if not exists reports_enabled boolean default true;
 alter table bot_accounts add column if not exists custom_commands_enabled boolean default true;
 alter table bot_accounts add column if not exists ai_rules_enabled boolean default true;
@@ -288,7 +291,8 @@ alter table business_accounts add column if not exists track_deleted_enabled boo
 alter table business_accounts add column if not exists track_edited_enabled boolean default true;
 alter table business_accounts add column if not exists media_archive_enabled boolean default true;
 alter table business_accounts add column if not exists media_archive_download boolean default false;
-alter table business_accounts add column if not exists archive_notify_enabled boolean default true;
+alter table business_accounts add column if not exists archive_notify_enabled boolean default false;
+alter table business_accounts alter column archive_notify_enabled set default false;
 alter table business_accounts add column if not exists reports_enabled boolean default true;
 alter table business_accounts add column if not exists ai_intent_enabled boolean default false;
 alter table business_accounts add column if not exists custom_commands_enabled boolean default true;
@@ -588,13 +592,15 @@ create table if not exists message_archive (
   deleted_at timestamptz,
   edit_count integer default 0,
   delete_detected boolean default false,
-  last_event_type text
+  last_event_type text,
+  updated_at timestamptz default now()
 );
 
 create table if not exists message_edit_history (
   id bigserial primary key,
   archive_id bigint,
   account_key text,
+  business_connection_id text,
   chat_id text not null,
   message_id bigint not null,
   old_text text,
@@ -704,9 +710,11 @@ alter table message_archive add column if not exists deleted_at timestamptz;
 alter table message_archive add column if not exists edit_count integer default 0;
 alter table message_archive add column if not exists delete_detected boolean default false;
 alter table message_archive add column if not exists last_event_type text;
+alter table message_archive add column if not exists updated_at timestamptz default now();
 
 alter table message_edit_history add column if not exists archive_id bigint;
 alter table message_edit_history add column if not exists account_key text;
+alter table message_edit_history add column if not exists business_connection_id text;
 alter table message_edit_history add column if not exists chat_id text;
 alter table message_edit_history add column if not exists message_id bigint;
 alter table message_edit_history add column if not exists old_text text;
@@ -790,10 +798,13 @@ create index if not exists message_archive_deleted_cleanup_idx
   on message_archive(deleted_at)
   where is_deleted = true;
 create index if not exists message_archive_edited_idx on message_archive(edited_at);
+create index if not exists message_archive_person_activity_idx
+  on message_archive(account_key, business_connection_id, chat_id, updated_at desc);
 create index if not exists message_archive_media_idx on message_archive(account_key, message_type) where file_id is not null;
 create index if not exists message_edit_history_chat_idx on message_edit_history(chat_id);
 create index if not exists message_edit_history_message_idx on message_edit_history(message_id);
 create index if not exists message_edit_history_account_idx on message_edit_history(account_key);
+create index if not exists message_edit_history_scope_idx on message_edit_history(account_key, business_connection_id, chat_id, message_id, edited_at);
 create index if not exists message_edit_history_edited_idx on message_edit_history(edited_at);
 create index if not exists ai_decisions_account_chat_idx on ai_decisions(account_key, chat_id, created_at desc);
 create index if not exists ai_decisions_intent_idx on ai_decisions(account_key, intent);
@@ -818,11 +829,11 @@ create unique index if not exists account_ai_rules_unique_idx on account_ai_rule
 create index if not exists account_ai_rules_enabled_idx on account_ai_rules(account_key, is_enabled, step_key);
 
 insert into bot_accounts (account_key, label, project_name, business_owner_id, admin_chat_id, flow_key, archive_enabled, archive_notify_enabled)
-values ('uzlye', 'UZLYE', 'O‘zbekiston Lider Yoshlari Ensiklopediyasi', null, null, 'uzlye_info_only', true, true)
+values ('uzlye', 'UZLYE', 'O‘zbekiston Lider Yoshlari Ensiklopediyasi', null, null, 'uzlye_info_only', true, false)
 on conflict (account_key) do nothing;
 
 insert into bot_accounts (account_key, label, project_name, business_owner_id, admin_chat_id, flow_key, archive_enabled, archive_notify_enabled)
-values ('second', 'Ikkinchi akkaunt', 'Millat Iftixorlari ensiklopediyasi', '8304283149', '8304283149', 'second_info_only', true, true)
+values ('second', 'Ikkinchi akkaunt', 'Millat Iftixorlari ensiklopediyasi', '8304283149', '8304283149', 'second_info_only', true, false)
 on conflict (account_key) do nothing;
 
 insert into account_flow_steps (account_key, flow_key, step_key, template_key, next_step_yes, next_step_no, next_step_partial, next_step_unknown, stop_after_send, sort_order, is_active)

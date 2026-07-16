@@ -187,7 +187,7 @@ function parseAccountsFromEnv() {
     auto_reply_enabled: true,
     reach_enabled: true,
     archive_enabled: true,
-    archive_notify_enabled: true
+    archive_notify_enabled: false
   }];
 
   if (!process.env.BUSINESS_ACCOUNTS_JSON) {
@@ -204,7 +204,7 @@ function parseAccountsFromEnv() {
         auto_reply_enabled: true,
         reach_enabled: true,
         archive_enabled: true,
-        archive_notify_enabled: true
+        archive_notify_enabled: false
       });
     }
     return fallback;
@@ -224,7 +224,7 @@ function parseAccountsFromEnv() {
       auto_reply_enabled: a.auto_reply_enabled !== false,
       reach_enabled: a.reach_enabled !== false,
       archive_enabled: a.archive_enabled !== false,
-      archive_notify_enabled: a.archive_notify_enabled !== false
+      archive_notify_enabled: a.archive_notify_enabled === true
     }));
   } catch (err) {
     console.error('BUSINESS_ACCOUNTS_JSON parse error:', err.message);
@@ -245,7 +245,7 @@ const DEFAULT_ACCOUNT = ENV_ACCOUNTS[0] || {
   auto_reply_enabled: true,
   reach_enabled: true,
   archive_enabled: true,
-  archive_notify_enabled: true
+  archive_notify_enabled: false
 };
 
 function normalizeAccount(account = {}) {
@@ -269,7 +269,7 @@ function normalizeAccount(account = {}) {
     archive_enabled: account.archive_enabled !== false,
     track_deleted_enabled: account.track_deleted_enabled !== false,
     track_edited_enabled: account.track_edited_enabled !== false,
-    archive_notify_enabled: account.archive_notify_enabled !== false,
+    archive_notify_enabled: account.archive_notify_enabled === true,
     reports_enabled: account.reports_enabled !== false,
     custom_commands_enabled: account.custom_commands_enabled !== false,
     ai_rules_enabled: account.ai_rules_enabled !== false,
@@ -384,7 +384,7 @@ async function getAccount(accountOrKey = DEFAULT_ACCOUNT_KEY) {
       reach_enabled: true,
       followup_enabled: true,
       archive_enabled: true,
-      archive_notify_enabled: true
+      archive_notify_enabled: false
     };
   }
   if (key === UNKNOWN_ACCOUNT_KEY) return unknownAccount();
@@ -441,7 +441,7 @@ function findAccountByUserId(accounts, userId) {
       reach_enabled: true,
       followup_enabled: true,
       archive_enabled: true,
-      archive_notify_enabled: true
+      archive_notify_enabled: false
     };
   }
   return null;
@@ -479,7 +479,7 @@ async function bindBusinessConnectionToAccount(accountOrKey, businessConnectionI
     archive_enabled: account.archive_enabled !== false,
     track_deleted_enabled: account.track_deleted_enabled !== false,
     track_edited_enabled: account.track_edited_enabled !== false,
-    archive_notify_enabled: account.archive_notify_enabled !== false,
+    archive_notify_enabled: account.archive_notify_enabled === true,
     reports_enabled: account.reports_enabled !== false,
     media_archive_enabled: account.media_archive_enabled !== false,
     media_archive_download: account.media_archive_download,
@@ -689,7 +689,7 @@ async function handleBusinessConnectionUpdate(connection = {}) {
       bot_enabled: true,
       auto_reply_enabled: true,
       archive_enabled: true,
-      archive_notify_enabled: true,
+      archive_notify_enabled: false,
       reports_enabled: true
     });
   }
@@ -876,7 +876,7 @@ async function rememberAccountBusinessConnection(account, businessConnectionId) 
     business_connection_id: String(businessConnectionId),
     flow_key: account.flow_key || 'info_only',
     archive_enabled: account.archive_enabled !== false,
-    archive_notify_enabled: account.archive_notify_enabled !== false,
+    archive_notify_enabled: account.archive_notify_enabled === true,
     updated_at: new Date().toISOString()
   }, { onConflict: 'account_key' });
   if (error) console.error('rememberAccountBusinessConnection:', error.message);
@@ -3287,7 +3287,9 @@ function messageArchiveMeta(msg = {}) {
   if (!media) return { messageType: msg.caption ? 'text' : 'other' };
   return {
     messageType: media.messageType,
-    fileId: media.file?.file_id || null
+    fileId: media.file?.file_id || null,
+    fileUniqueId: media.file?.file_unique_id || null,
+    fileName: media.file?.file_name || null
   };
 }
 
@@ -3304,15 +3306,21 @@ function messageArchivePayload(msg, account, direction, eventType = 'created') {
     business_connection_id: String(businessConnectionId),
     chat_id: String(msg.chat?.id || ''),
     message_id: msg.message_id || null,
+    from_id: msg.from?.id ? String(msg.from.id) : null,
+    from_username: msg.from?.username || null,
+    from_first_name: msg.from?.first_name || null,
     sender: messageArchiveSender(msg.from || msg.chat || {}),
     direction,
     message_type: meta.messageType,
     text: msg.text || null,
     caption: msg.caption || null,
     file_id: meta.fileId || null,
+    file_unique_id: meta.fileUniqueId || null,
+    file_name: meta.fileName || null,
     sent_at: msg.date ? new Date(Number(msg.date) * 1000).toISOString() : new Date().toISOString(),
     is_deleted: false,
-    last_event_type: eventType
+    last_event_type: eventType,
+    updated_at: new Date().toISOString()
   };
 }
 
@@ -3353,29 +3361,34 @@ async function archiveEditedBusinessMessage(msg) {
     messageId: payload.message_id,
     accountKey: payload.account_key
   });
-  await supabase.from('message_edit_history').insert({
-    archive_id: oldRow?.id || null,
-    account_key: payload.account_key,
-    chat_id: payload.chat_id,
-    message_id: payload.message_id,
-    old_text: oldRow?.text || null,
-    new_text: payload.text || null,
-    old_caption: oldRow?.caption || null,
-    new_caption: payload.caption || null
-  });
-
   const nextEditCount = Number(oldRow?.edit_count || 0) + 1;
   const { data: savedRow, error } = await supabase.from('message_archive').upsert({
     ...(oldRow || {}),
     ...payload,
     id: oldRow?.id,
     edited_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
     edit_count: nextEditCount,
     last_event_type: 'edited'
   }, { onConflict: 'account_key,business_connection_id,chat_id,message_id' }).select().maybeSingle();
   if (error) console.error('archiveEditedBusinessMessage:', error.message);
+  const historyRow = savedRow || oldRow;
+  if (historyRow?.id) {
+    const { error: historyError } = await supabase.from('message_edit_history').insert({
+      archive_id: historyRow.id,
+      account_key: payload.account_key,
+      business_connection_id: payload.business_connection_id,
+      chat_id: payload.chat_id,
+      message_id: payload.message_id,
+      old_text: oldRow?.text || null,
+      new_text: payload.text || null,
+      old_caption: oldRow?.caption || null,
+      new_caption: payload.caption || null
+    });
+    if (historyError) console.error('archiveEditedBusinessMessage history:', historyError.message);
+  }
 
-  if (account.archive_notify_enabled !== false) await notifyEditedMessage(account, oldRow, savedRow || payload, resolved.reason);
+  if (account.archive_notify_enabled === true) await notifyEditedMessage(account, oldRow, savedRow || payload, resolved.reason);
 }
 
 function deletedMessageIds(update = {}) {
@@ -3391,6 +3404,7 @@ async function handleDeletedBusinessMessages(update = {}) {
     if (!messageId) continue;
     const resolved = await resolveArchiveAccount(update, messageId, 'deleted');
     const account = resolved.account;
+    if (account?.archive_enabled === false || account?.track_deleted_enabled === false) continue;
     const ak = account.account_key;
     let oldRow = resolved.archived || await findArchivedMessage({
       businessConnectionId,
@@ -3410,14 +3424,20 @@ async function handleDeletedBusinessMessages(update = {}) {
       deleted_at: new Date().toISOString(),
       is_deleted: true,
       delete_detected: true,
-      last_event_type: 'deleted'
+      last_event_type: 'deleted',
+      updated_at: new Date().toISOString()
     };
     const storedRow = oldRow?.account_key === ak ? oldRow : null;
     const carry = oldRow ? {
       message_type: oldRow.message_type || 'other',
       text: oldRow.text || null,
       caption: oldRow.caption || null,
-      file_id: oldRow.file_id || null
+      file_id: oldRow.file_id || null,
+      file_unique_id: oldRow.file_unique_id || null,
+      file_name: oldRow.file_name || null,
+      from_id: oldRow.from_id || null,
+      from_username: oldRow.from_username || null,
+      from_first_name: oldRow.from_first_name || null
     } : {};
     const { data: savedRow, error } = await supabase.from('message_archive').upsert({
       ...(storedRow || {}),
@@ -3426,7 +3446,7 @@ async function handleDeletedBusinessMessages(update = {}) {
       id: storedRow?.id
     }, { onConflict: 'account_key,business_connection_id,chat_id,message_id' }).select().maybeSingle();
     if (error) console.error('handleDeletedBusinessMessages:', error.message);
-    if (account.archive_notify_enabled !== false) await notifyDeletedMessage(account, savedRow || (oldRow ? { ...oldRow, ...patch } : patch), resolved.reason);
+    if (account.archive_notify_enabled === true) await notifyDeletedMessage(account, savedRow || (oldRow ? { ...oldRow, ...patch } : patch), resolved.reason);
   }
 }
 
@@ -3448,6 +3468,20 @@ function deletedItemLabel(messageType = 'text', full = false) {
   return shortLabels[messageType] || 'xabarni';
 }
 
+function archiveMessageTypeLabel(row = {}) {
+  const labels = {
+    text: 'Matn',
+    photo: 'Rasm',
+    voice: 'Ovozli xabar',
+    video: 'Video',
+    video_note: 'Dumaloq video',
+    audio: 'Audio',
+    document: 'Hujjat',
+    sticker: 'Stiker'
+  };
+  return labels[row.message_type] || 'Xabar';
+}
+
 function archiveStoredContent(row = {}) {
   const text = String(row.text || '').trim();
   const caption = String(row.caption || '').trim();
@@ -3459,13 +3493,24 @@ function archiveStoredContent(row = {}) {
     video: 'Video',
     video_note: 'Dumaloq video',
     audio: 'Audio',
-    document: 'Hujjat',
+    document: row.file_name ? `Hujjat: ${row.file_name}` : 'Hujjat',
     sticker: 'Stiker'
   };
-  return labels[row.message_type] || 'Xabar o‘chirilishidan oldin saqlanmagan';
+  return labels[row.message_type] || 'Xabar o‘chirilishidan oldin saqlanmagan.';
+}
+
+async function reserveArchiveNotification(row, eventType) {
+  return markProcessedEvent({
+    accountKey: row.account_key,
+    updateId: `archive_notification:${row.account_key}:${row.business_connection_id}:${row.chat_id}:${row.message_id}:${eventType}`,
+    messageId: `${row.business_connection_id}:${row.chat_id}:${row.message_id}`,
+    eventType: `archive_notification_${eventType}`,
+    chatId: row.chat_id
+  });
 }
 
 async function notifyDeletedMessage(account, row, resolutionReason = '') {
+  if (!row?.id || !(await reserveArchiveNotification(row, 'deleted'))) return;
   const actor = archiveActor(row);
   const item = deletedItemLabel(row?.message_type);
   const targetAdminChatId = await getAdminChatIdForAccount(account.account_key);
@@ -3480,7 +3525,7 @@ async function notifyDeletedMessage(account, row, resolutionReason = '') {
     return;
   }
   await sendAdminForAccount(account.account_key, `🗑 <b>${html(actor)} ${html(item)} o‘chirdi</b>`, {
-    reply_markup: row?.id ? { inline_keyboard: [[{ text: '👁 Ko‘rish', callback_data: `archv:${account.account_key}:${row.id}` }]] } : undefined
+    reply_markup: { inline_keyboard: [[{ text: '👁 Ko‘rish', callback_data: `deleted_view:${row.id}` }]] }
   });
   await logEvent(row?.chat_id || 'unknown', 'archive_deleted_notification_sent', JSON.stringify({
     event_type: 'deleted',
@@ -3494,6 +3539,7 @@ async function notifyDeletedMessage(account, row, resolutionReason = '') {
 }
 
 async function notifyEditedMessage(account, oldRow, payload, resolutionReason = '') {
+  if (!payload?.id || !(await reserveArchiveNotification(payload, 'edited'))) return;
   const actor = archiveActor(payload);
   const targetAdminChatId = await getAdminChatIdForAccount(account.account_key);
   if (!targetAdminChatId) {
@@ -3507,7 +3553,7 @@ async function notifyEditedMessage(account, oldRow, payload, resolutionReason = 
     return;
   }
   await sendAdminForAccount(account.account_key, `✏️ <b>${html(actor)} xabarni tahrirladi</b>`, {
-    reply_markup: payload?.id ? { inline_keyboard: [[{ text: '👁 Ko‘rish', callback_data: `archv:${account.account_key}:${payload.id}` }]] } : undefined
+    reply_markup: { inline_keyboard: [[{ text: '👁 Ko‘rish', callback_data: `edited_view:${payload.id}` }]] }
   });
   await logEvent(payload.chat_id || 'unknown', 'archive_edited_notification_sent', JSON.stringify({
     event_type: 'edited',
@@ -3531,21 +3577,31 @@ async function getArchiveRowById(accountOrKey, id) {
   return data || null;
 }
 
-async function latestEditHistory(accountOrKey, row) {
-  if (!row) return null;
-  let q = supabase.from('message_edit_history')
-    .select('*')
-    .eq('chat_id', String(row.chat_id))
-    .eq('message_id', row.message_id)
-    .order('edited_at', { ascending: false })
-    .limit(1);
-  q = accountLeadFilter(q, accountOrKey);
-  const { data, error } = await q.maybeSingle();
+async function getArchiveRowByIdAny(id) {
+  const { data, error } = await supabase.from('message_archive').select('*').eq('id', String(id)).maybeSingle();
   if (error) {
-    console.error('latestEditHistory:', error.message);
+    console.error('getArchiveRowByIdAny:', error.message);
     return null;
   }
   return data || null;
+}
+
+async function archiveEditHistory(accountOrKey, row) {
+  if (!row) return null;
+  let q = supabase.from('message_edit_history')
+    .select('*')
+    .eq('archive_id', row.id)
+    .eq('business_connection_id', String(row.business_connection_id))
+    .eq('chat_id', String(row.chat_id))
+    .eq('message_id', row.message_id)
+    .order('edited_at', { ascending: true });
+  q = accountLeadFilter(q, accountOrKey);
+  const { data, error } = await q;
+  if (error) {
+    console.error('archiveEditHistory:', error.message);
+    return [];
+  }
+  return data || [];
 }
 
 async function sendArchiveFullDetail(chatId, accountOrKey, archiveId) {
@@ -3555,17 +3611,16 @@ async function sendArchiveFullDetail(chatId, accountOrKey, archiveId) {
   const actor = archiveActor(row);
   const isDeleted = row.is_deleted === true || row.delete_detected === true;
   if (!isDeleted && (row.last_event_type === 'edited' || Number(row.edit_count || 0) > 0)) {
-    const hist = await latestEditHistory(account.account_key, row);
-    await tg('sendMessage', {
-      chat_id: chatId,
-      parse_mode: 'HTML',
-      text:
-        `✏️ <b>${html(actor)} ushbu xabarni tahrirladi</b>\n\n` +
-        `Akkaunt: ${html(account.label || accountDisplayLabel(account.account_key))}\n\n` +
-        `Eski xabar:\n${html(short(hist?.old_text || hist?.old_caption || '-', 1200))}\n\n` +
-        `Yangi xabar:\n${html(short(hist?.new_text || hist?.new_caption || row.text || row.caption || '-', 1200))}\n\n` +
-        `Vaqt: ${row.edited_at || hist?.edited_at || '-'}`
-    });
+    const history = await archiveEditHistory(account.account_key, row);
+    await tg('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `✏️ <b>${html(actor)} xabarining tahrir tarixi</b>\nAkkaunt: ${html(account.label || accountDisplayLabel(account.account_key))}` });
+    for (const [index, hist] of history.entries()) {
+      await tg('sendMessage', {
+        chat_id: chatId,
+        parse_mode: 'HTML',
+        text: `✏️ <b>${index + 1}-tahrir</b>\n\nEski xabar:\n${html(short(hist.old_text || hist.old_caption || 'Xabar o‘chirilishidan oldin saqlanmagan.', 1200))}\n\nYangi xabar:\n${html(short(hist.new_text || hist.new_caption || archiveStoredContent(row), 1200))}\n\nVaqt: ${hist.edited_at || '-'}`
+      });
+    }
+    if (!history.length) await tg('sendMessage', { chat_id: chatId, text: 'Tahrir tarixi saqlanmagan.' });
     return;
   }
   const item = deletedItemLabel(row.message_type, true);
@@ -3575,9 +3630,11 @@ async function sendArchiveFullDetail(chatId, accountOrKey, archiveId) {
     parse_mode: 'HTML',
     text:
       `🗑 <b>${html(actor)} ushbu ${html(item)} o‘chirdi</b>\n\n` +
-      `Akkaunt: ${html(account.label || accountDisplayLabel(account.account_key))}` +
-      `\n\nO‘chirilgan xabar:\n${html(short(deletedText, 1200))}` +
-      `\n\nVaqt: ${row.deleted_at || '-'}`
+      `Akkaunt: ${html(account.label || accountDisplayLabel(account.account_key))}\n` +
+      `Yuborilgan vaqt: ${row.sent_at || '-'}\n` +
+      `O‘chirilgan vaqt: ${row.deleted_at || '-'}\n` +
+      `Turi: ${html(archiveMessageTypeLabel(row))}` +
+      `\n\nMatn:\n${html(short(deletedText, 1200))}`
   });
 }
 
@@ -4299,9 +4356,10 @@ async function getArchiveRows(type, accountOrKey = DEFAULT_ACCOUNT_KEY, chatId =
   if (chatId) q = q.eq('chat_id', String(chatId));
   if (businessConnectionId) q = q.eq('business_connection_id', String(businessConnectionId));
   if (type === 'deleted') q = q.eq('is_deleted', true).eq('direction', 'incoming').order('deleted_at', { ascending: false, nullsFirst: false });
-  if (type === 'edited') q = q.gt('edit_count', 0).order('edited_at', { ascending: false, nullsFirst: false });
+  if (type === 'edited') q = q.gt('edit_count', 0).eq('direction', 'incoming').order('edited_at', { ascending: false, nullsFirst: false });
+  if (type === 'all') q = q.eq('direction', 'incoming').or('is_deleted.eq.true,edit_count.gt.0').order('updated_at', { ascending: false, nullsFirst: false });
   if (type === 'media') q = q.not('file_id', 'is', null).order('created_at', { ascending: false });
-  if (!['deleted', 'edited', 'media'].includes(type)) q = q.order('created_at', { ascending: false });
+  if (!['deleted', 'edited', 'media', 'all'].includes(type)) q = q.order('created_at', { ascending: false });
   q = q.range(offset, offset + limit - 1);
   const { data, error } = await q;
   if (error) {
@@ -4315,12 +4373,12 @@ async function getArchivePeople(accountOrKey = DEFAULT_ACCOUNT_KEY, limit = 20) 
   const seen = new Map();
   const pageSize = 200;
   let offset = 0;
-  while (seen.size < limit) {
+  while (true) {
     let q = supabase.from('message_archive')
-      .select('id,account_key,business_connection_id,chat_id,sender,from_username,from_first_name,created_at,deleted_at')
-      .eq('is_deleted', true)
+      .select('id,account_key,business_connection_id,chat_id,sender,from_username,from_first_name,created_at,updated_at,deleted_at,edited_at,is_deleted,edit_count')
+      .or('is_deleted.eq.true,edit_count.gt.0')
       .eq('direction', 'incoming')
-      .order('deleted_at', { ascending: false, nullsFirst: false })
+      .order('updated_at', { ascending: false, nullsFirst: false })
       .range(offset, offset + pageSize - 1);
     q = archiveAccountFilter(q, accountOrKey);
     const { data, error } = await q;
@@ -4330,20 +4388,36 @@ async function getArchivePeople(accountOrKey = DEFAULT_ACCOUNT_KEY, limit = 20) 
     }
     for (const row of data || []) {
       const key = `${row.business_connection_id}:${row.chat_id}`;
-      if (!seen.has(key)) seen.set(key, row);
-      if (seen.size >= limit) break;
+      const existing = seen.get(key) || {
+        ...row,
+        deleted_count: 0,
+        edited_count: 0,
+        last_activity: row.updated_at || row.deleted_at || row.edited_at || row.created_at
+      };
+      if (row.is_deleted) existing.deleted_count += 1;
+      existing.edited_count += Number(row.edit_count || 0);
+      const current = new Date(existing.last_activity || 0).getTime();
+      const candidate = new Date(row.updated_at || row.deleted_at || row.edited_at || row.created_at || 0).getTime();
+      if (candidate > current) {
+        existing.last_activity = row.updated_at || row.deleted_at || row.edited_at || row.created_at;
+        existing.id = row.id;
+        existing.sender = row.sender || existing.sender;
+      }
+      seen.set(key, existing);
     }
     if ((data || []).length < pageSize) break;
     offset += pageSize;
   }
-  return [...seen.values()];
+  return [...seen.values()]
+    .sort((a, b) => new Date(b.last_activity || 0) - new Date(a.last_activity || 0))
+    .slice(0, limit);
 }
 
 async function sendArchivePeopleMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const account = await getAccount(accountOrKey);
   const people = await getArchivePeople(account.account_key);
   const rows = people.map(p => ([{
-    text: p.sender || (p.from_username ? `@${p.from_username}` : (p.from_first_name || String(p.chat_id))),
+    text: `👤 ${p.sender || (p.from_username ? `@${p.from_username}` : (p.from_first_name || String(p.chat_id)))} — ${p.deleted_count} ta o‘chirilgan xabar`,
     callback_data: `archp:${account.account_key}:${p.id}`
   }]));
   if (!rows.length) rows.push([{ text: 'Hozircha arxiv yo‘q', callback_data: 'noop' }]);
@@ -4366,7 +4440,7 @@ function archiveEventLabel(row = {}) {
 }
 
 function archiveEventButtonText(row = {}) {
-  const d = new Date(row.deleted_at || row.sent_at || row.created_at || Date.now());
+  const d = new Date(row.deleted_at || row.edited_at || row.updated_at || row.sent_at || row.created_at || Date.now());
   const date = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
   const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   return `${date} ${time} — ${short(archiveStoredContent(row), 36)}`;
@@ -4376,37 +4450,51 @@ async function sendArchivePersonEvents(chatId, accountOrKey, profileArchiveId) {
   const account = await getAccount(accountOrKey);
   const profile = await getArchiveRowById(account.account_key, profileArchiveId);
   if (!profile) return tg('sendMessage', { chat_id: chatId, text: 'Foydalanuvchi arxivi topilmadi.' });
-  const rows = await getArchiveRows('deleted', account.account_key, profile.chat_id, 5, profile.business_connection_id);
-  const buttons = rows.map(r => ([{ text: archiveEventButtonText(r), callback_data: `archv:${account.account_key}:${r.id}` }]));
-  if (!buttons.length) buttons.push([{ text: 'Bu foydalanuvchida o‘chirilgan xabar yo‘q', callback_data: 'noop' }]);
-  buttons.push([{ text: 'Hammasini ko‘rish', callback_data: `archall:${account.account_key}:${profile.id}:0` }]);
+  const [deletedRows, editedRows] = await Promise.all([
+    getArchiveRows('deleted', account.account_key, profile.chat_id, 1000, profile.business_connection_id),
+    getArchiveRows('edited', account.account_key, profile.chat_id, 1000, profile.business_connection_id)
+  ]);
+  const activityTimes = [...deletedRows, ...editedRows]
+    .map(row => row.updated_at || row.deleted_at || row.edited_at || row.created_at)
+    .filter(Boolean)
+    .sort();
+  const lastActivity = activityTimes[activityTimes.length - 1] || profile.updated_at || profile.created_at || '-';
+  const buttons = [
+    [{ text: `🗑 O‘chirilganlar (${deletedRows.length})`, callback_data: `archlist:${account.account_key}:${profile.id}:deleted:0` }],
+    [{ text: `✏️ Tahrirlanganlar (${editedRows.length})`, callback_data: `archlist:${account.account_key}:${profile.id}:edited:0` }],
+    [{ text: '📚 Hammasini ko‘rish', callback_data: `archlist:${account.account_key}:${profile.id}:all:0` }]
+  ];
   buttons.push([{ text: '⬅️ Arxiv', callback_data: `archa:${account.account_key}` }]);
   const person = profile.sender || archiveActor(profile);
   return tg('sendMessage', {
     chat_id: chatId,
-    text: `Joriy akkaunt: ${account.label || accountDisplayLabel(account.account_key)}\n\n${person}\n\nO‘chirilgan xabarlar`,
+    text: `Joriy akkaunt: ${account.label || accountDisplayLabel(account.account_key)}\n\n👤 ${person}\nChat ID: ${profile.chat_id}\nO‘chirilgan: ${deletedRows.length}\nTahrirlangan: ${editedRows.length}\nOxirgi faollik: ${lastActivity}`,
     reply_markup: { inline_keyboard: buttons }
   });
 }
 
 async function sendArchiveAllDeleted(chatId, accountOrKey, profileArchiveId, page = 0) {
+  return sendArchivePersonList(chatId, accountOrKey, profileArchiveId, 'deleted', page);
+}
+
+async function sendArchivePersonList(chatId, accountOrKey, profileArchiveId, type = 'deleted', page = 0) {
   const account = await getAccount(accountOrKey);
   const profile = await getArchiveRowById(account.account_key, profileArchiveId);
   if (!profile) return tg('sendMessage', { chat_id: chatId, text: 'Foydalanuvchi arxivi topilmadi.' });
   const pageSize = 20;
   const safePage = Math.max(0, Number(page) || 0);
-  const fetched = await getArchiveRows('deleted', account.account_key, profile.chat_id, pageSize + 1, profile.business_connection_id, safePage * pageSize);
+  const fetched = await getArchiveRows(type, account.account_key, profile.chat_id, pageSize + 1, profile.business_connection_id, safePage * pageSize);
   const hasNext = fetched.length > pageSize;
   const rows = fetched.slice(0, pageSize);
-  const buttons = rows.map(r => ([{ text: archiveEventButtonText(r), callback_data: `archv:${account.account_key}:${r.id}` }]));
+  const buttons = rows.map(r => ([{ text: archiveEventButtonText(r), callback_data: `${r.is_deleted ? 'deleted_view' : 'edited_view'}:${r.id}` }]));
   const paging = [];
-  if (safePage > 0) paging.push({ text: '⬅️ Oldingi', callback_data: `archall:${account.account_key}:${profile.id}:${safePage - 1}` });
-  if (hasNext) paging.push({ text: 'Keyingi ➡️', callback_data: `archall:${account.account_key}:${profile.id}:${safePage + 1}` });
+  if (safePage > 0) paging.push({ text: '⬅️ Oldingi', callback_data: `archlist:${account.account_key}:${profile.id}:${type}:${safePage - 1}` });
+  if (hasNext) paging.push({ text: 'Keyingi ➡️', callback_data: `archlist:${account.account_key}:${profile.id}:${type}:${safePage + 1}` });
   if (paging.length) buttons.push(paging);
   buttons.push([{ text: '⬅️ Foydalanuvchi', callback_data: `archp:${account.account_key}:${profile.id}` }]);
   return tg('sendMessage', {
     chat_id: chatId,
-    text: `${profile.sender || archiveActor(profile)}\n\nBarcha o‘chirilgan xabarlar, ${safePage + 1}-sahifa`,
+    text: `${profile.sender || archiveActor(profile)}\n\n${type === 'edited' ? 'Tahrirlangan xabarlar' : type === 'all' ? 'Barcha arxiv hodisalari' : 'Barcha o‘chirilgan xabarlar'}, ${safePage + 1}-sahifa`,
     reply_markup: { inline_keyboard: buttons }
   });
 }
@@ -4805,7 +4893,7 @@ async function sendAccountStatus(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
       `Business connection: ${account.business_connection_id || '-'}\n` +
       `Auto Reply: ${isAutoActive(auto) ? 'ON' : 'OFF'}\n` +
       `Archive: ${account.archive_enabled === false ? 'OFF' : 'ON'}\n` +
-      `Archive notify: ${account.archive_notify_enabled === false ? 'OFF' : 'ON'}\n` +
+      `Archive notify: ${account.archive_notify_enabled === true ? 'ON' : 'OFF'}\n` +
       `Active session: ${auto?.session_id || '-'}\n` +
       `Daily auto: ${daily.enabled ? `${daily.start_time}, ${daily.duration_hours}h` : 'OFF'}`
   });
@@ -4933,7 +5021,7 @@ async function sendArchiveSettingsMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KE
       `Deleted tracking: ${account.track_deleted_enabled !== false ? 'ON' : 'OFF'}\n` +
       `Edited tracking: ${account.track_edited_enabled !== false ? 'ON' : 'OFF'}\n` +
       `Media archive: ${account.media_archive_enabled !== false ? 'ON' : 'OFF'}\n` +
-      `Admin notification: ${account.archive_notify_enabled !== false ? 'ON' : 'OFF'}\n` +
+      `Admin notification: ${account.archive_notify_enabled === true ? 'ON' : 'OFF'}\n` +
       `Media download: ${account.media_archive_download ? 'ON' : 'OFF'}`,
     reply_markup: {
       inline_keyboard: [
@@ -4941,8 +5029,9 @@ async function sendArchiveSettingsMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KE
         row('O‘chirilgan xabarlarni kuzatish', 'track_deleted_enabled', account.track_deleted_enabled !== false),
         row('Tahrirlangan xabarlarni kuzatish', 'track_edited_enabled', account.track_edited_enabled !== false),
         row('Media arxiv', 'media_archive_enabled', account.media_archive_enabled !== false),
-        row('Admin notification', 'archive_notify_enabled', account.archive_notify_enabled !== false),
+        row('Admin notification', 'archive_notify_enabled', account.archive_notify_enabled === true),
         row('Media download', 'media_archive_download', Boolean(account.media_archive_download)),
+        [{ text: '🗑 O‘chirilgan xabarlar', callback_data: `archa:${account.account_key}` }],
         [{ text: '⬅️ Orqaga', callback_data: 'menu' }]
       ]
     }
@@ -6989,6 +7078,19 @@ async function handleCallback(cb) {
     if (!accountSetHas(ownedAccountKeys, ak)) return denyAccount();
     await setSelectedAccountKey(chatId, ak, cb.from?.id);
     return sendArchiveAllDeleted(chatId, ak, profileArchiveId, page);
+  }
+  if (data.startsWith('archlist:')) {
+    const [, ak, profileArchiveId, type, page] = data.split(':');
+    if (!accountSetHas(ownedAccountKeys, ak)) return denyAccount();
+    await setSelectedAccountKey(chatId, ak, cb.from?.id);
+    return sendArchivePersonList(chatId, ak, profileArchiveId, ['deleted', 'edited', 'all'].includes(type) ? type : 'deleted', page);
+  }
+  if (data.startsWith('deleted_view:') || data.startsWith('edited_view:')) {
+    const archiveId = data.split(':')[1];
+    const row = await getArchiveRowByIdAny(archiveId);
+    if (!row || !accountSetHas(ownedAccountKeys, row.account_key)) return denyAccount();
+    await setSelectedAccountKey(chatId, row.account_key, cb.from?.id);
+    return sendArchiveFullDetail(chatId, row.account_key, archiveId);
   }
   if (data.startsWith('archv:')) {
     const [, ak, archiveId] = data.split(':');
