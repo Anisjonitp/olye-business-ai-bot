@@ -44,6 +44,21 @@ node index.js
 
 Environment Variables uchun `.env.example` fayliga qarang.
 
+Arxiv retention muddati `ARCHIVE_RETENTION_DAYS=30` orqali boshqariladi. Bot kuniga bir marta 30 kundan eski chat arxivi va tahrir tarixini tozalaydi.
+
+SaaS workspace qatlami dastlab passiv holatda deploy qilinadi:
+
+```text
+SAAS_PLATFORM_ENABLED=false
+NEW_USER_ONBOARDING_ENABLED=false
+FLOW_BUILDER_ENABLED=false
+SUBSCRIPTION_ENFORCEMENT_ENABLED=false
+SAAS_TEST_USER_IDS=
+PLATFORM_SUPER_ADMIN_IDS=
+```
+
+Bu flaglar `false` bo‘lsa, mavjud UZLYE va ikkinchi account eski `account_key` routing, template, flow, lead va timer oqimida ishlashda davom etadi. PHASE 1 migration mavjud accountlarni internal workspace sifatida bog‘laydi, ammo runtime oqimini yangi subscription qoidalariga o‘tkazmaydi.
+
 Muhim test-mode sozlamalari:
 
 ```text
