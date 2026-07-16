@@ -55,6 +55,10 @@ const SAAS_TEST_USER_IDS = envIdSet(process.env.SAAS_TEST_USER_IDS || '');
 const PLATFORM_SUPER_ADMIN_IDS = envIdSet(process.env.PLATFORM_SUPER_ADMIN_IDS || process.env.PLATFORM_OWNER_IDS || '');
 const TRIAL_DAYS = Math.max(1, Number(process.env.TRIAL_DAYS || 3));
 const PLATFORM_SUPPORT_CONTACT = process.env.PLATFORM_SUPPORT_CONTACT || '';
+const NEW_WORKSPACE_TEMPLATE_PACK = process.env.NEW_WORKSPACE_TEMPLATE_PACK || 'info_only_v1';
+const NEW_WORKSPACE_FLOW_PACK = process.env.NEW_WORKSPACE_FLOW_PACK || 'info_only_v1';
+const CRM_PRO_FEATURES_ENABLED = String(process.env.CRM_PRO_FEATURES_ENABLED || 'false') === 'true';
+const ARCHIVE_ENABLED = String(process.env.ARCHIVE_ENABLED || 'true') === 'true';
 const AI_INTENT_ENABLED = String(process.env.AI_INTENT_ENABLED || 'true') === 'true';
 const AI_TEMPLATE_EDITOR_ENABLED = String(process.env.AI_TEMPLATE_EDITOR_ENABLED || 'true') === 'true';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
@@ -332,6 +336,26 @@ function accountKey(accountOrKey = DEFAULT_ACCOUNT_KEY) {
 
 function resolveLegacyAccountKey(workspaceBusinessAccount = {}) {
   return normalizeAccountKey(workspaceBusinessAccount.existing_account_key || workspaceBusinessAccount.account_key || DEFAULT_ACCOUNT_KEY);
+}
+
+function newUserOnboardingIsEnabled() {
+  return SAAS_PLATFORM_ENABLED && NEW_USER_ONBOARDING_ENABLED;
+}
+
+function stableWorkspaceKeyFragment(value = '') {
+  let first = 5381;
+  let second = 52711;
+  for (const char of String(value)) {
+    const code = char.charCodeAt(0);
+    first = ((first * 33) ^ code) >>> 0;
+    second = ((second * 31) + code) >>> 0;
+  }
+  return `${first.toString(36)}${second.toString(36)}`;
+}
+
+function newWorkspaceAccountKey(telegramUserId, businessConnectionId) {
+  const owner = String(telegramUserId || 'owner').replace(/[^a-zA-Z0-9]/g, '').slice(-18) || 'owner';
+  return `ws_${owner}_${stableWorkspaceKeyFragment(businessConnectionId)}`;
 }
 
 async function resolveWorkspaceByAccountKey(accountOrKey = DEFAULT_ACCOUNT_KEY) {
@@ -931,13 +955,251 @@ async function setAccountReachEnabled(accountOrKey, enabled, actorId = '') {
   return account;
 }
 
+async function isInternalLegacyBusinessAccount(account = null) {
+  if (!account?.account_key) return false;
+  const key = normalizeAccountKey(account.account_key);
+  const protectedKeys = new Set([
+    DEFAULT_ACCOUNT_KEY,
+    normalizeAccountKey(process.env.SECOND_ACCOUNT_KEY || 'second'),
+    'liderlar'
+  ]);
+  if (protectedKeys.has(key)) return true;
+  const tenant = await resolveWorkspaceByAccountKey(key);
+  return tenant?.workspace?.is_platform_internal === true;
+}
+
+async function markWorkspaceBusinessConnectionStatus(businessConnectionId, status, reason = null) {
+  if (!businessConnectionId) return null;
+  const now = new Date().toISOString();
+  const patch = {
+    status,
+    updated_at: now
+  };
+  if (status === 'connected') {
+    patch.last_subscription_block_reason = null;
+    patch.last_subscription_blocked_at = null;
+  } else if (reason) {
+    patch.last_subscription_block_reason = reason;
+    patch.last_subscription_blocked_at = now;
+  }
+  const { data, error } = await supabase.from('workspace_business_accounts')
+    .update(patch)
+    .eq('business_connection_id', String(businessConnectionId))
+    .select('*')
+    .maybeSingle();
+  if (error && !isMissingTableError(error)) console.error('markWorkspaceBusinessConnectionStatus:', error.message);
+  return data || null;
+}
+
+async function provisionNewWorkspaceBusinessConnection(connection = {}) {
+  const businessConnectionId = String(connection.id || connection.business_connection_id || '');
+  const user = connection.user || {};
+  const ownerTelegramId = String(user.id || connection.user_chat_id || connection.user_id || '');
+  if (!businessConnectionId || !ownerTelegramId) return { ok: false, reason: 'business_connection_owner_missing' };
+  const workspaceName = String(user.first_name || user.username || `Workspace ${ownerTelegramId}`).trim().slice(0, 120);
+  const { data, error } = await supabase.rpc('provision_workspace_business_connection', {
+    p_owner_telegram_id: ownerTelegramId,
+    p_owner_username: user.username || null,
+    p_owner_first_name: user.first_name || null,
+    p_workspace_name: workspaceName,
+    p_business_connection_id: businessConnectionId,
+    p_account_key: newWorkspaceAccountKey(ownerTelegramId, businessConnectionId),
+    p_template_pack_key: NEW_WORKSPACE_TEMPLATE_PACK,
+    p_flow_pack_key: NEW_WORKSPACE_FLOW_PACK,
+    p_trial_days: TRIAL_DAYS
+  });
+  if (error) {
+    console.error('[ONBOARDING] provision:', error.message);
+    return { ok: false, reason: error.message || 'workspace_provision_failed' };
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row?.workspace_id || !row?.account_key) return { ok: false, reason: 'workspace_provision_empty_result' };
+  return { ok: true, row, ownerTelegramId, user };
+}
+
+function onboardingSubscriptionText(row = {}) {
+  if (row.subscription_status === 'trial' && row.trial_ends_at) {
+    return `3 kunlik trial faol. Tugash: ${formatSubscriptionDate(row.trial_ends_at)}`;
+  }
+  if (row.subscription_status === 'pro') return 'PRO tarif faol.';
+  return 'Trial avtomatik faollashtirilmadi. Tarif holatini ko‘rish uchun administrator bilan bog‘laning.';
+}
+
+async function sendNewWorkspaceConnectedMessage({ ownerTelegramId, row }) {
+  const text =
+    `✅ Business akkaunt workspace’ga muvaffaqiyatli ulandi.\n\n` +
+    `Akkaunt: ${row.account_key}\n` +
+    `${onboardingSubscriptionText(row)}\n\n` +
+    `Default shablonlar va info-only flow nusxalandi. Sozlamalarni ochish uchun /menu buyrug‘ini yuboring.`;
+  await tg('sendMessage', {
+    chat_id: ownerTelegramId,
+    text,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '⚙️ Sozlash menyusi', callback_data: 'onboarding_open_menu' }],
+        [{ text: '🔄 Ulanish holati', callback_data: 'onboarding_status' }]
+      ]
+    }
+  });
+}
+
+async function getUserOnboardingWorkspaces(telegramUserId) {
+  const { data: user, error: userError } = await supabase.from('platform_users')
+    .select('id')
+    .eq('telegram_user_id', String(telegramUserId || ''))
+    .maybeSingle();
+  if (userError || !user?.id) return [];
+  const { data: members, error: memberError } = await supabase.from('workspace_members')
+    .select('workspace_id,role,is_active')
+    .eq('user_id', user.id)
+    .eq('is_active', true);
+  if (memberError || !members?.length) return [];
+  const workspaceIds = members.map(row => row.workspace_id);
+  const [workspaceResult, accountResult, subscriptionResult] = await Promise.all([
+    supabase.from('workspaces').select('*').in('id', workspaceIds),
+    supabase.from('workspace_business_accounts').select('*').in('workspace_id', workspaceIds),
+    supabase.from('subscriptions').select('*').in('workspace_id', workspaceIds)
+  ]);
+  if (workspaceResult.error || accountResult.error || subscriptionResult.error) return [];
+  const membersByWorkspace = new Map(members.map(row => [row.workspace_id, row]));
+  const accountByWorkspace = new Map((accountResult.data || []).map(row => [row.workspace_id, row]));
+  const subscriptionByWorkspace = new Map((subscriptionResult.data || []).map(row => [row.workspace_id, row]));
+  return (workspaceResult.data || []).map(workspace => ({
+    workspace,
+    membership: membersByWorkspace.get(workspace.id),
+    account: accountByWorkspace.get(workspace.id) || null,
+    subscription: subscriptionByWorkspace.get(workspace.id) || null
+  }));
+}
+
+async function sendUserOnboardingMenu(chatId, user = {}) {
+  const items = await getUserOnboardingWorkspaces(user.id);
+  const externalItems = items.filter(item => item.workspace?.is_platform_internal !== true);
+  if (!externalItems.length) {
+    return tg('sendMessage', {
+      chat_id: chatId,
+      text:
+        `🚀 ${PLATFORM_NAME}\n\n` +
+        `Workspace yaratish uchun Telegram Business profilingizda botni Business bot sifatida ulang. ` +
+        `Ulanish muvaffaqiyatli bo‘lgach, workspace, default shablonlar va 3 kunlik trial avtomatik yaratiladi.`,
+      reply_markup: { inline_keyboard: [[{ text: '🔄 Ulanish holati', callback_data: 'onboarding_status' }]] }
+    });
+  }
+  const lines = externalItems.map(item => {
+    const account = item.account;
+    const subscription = item.subscription || {};
+    const expiry = subscriptionExpiryAt(subscription);
+    return [
+      `• ${item.workspace.name || item.workspace.workspace_key}`,
+      `  Business: ${account?.status || 'pending'}`,
+      `  Tarif: ${subscription.status || 'pending'}${expiry ? `, ${formatSubscriptionDate(expiry)}` : ''}`
+    ].join('\n');
+  });
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: `🚀 ${PLATFORM_NAME}\n\n${lines.join('\n\n')}`,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '⚙️ Sozlash menyusi', callback_data: 'onboarding_open_menu' }],
+        [{ text: '🔄 Yangilash', callback_data: 'onboarding_status' }, { text: '🔗 Ulanish yordamchisi', callback_data: 'onboarding_help' }]
+      ]
+    }
+  });
+}
+
+async function handleUserOnboardingMessage(msg = {}) {
+  if (!newUserOnboardingIsEnabled()) return false;
+  const chatId = String(msg.chat?.id || '');
+  const user = msg.from || {};
+  const text = normalizeCommandWord(String(msg.text || '').trim().split(/\s+/)[0]);
+  if (!chatId || !user.id || (msg.chat?.type && msg.chat.type !== 'private')) return false;
+  if (!['/start', '/onboarding', '/ulanish', '/ulanishholati'].includes(text)) return false;
+  if (text === '/start' && await isKnownAdminMessage(msg)) return false;
+  await sendUserOnboardingMenu(chatId, user);
+  return true;
+}
+
+async function handleUserOnboardingCallback(cb = {}) {
+  if (!newUserOnboardingIsEnabled()) return false;
+  const data = String(cb.data || '');
+  const chatId = String(cb.message?.chat?.id || '');
+  const user = cb.from || {};
+  if (!chatId || !user.id || !data.startsWith('onboarding_')) return false;
+  if (data === 'onboarding_open_menu') {
+    const items = await getUserOnboardingWorkspaces(user.id);
+    const item = items.find(row => row.workspace?.is_platform_internal !== true && row.account?.existing_account_key);
+    if (!item?.account?.existing_account_key) return sendUserOnboardingMenu(chatId, user);
+    await setSelectedAccountKey(chatId, item.account.existing_account_key, user.id);
+    return sendDashboard(chatId, item.account.existing_account_key, user.id);
+  }
+  if (data === 'onboarding_help') {
+    return tg('sendMessage', {
+      chat_id: chatId,
+      text: 'Telegram Business profilingizdagi Business bot sozlamasidan ushbu botni ulang. Ulanish tasdiqlangach bot workspace va 3 kunlik trialni avtomatik tayyorlaydi.'
+    });
+  }
+  return sendUserOnboardingMenu(chatId, user);
+}
+
 async function handleBusinessConnectionUpdate(connection = {}) {
   const businessConnectionId = connection.id || connection.business_connection_id || '';
   const user = connection.user || {};
   const userId = user.id || connection.user_chat_id || connection.user_id || '';
   if (!businessConnectionId) return;
   const accounts = await getAccounts();
-  let account = findAccountByUserId(accounts, userId);
+  const existingMapping = await findBusinessConnectionMapping(businessConnectionId);
+  const mappedAccount = existingMapping?.account_key
+    ? accounts.find(row => accountKeyMatches(row.account_key, existingMapping.account_key)) || await getAccount(existingMapping.account_key)
+    : null;
+
+  if (connection.is_enabled === false) {
+    await markWorkspaceBusinessConnectionStatus(businessConnectionId, 'disconnected', 'business_connection_disabled');
+    if (mappedAccount && userId) {
+      await tg('sendMessage', {
+        chat_id: userId,
+        text: '⚠️ Telegram Business ulanishi o‘chirildi. Avtomatik javob, reach va follow-up to‘xtatildi.'
+      }).catch(err => console.error('business_connection disconnect notify:', err.message));
+    }
+    await logEvent('business_connection', 'business_connection_disconnected', JSON.stringify({
+      business_connection_id: businessConnectionId,
+      account_key: mappedAccount?.account_key || null,
+      user_id: userId || null
+    }), mappedAccount?.account_key || UNKNOWN_ACCOUNT_KEY);
+    return;
+  }
+
+  const ownerAccount = findAccountByUserId(accounts, userId);
+  if (newUserOnboardingIsEnabled() && !mappedAccount && !(await isInternalLegacyBusinessAccount(ownerAccount))) {
+    const provisioned = await provisionNewWorkspaceBusinessConnection(connection);
+    if (!provisioned.ok) {
+      await logEvent('business_connection', 'workspace_provision_failed', JSON.stringify({
+        business_connection_id: businessConnectionId,
+        user_id: userId || null,
+        reason: provisioned.reason
+      }), UNKNOWN_ACCOUNT_KEY);
+      if (userId) {
+        await tg('sendMessage', {
+          chat_id: userId,
+          text: '⚠️ Business ulanishi qabul qilindi, lekin workspace tayyorlanmadi. Iltimos, birozdan keyin /onboarding buyrug‘i bilan holatni tekshiring.'
+        }).catch(err => console.error('workspace provision failure notify:', err.message));
+      }
+      return;
+    }
+    const account = await getAccount(provisioned.row.account_key);
+    await markWorkspaceBusinessConnectionStatus(businessConnectionId, 'connected');
+    await sendNewWorkspaceConnectedMessage({ ownerTelegramId: provisioned.ownerTelegramId, row: provisioned.row })
+      .catch(err => console.error('workspace provision notify:', err.message));
+    await logEvent('business_connection', provisioned.row.already_connected ? 'business_connection_already_bound' : 'workspace_business_connection_provisioned', JSON.stringify({
+      business_connection_id: businessConnectionId,
+      account_key: account.account_key,
+      workspace_id: provisioned.row.workspace_id,
+      subscription_status: provisioned.row.subscription_status,
+      trial_reason: provisioned.row.trial_reason || null
+    }), account.account_key);
+    return;
+  }
+
+  let account = mappedAccount || ownerAccount;
   if (!account) {
     const label = user.username || user.first_name || String(userId || businessConnectionId);
     account = normalizeAccount({
@@ -958,6 +1220,7 @@ async function handleBusinessConnectionUpdate(connection = {}) {
       reports_enabled: true
     });
   }
+  await markWorkspaceBusinessConnectionStatus(businessConnectionId, 'connected');
   await bindBusinessConnectionToAccount(account, businessConnectionId, {
     id: userId,
     username: user.username,
@@ -5572,6 +5835,7 @@ async function sendCommandsMenu(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, opti
   const commands = allCommands.filter(cmd => isCommandArchived(cmd) === archived);
   const rows = [
     [{ text: '📋 Buyruqlar ro‘yxati', callback_data: 'cmd_list' }],
+    [{ text: '➕ Yangi buyruq', callback_data: 'cmd_add' }],
     [{ text: '📦 Arxiv', callback_data: 'cmd_archive_list' }]
   ];
   for (const cmd of commands.slice(0, 20)) {
@@ -5948,6 +6212,39 @@ async function sendDashboard(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, fromId 
       `⏰ Eslatma kerak: ${due} ta`,
     reply_markup: mainMenuKeyboard(accounts.length > 1, showCommands, account)
   });
+}
+
+async function sendWorkspaceLeadPanel(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = await getAccount(accountOrKey);
+  const tenant = await resolveWorkspaceByAccountKey(account.account_key);
+  let query = supabase.from('business_leads').select('*').eq('account_key', account.account_key).order('updated_at', { ascending: false }).limit(12);
+  if (tenant?.workspaceAccount?.id) query = query.eq('workspace_business_account_id', tenant.workspaceAccount.id);
+  const { data, error } = await query;
+  if (error) return tg('sendMessage', { chat_id: chatId, text: `Lidlar o‘qilmadi: ${error.message}` });
+  const lines = (data || []).map((lead, index) => `${index + 1}. ${lead.first_name || lead.username || lead.chat_id}\n${lead.stage || 'new'} | ${lead.handoff_status || (lead.needs_human ? 'operator kutmoqda' : 'bot')}`).join('\n\n');
+  return tg('sendMessage', { chat_id: chatId, text: `👥 Lidlar\n\n${lines || 'Hozircha lid yo‘q.'}` });
+}
+
+async function sendWorkspaceOperators(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const tenant = await resolveWorkspaceByAccountKey(accountOrKey);
+  if (!tenant?.workspace_id) return tg('sendMessage', { chat_id: chatId, text: 'Workspace topilmadi.' });
+  const { data, error } = await supabase.from('workspace_members')
+    .select('role,is_active,platform_users(telegram_user_id,username,first_name)')
+    .eq('workspace_id', tenant.workspace_id)
+    .eq('is_active', true);
+  if (error) return tg('sendMessage', { chat_id: chatId, text: `Operatorlar o‘qilmadi: ${error.message}` });
+  const lines = (data || []).map((row, index) => `${index + 1}. ${row.platform_users?.first_name || row.platform_users?.username || row.platform_users?.telegram_user_id || '-'} — ${row.role}`).join('\n');
+  return tg('sendMessage', { chat_id: chatId, text: `👨‍💼 Operatorlar va rollar\n\n${lines || 'Hozircha a’zo yo‘q.'}` });
+}
+
+async function sendFollowupSettings(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const tenant = await resolveWorkspaceByAccountKey(accountOrKey);
+  if (!tenant?.account_id) return tg('sendMessage', { chat_id: chatId, text: 'Follow-up sozlamasi uchun workspace topilmadi.' });
+  const { data, error } = await supabase.from('followup_policies')
+    .select('*').eq('workspace_business_account_id', tenant.account_id).order('updated_at', { ascending: false }).limit(10);
+  if (error) return tg('sendMessage', { chat_id: chatId, text: `Follow-up sozlamalari o‘qilmadi: ${error.message}` });
+  const lines = (data || []).map(row => `${row.step_key || 'umumiy'}: ${row.is_enabled ? 'ON' : 'OFF'}, ${row.first_wait_minutes} daqiqa, max ${row.max_sends}`).join('\n');
+  return tg('sendMessage', { chat_id: chatId, text: `⏱ Follow-up\n\n${lines || 'Hozircha policy yo‘q. Flow builderdan bosqichga follow-up biriktiring.'}` });
 }
 
 async function sendUserTariff(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY, telegramUserId = chatId) {
@@ -6834,14 +7131,13 @@ async function sendPlatformTestNotification(chatId, accountKey, adminUser = {}) 
 
 function mainMenuKeyboard(showAccounts = false, showCommands = false, account = null) {
   const rows = [
-      [{ text: '👤 Akkaunt tanlash', callback_data: 'accounts' }],
-      [{ text: '💎 Tarif', callback_data: 'tariff' }],
-      [{ text: '✏️ Shablonlar', callback_data: 'templates' }],
-      [{ text: '🔁 Ketma-ketlik', callback_data: 'flow_menu' }],
-      [{ text: '🧠 AI qoidalar', callback_data: 'rules_menu' }],
-      [{ text: '🕵️ Arxiv sozlamalari', callback_data: 'archive_settings' }],
-      [{ text: '📈 Hisobotlar', callback_data: 'report' }],
-      [{ text: '🩺 Diagnostika', callback_data: 'diagnostics' }]
+      [{ text: '🤖 Bot holati', callback_data: 'account_status' }, { text: '📣 Reach', callback_data: 'outreach_menu' }],
+      [{ text: '🧩 Shablonlar', callback_data: 'templates' }, { text: '🔀 Ketma-ketlik', callback_data: 'flow_menu' }],
+      [{ text: '⏱ Follow-up', callback_data: 'followup_menu' }, { text: '👥 Lidlar', callback_data: 'workspace_leads' }],
+      [{ text: '🕵️ Chat arxivi', callback_data: 'archive_menu' }, { text: '👨‍💼 Operatorlar', callback_data: 'workspace_operators' }],
+      [{ text: '🔗 Business akkaunt', callback_data: 'account_status' }, { text: '💎 Tarif', callback_data: 'tariff' }],
+      [{ text: '⚙️ Sozlamalar', callback_data: 'settings' }, { text: '🆘 Yordam', callback_data: 'platform_help' }],
+      [{ text: '👤 Akkaunt tanlash', callback_data: 'accounts' }]
   ];
   if (account) {
     rows.splice(1, 0, [
@@ -6852,7 +7148,7 @@ function mainMenuKeyboard(showAccounts = false, showCommands = false, account = 
     ]);
   }
   if (showCommands) rows.splice(1, 0, [{ text: '🧩 Buyruqlar', callback_data: 'commands_menu' }]);
-  if (!showAccounts) rows[0][0].text = '👤 Akkaunt';
+  if (!showAccounts) rows[6][0].text = '👤 Akkaunt';
   return { inline_keyboard: rows };
 }
 
@@ -8140,6 +8436,7 @@ async function handleCallback(cb) {
   const chatId = cb.message?.chat?.id;
   await answerCallback(cb.id);
   if (!chatId) return;
+  if (await handleUserOnboardingCallback(cb)) return;
   const selectedAccountKey = await getPublicSelectedAccountKey(chatId, cb.from?.id);
   const ownedAccountKeys = new Set((await getPublicOwnedAccounts(chatId, cb.from?.id)).map(a => a.account_key));
   const denyAccount = () => commandManagementDenied(chatId);
@@ -8155,6 +8452,14 @@ async function handleCallback(cb) {
 
   if (data === 'menu' || data === 'noop') return sendDashboard(chatId, selectedAccountKey, cb.from?.id);
   if (data === 'accounts') return sendAccountsMenu(chatId, cb.from?.id);
+  if (data === 'account_status') return sendAccountStatus(chatId, selectedAccountKey);
+  if (data === 'workspace_leads') return sendWorkspaceLeadPanel(chatId, selectedAccountKey);
+  if (data === 'workspace_operators') return sendWorkspaceOperators(chatId, selectedAccountKey);
+  if (data === 'followup_menu') return sendFollowupSettings(chatId, selectedAccountKey);
+  if (data === 'platform_help') return tg('sendMessage', {
+    chat_id: chatId,
+    text: '🆘 Yordam\n\nBusiness akkauntini ulang, shablon va ketma-ketlikni sozlang, reachni faollashtiring. Tarif tugaganda avtomatlashtirish to‘xtaydi, ammo ma’lumotlar va menyu saqlanadi.'
+  });
   if (data === 'tariff') return sendUserTariff(chatId, selectedAccountKey, cb.from?.id);
   if (data.startsWith('account_bot:')) {
     const allowedAccountKey = await getCommandManagementAccountKey(chatId, cb.from?.id, selectedAccountKey);
@@ -8181,6 +8486,7 @@ async function handleCallback(cb) {
     const commandAccountKey = await getCommandManagementAccountKey(chatId, cb.from?.id, selectedAccountKey);
     if (!commandAccountKey) return commandManagementDenied(chatId);
     if (data === 'cmd_menu' || data === 'commands_menu' || data === 'cmd_list') return sendCommandsMenu(chatId, commandAccountKey);
+    if (data === 'cmd_add' || data === 'command_add') return startCommandCreate(chatId, commandAccountKey, cb.from || {});
     if (data === 'cmd_archive_list') return sendCommandsMenu(chatId, commandAccountKey, { archived: true });
     if (data === 'command_cancel' || data === 'cmd_cancel') {
       await setSelectedAccountKey(chatId, commandAccountKey, cb.from?.id);
@@ -8215,7 +8521,7 @@ async function handleCallback(cb) {
       await tg('sendMessage', { chat_id: chatId, text: `♻️ /${saved.command_key || key} qayta tiklandi.` });
       return sendCommandDetail(chatId, commandAccountKey, saved.command_key || key);
     }
-    return tg('sendMessage', { chat_id: chatId, text: 'Yangi buyruq qo‘shish va kengaytirilgan sozlash hozircha o‘chirilgan.' });
+    return tg('sendMessage', { chat_id: chatId, text: 'Buyruq amali topilmadi.' });
   }
   if (data.startsWith('lead_')) {
     const leadChatId = data.split(':')[1];
@@ -8661,6 +8967,7 @@ app.post('/webhook', async (req, res) => {
     const update = req.body || {};
     if (update.callback_query) await handleCallback(update.callback_query);
     if (update.message) {
+      if (await handleUserOnboardingMessage(update.message)) return;
       const text = normalizeCommandWord(String(update.message.text || '').trim().split(/\s+/)[0]);
       if (text === '/whoami') {
         await replyWhoami(update.message, 'message');
