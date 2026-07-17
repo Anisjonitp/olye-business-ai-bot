@@ -46,6 +46,8 @@ Environment Variables uchun `.env.example` fayliga qarang.
 
 Arxiv retention muddati `ARCHIVE_RETENTION_DAYS=30` orqali boshqariladi. Bot kuniga bir marta 30 kundan eski chat arxivi va tahrir tarixini tozalaydi.
 
+`OUTREACH_MONITOR_ENABLED=false` bo‘lsa outreach monitor ogohlantirishlari vaqtincha o‘chiq turadi; Telegram Business auto-reply oqimi monitor holatidan mustaqil ishlaydi.
+
 SaaS workspace qatlami dastlab passiv holatda deploy qilinadi:
 
 ```text

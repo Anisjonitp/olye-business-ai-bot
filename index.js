@@ -40,6 +40,7 @@ const DAILY_DEFAULT_START = process.env.DAILY_AUTO_START || '07:00';
 const DAILY_DEFAULT_DURATION_HOURS = Number(process.env.DAILY_AUTO_DURATION_HOURS || 2);
 const LOCAL_UTC_OFFSET_HOURS = Number(process.env.LOCAL_UTC_OFFSET_HOURS || 5);
 const DAILY_NO_OUTREACH_WARN_MIN = Number(process.env.DAILY_NO_OUTREACH_WARN_MIN || 15);
+const OUTREACH_MONITOR_ENABLED = String(process.env.OUTREACH_MONITOR_ENABLED || 'false') === 'true';
 const REMINDER_AFTER_MS = Number(process.env.REMINDER_AFTER_MS || 3600000);
 const SCHEDULER_TICK_MS = Number(process.env.SCHEDULER_TICK_MS || 60000);
 const MEDIA_ARCHIVE_ENABLED = String(process.env.MEDIA_ARCHIVE_ENABLED || 'true') === 'true';
@@ -84,6 +85,22 @@ if (!SUPABASE_KEY) throw new Error('SUPABASE key missing');
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const ADMIN_TG_API = ADMIN_BOT_TOKEN ? `https://api.telegram.org/bot${ADMIN_BOT_TOKEN}` : '';
+const STARTED_AT = new Date().toISOString();
+const UPDATE_MODE = 'webhook';
+let databaseStatus = 'unknown';
+
+console.log('[STARTUP] app_started');
+console.log('[STARTUP] env_valid');
+console.log(`[STARTUP] user_bot_initialized token_present=${Boolean(BOT_TOKEN)}`);
+console.log(`[STARTUP] admin_bot_initialized token_present=${Boolean(ADMIN_BOT_TOKEN)}`);
+
+process.on('unhandledRejection', err => {
+  console.error('[UNHANDLED_REJECTION]', err?.stack || err);
+});
+
+process.on('uncaughtException', err => {
+  console.error('[UNCAUGHT_EXCEPTION]', err?.stack || err);
+});
 
 const STAGE = {
   NEW: 'new',
@@ -621,6 +638,14 @@ function settingKey(key, accountOrKey = DEFAULT_ACCOUNT_KEY) {
 // -------------------- Telegram helpers --------------------
 async function tg(method, payload = {}, botToken = BOT_TOKEN) {
   const base = botToken ? `https://api.telegram.org/bot${botToken}` : TG_API;
+  if (method?.startsWith('send')) {
+    console.log(
+      `[TELEGRAM_SEND_ATTEMPT] method=${method} ` +
+      `chat_id=${payload.chat_id || '-'} ` +
+      `business_connection_id=${payload.business_connection_id || '-'} ` +
+      `template_key=${payload.template_key || '-'}`
+    );
+  }
   const res = await fetch(`${base}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -628,10 +653,25 @@ async function tg(method, payload = {}, botToken = BOT_TOKEN) {
   });
   const data = await res.json().catch(() => null);
   if (!res.ok || !data?.ok) {
+    if (method?.startsWith('send')) {
+      console.log(
+        `[TELEGRAM_SEND_RESULT] ok=false ` +
+        `message_id=- ` +
+        `error_code=${data?.error_code || res.status || '-'} ` +
+        `description=${String(data?.description || res.statusText || '').replace(/\s+/g, '_').slice(0, 300)}`
+      );
+    }
     console.error('Telegram API error:', method, data);
     const err = new Error(data?.description || `Telegram API error: ${method}`);
     err.telegram = data || { ok: false, error_code: res.status, description: res.statusText };
     throw err;
+  }
+  if (method?.startsWith('send')) {
+    console.log(
+      `[TELEGRAM_SEND_RESULT] ok=true ` +
+      `message_id=${data.result?.message_id || '-'} ` +
+      `error_code=- description=-`
+    );
   }
   return data.result;
 }
@@ -639,6 +679,24 @@ async function tg(method, payload = {}, botToken = BOT_TOKEN) {
 async function adminTg(method, payload = {}) {
   if (!ADMIN_BOT_TOKEN) throw new Error('ADMIN_BOT_TOKEN missing');
   return tg(method, payload, ADMIN_BOT_TOKEN);
+}
+
+async function probeDatabase() {
+  try {
+    const { error } = await supabase.from('bot_settings').select('key', { count: 'exact', head: true }).limit(1);
+    if (error) {
+      databaseStatus = `error:${error.message}`;
+      console.error('[STARTUP] database_connected false error=', error.message);
+      return false;
+    }
+    databaseStatus = 'connected';
+    console.log('[STARTUP] database_connected');
+    return true;
+  } catch (err) {
+    databaseStatus = `error:${err.message || String(err)}`;
+    console.error('[STARTUP] database_connected false', err?.stack || err);
+    return false;
+  }
 }
 
 async function getAccounts() {
@@ -3945,10 +4003,26 @@ async function runSchedulerTick(source = 'interval') {
     }
     const accounts = await getAccounts();
     for (const account of accounts) {
-      await maybeStartDailyAuto(account.account_key);
-      await maybeWarnNoOutreach(account.account_key);
-      await maybeFinishAutoReport(account.account_key);
-      await maybeSendScheduledDailyReport(account);
+      try {
+        await maybeStartDailyAuto(account.account_key);
+      } catch (error) {
+        console.error('[DAILY_AUTO_ERROR]', error?.stack || error);
+      }
+      try {
+        await maybeWarnNoOutreach(account.account_key);
+      } catch (error) {
+        console.error('[OUTREACH_MONITOR_ERROR]', error?.stack || error);
+      }
+      try {
+        await maybeFinishAutoReport(account.account_key);
+      } catch (error) {
+        console.error('[AUTO_REPORT_ERROR]', error?.stack || error);
+      }
+      try {
+        await maybeSendScheduledDailyReport(account);
+      } catch (error) {
+        console.error('[DAILY_REPORT_ERROR]', error?.stack || error);
+      }
     }
   } catch (err) {
     console.error('scheduler tick error:', err);
@@ -4049,6 +4123,7 @@ async function getOutreachMonitorState(accountOrKey = DEFAULT_ACCOUNT_KEY) {
 }
 
 async function maybeWarnNoOutreach(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  if (!OUTREACH_MONITOR_ENABLED) return;
   const ak = accountKey(accountOrKey);
   const auto = await getAutoOutreach(ak);
   if (!isAutoActive(auto) || auto.no_outreach_warn_sent) return;
@@ -4697,6 +4772,7 @@ async function handleBusinessMessage(msg, options = {}) {
   const businessConnectionId = msg.business_connection_id || msg.business_connection?.id || null;
   const account = await findAccountForBusinessMessage(msg);
   const ak = account.account_key;
+  console.log(`[ACCOUNT_LOOKUP] success=${ak !== UNKNOWN_ACCOUNT_KEY ? 'true' : 'false'} account_key=${ak} business_connection_id=${businessConnectionId || '-'} error=-`);
   const text = getMessageText(msg).trim();
   const direction = isAccountOwnerMessage(msg, account) ? 'outgoing' : 'incoming';
   if (direction === 'outgoing') await rememberAccountBusinessConnection(account, businessConnectionId);
@@ -4787,6 +4863,7 @@ async function handleBusinessMessage(msg, options = {}) {
 
   const rawText = text || (isMediaOnly(msg) ? '[media]' : '');
   const existingLead = await getLead(chatId, ak);
+  console.log(`[LEAD_LOOKUP] success=${existingLead ? 'true' : 'false'} account_key=${ak} lead_chat_id=${chatId} error=-`);
   if (!existingLead) {
     await logIgnore(chatId, 'no_outreach_session', rawText, ak);
     logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: false, canAutoReply: false, blockReason: 'no_admin_started_lead' });
@@ -4838,6 +4915,7 @@ async function handleBusinessMessage(msg, options = {}) {
   lead = await getLead(chatId, ak) || activeLead;
   activeLead = lead;
   const allowed = await canLeadAutoReply(activeLead, account);
+  console.log(`[FLOW_LOOKUP] success=${activeLead?.stage ? 'true' : 'false'} account_key=${ak} lead_chat_id=${chatId} stage=${activeLead?.stage || '-'} error=-`);
   if (!allowed.ok) {
     await logIgnore(chatId, allowed.reason, `${activeLead.stage}: ${rawText}`, ak);
     logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: false, blockReason: allowed.reason });
@@ -4859,6 +4937,7 @@ async function handleBusinessMessage(msg, options = {}) {
     return;
   }
 
+  console.log(`[INTENT_DECISION] account_key=${ak} lead_chat_id=${chatId} stage=${activeLead.stage || '-'} text_len=${text.length}`);
   enqueueLeadMessage(activeLead, text);
 }
 
@@ -4944,6 +5023,7 @@ async function processLeadBatch(initialLead, texts) {
     return;
   }
   const intent = mapAiIntentToRuleIntent(aiDecision, lead.stage, ruleIntent);
+  console.log(`[INTENT_DECISION] account_key=${lead.account_key} lead_chat_id=${lead.chat_id} stage=${lead.stage || '-'} intent=${intent} rule_intent=${ruleIntent} ai_used=${aiDecision ? 'true' : 'false'}`);
   await updateLead(lead.chat_id, {
     last_user_message: text,
     last_message_at: new Date().toISOString(),
@@ -9213,7 +9293,18 @@ async function sendLeadStatus(chatId, lead) {
 
 // -------------------- HTTP routes --------------------
 app.get('/', (_, res) => res.json({ ok: true, name: 'OLYE Info Bot v6', mode: 'info-only' }));
-app.get('/health', (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get('/health', async (_, res) => {
+  const dbOk = await probeDatabase();
+  res.json({
+    ok: true,
+    user_bot: BOT_TOKEN ? 'running' : 'missing_token',
+    admin_bot: ADMIN_BOT_TOKEN ? 'running' : 'not_configured',
+    database: dbOk ? 'connected' : databaseStatus,
+    update_mode: UPDATE_MODE,
+    outreach_monitor: OUTREACH_MONITOR_ENABLED ? 'enabled' : 'disabled',
+    started_at: STARTED_AT
+  });
+});
 app.get('/webhook', (_, res) => res.json({ ok: true, note: 'Telegram uses POST /webhook' }));
 app.get('/tick', async (_, res) => {
   await runSchedulerTick('http');
@@ -9223,6 +9314,48 @@ app.get('/tick', async (_, res) => {
 const BASIC_ALLOWED_UPDATES = ['message', 'callback_query', 'business_connection', 'business_message', 'edited_business_message'];
 const FULL_ALLOWED_UPDATES = [...BASIC_ALLOWED_UPDATES, 'deleted_business_messages'];
 const ADMIN_ALLOWED_UPDATES = ['message', 'callback_query'];
+
+function updateType(update = {}) {
+  return ['message', 'business_message', 'edited_business_message', 'callback_query', 'business_connection', 'deleted_business_messages']
+    .find(key => update[key]) || 'unknown';
+}
+
+function updateChatId(update = {}) {
+  return update.message?.chat?.id ||
+    update.business_message?.chat?.id ||
+    update.edited_business_message?.chat?.id ||
+    update.callback_query?.message?.chat?.id ||
+    update.callback_query?.from?.id ||
+    update.business_connection?.user?.id ||
+    '';
+}
+
+function updateMessageId(update = {}) {
+  return update.message?.message_id ||
+    update.business_message?.message_id ||
+    update.edited_business_message?.message_id ||
+    update.callback_query?.message?.message_id ||
+    '';
+}
+
+function updateBusinessConnectionId(update = {}) {
+  return update.business_message?.business_connection_id ||
+    update.edited_business_message?.business_connection_id ||
+    update.business_connection?.id ||
+    update.deleted_business_messages?.business_connection_id ||
+    '';
+}
+
+function logUpdateReceived(update = {}, bot = 'user') {
+  console.log(
+    `[UPDATE_RECEIVED] update_id=${update.update_id || '-'} ` +
+    `update_type=${updateType(update)} ` +
+    `bot=${bot} ` +
+    `business_connection_id=${updateBusinessConnectionId(update) || '-'} ` +
+    `chat_id=${updateChatId(update) || '-'} ` +
+    `message_id=${updateMessageId(update) || '-'}`
+  );
+}
 
 async function setWebhookResponse(req, res, allowedUpdates) {
   try {
@@ -9314,6 +9447,7 @@ app.post('/admin-webhook', async (req, res) => {
   try {
     if (!ADMIN_BOT_TOKEN || !PLATFORM_ADMIN_ENABLED) return;
     const update = req.body || {};
+    logUpdateReceived(update, 'admin');
     if (update.callback_query) await handlePlatformCallback(update.callback_query);
     if (update.message) await handlePlatformAdminMessage(update.message);
   } catch (err) {
@@ -9329,6 +9463,7 @@ app.post('/webhook', async (req, res) => {
   res.json({ ok: true });
   try {
     const update = req.body || {};
+    logUpdateReceived(update, 'user');
     if (update.callback_query) await handleCallback(update.callback_query);
     if (update.message) {
       if (await handleUserOnboardingMessage(update.message)) return;
@@ -9358,7 +9493,10 @@ function html(s = '') { return String(s).replace(/[&<>]/g, ch => ({ '&': '&amp;'
 function short(s = '', n = 80) { const x = String(s || ''); return x.length > n ? x.slice(0, n - 1) + '…' : x; }
 
 setInterval(() => runSchedulerTick('interval'), SCHEDULER_TICK_MS).unref();
+console.log('[STARTUP] schedulers_started');
 
 app.listen(PORT, () => {
   console.log(`OLYE Info Bot v6 running on port ${PORT}`);
+  console.log(`[STARTUP] webhook_or_polling_started mode=${UPDATE_MODE} user_path=/webhook admin_path=/admin-webhook`);
+  probeDatabase().catch(err => console.error('[STARTUP] database_probe_failed', err?.stack || err));
 });
