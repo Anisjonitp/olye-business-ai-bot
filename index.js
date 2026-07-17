@@ -3541,8 +3541,16 @@ async function markManualBusinessReach({ chatId, businessConnectionId, leadProfi
   const now = new Date().toISOString();
   const sentAt = messageDate || now;
   const contextStage = detectAdminBusinessContextStage(adminText);
-  const stage = existing?.stage || STAGE.NEW;
-  const status = existing?.status || 'manual_control';
+  const promptStage = detectAdminPromptStage(adminText);
+  const shouldContinueFlow = Boolean(promptStage && !adminBusinessContextStopsBot(contextStage));
+  const stage = shouldContinueFlow ? promptStage : (existing?.stage || STAGE.NEW);
+  const status = shouldContinueFlow ? 'active' : (existing?.status || 'manual_control');
+  const sessionId = shouldContinueFlow
+    ? (existing?.outreach_session_id || `manual_prompt_${accountKey}_${Date.now()}`)
+    : existing?.outreach_session_id || null;
+  const activeUntil = shouldContinueFlow
+    ? null
+    : new Date(Date.now() + ADMIN_TAKEOVER_MINUTES * 60000).toISOString();
   const patch = {
     account_key: accountKey,
     chat_id: String(chatId),
@@ -3552,20 +3560,41 @@ async function markManualBusinessReach({ chatId, businessConnectionId, leadProfi
     username: existing?.username || leadProfile?.username || null,
     status,
     stage,
-    current_stage: contextStage,
-    bot_enabled: existing?.bot_enabled ?? false,
-    bot_enabled_for_lead: existing?.bot_enabled_for_lead ?? false,
-    manual_only: existing?.manual_only ?? true,
-    campaign_active: existing?.campaign_active ?? false,
+    current_stage: stage,
+    bot_enabled: shouldContinueFlow ? true : (existing?.bot_enabled ?? false),
+    bot_enabled_for_lead: shouldContinueFlow ? true : (existing?.bot_enabled_for_lead ?? false),
+    manual_only: shouldContinueFlow ? false : (existing?.manual_only ?? true),
+    outreach_sent: shouldContinueFlow ? true : (existing?.outreach_sent ?? false),
+    reach_sent: shouldContinueFlow ? true : (existing?.reach_sent ?? false),
+    assigned_by_admin: shouldContinueFlow ? true : (existing?.assigned_by_admin ?? true),
+    manually_started: shouldContinueFlow ? true : (existing?.manually_started ?? true),
+    campaign_active: shouldContinueFlow ? true : (existing?.campaign_active ?? false),
+    campaign_started_at: shouldContinueFlow ? (existing?.campaign_started_at || now) : existing?.campaign_started_at || null,
+    campaign_started_by: shouldContinueFlow ? (adminUser?.id ? String(adminUser.id) : 'admin_manual_prompt') : existing?.campaign_started_by || null,
+    campaign_trigger_message_id: shouldContinueFlow && messageId ? String(messageId) : existing?.campaign_trigger_message_id || null,
+    campaign_trigger_text: shouldContinueFlow ? adminText : existing?.campaign_trigger_text || null,
+    campaign_stage: shouldContinueFlow ? stage : existing?.campaign_stage || null,
+    campaign_completed_at: shouldContinueFlow ? null : existing?.campaign_completed_at || null,
+    campaign_expired_at: shouldContinueFlow ? null : existing?.campaign_expired_at || null,
+    outreach_session_id: sessionId,
+    outreach_message: shouldContinueFlow ? adminText : existing?.outreach_message || null,
+    reach_message_text: shouldContinueFlow ? adminText : existing?.reach_message_text || null,
+    reach_message_id: shouldContinueFlow && messageId ? String(messageId) : existing?.reach_message_id || null,
+    reach_batch_id: shouldContinueFlow ? sessionId : existing?.reach_batch_id || null,
+    outreach_at: shouldContinueFlow ? now : existing?.outreach_at || null,
+    reach_sent_at: shouldContinueFlow ? now : existing?.reach_sent_at || null,
     first_admin_message: existing?.first_admin_message || adminText,
     first_admin_message_at: existing?.first_admin_message_at || sentAt,
     last_admin_message: adminText,
     last_admin_message_at: sentAt,
     last_actor: 'admin',
     last_message_at: sentAt,
-    admin_active_until: new Date(Date.now() + ADMIN_TAKEOVER_MINUTES * 60000).toISOString(),
-    needs_human: true,
-    needs_human_reason: existing?.needs_human_reason || 'manual_admin_message'
+    admin_active_until: activeUntil,
+    needs_human: shouldContinueFlow ? false : true,
+    needs_human_reason: shouldContinueFlow ? null : (existing?.needs_human_reason || 'manual_admin_message'),
+    paused_at: shouldContinueFlow ? null : existing?.paused_at || null,
+    paused_by: shouldContinueFlow ? null : existing?.paused_by || null,
+    pause_reason: shouldContinueFlow ? null : existing?.pause_reason || null
   };
 
   let lead = existing;
@@ -3577,18 +3606,29 @@ async function markManualBusinessReach({ chatId, businessConnectionId, leadProfi
       text: '',
       stage,
       status,
-      botEnabled: false,
+      botEnabled: shouldContinueFlow,
       accountKey
     });
   }
   lead = await updateLead(chatId, patch, accountKey) || lead;
+  console.log(
+    `[ADMIN_OUTGOING] chat_id=${chatId} ` +
+    `business_connection_id=${businessConnectionId || '-'} ` +
+    `account_key=${accountKey} ` +
+    `text=${short(adminText, 120).replace(/\s+/g, '_')} ` +
+    `matched_flow_stage=${promptStage || '-'} ` +
+    `lead_upserted=${lead ? 'true' : 'false'} ` +
+    `bot_enabled_for_lead=${lead?.bot_enabled_for_lead ? 'true' : 'false'} ` +
+    `manual_only=${lead?.manual_only ? 'true' : 'false'} ` +
+    `current_stage=${lead?.current_stage || lead?.stage || '-'}`
+  );
   await logEvent(chatId, edited ? 'manual_admin_message_edited' : 'manual_admin_message', adminText, accountKey);
   await writeAuditLog({
     accountKey,
     chatId,
     action: edited ? 'manual_admin_message_edited' : 'manual_admin_message',
     oldValue: existing ? { stage: existing.stage, current_stage: existing.current_stage, bot_enabled_for_lead: existing.bot_enabled_for_lead } : null,
-    newValue: { stage, current_stage: contextStage, message_id: messageId, campaign_active: patch.campaign_active },
+    newValue: { stage, current_stage: stage, matched_flow_stage: promptStage, message_id: messageId, campaign_active: patch.campaign_active },
     actorType: 'admin',
     actorId: adminUser?.id
   });
@@ -4196,6 +4236,10 @@ function classify(text = '', stage = STAGE.NEW) {
 
   const paymentWords = ['karta', 'tolov', 'to‘lov', "to'lov", 'pul', 'qayerga tolay', 'qayerga to‘lay', 'to‘layman', "to'layman", 'kartaga'];
   if (includesAny(t, paymentWords)) return 'payment_near';
+
+  const exactNo = ['yu', 'yuk', 'yoq', "yo'q"];
+  if (stage === STAGE.ASKED_APPLICATION && exactNo.includes(t)) return 'application_not_submitted';
+  if (stage === STAGE.ASKED_INFO && exactNo.includes(t)) return 'no_info';
 
   const applicationLink = [
     'yoq', "yo'q", 'qoldirmagan', 'qoldirmadim', 'ariza qoldirmadim', 'hali qoldirmadim',
@@ -4840,6 +4884,7 @@ async function handleBusinessMessage(msg, options = {}) {
 
   if (!canAccountAutoReply(account)) {
     await logIgnore(chatId, 'account_bot_off', businessConnectionId || '', ak);
+    console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=${Boolean(await getLead(chatId, ak)) ? 'true' : 'false'} current_stage=- bot_enabled_for_lead=- manual_only=- takeover_until=- blocked_reason=account_bot_off`);
     logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: Boolean(await getLead(chatId, ak)), canAutoReply: false, blockReason: 'account_bot_off' });
     return;
   }
@@ -4851,6 +4896,7 @@ async function handleBusinessMessage(msg, options = {}) {
   });
   if (!subscriptionAccess.ok) {
     await logIgnore(chatId, subscriptionAccess.reason, businessConnectionId || '', ak);
+    console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=${Boolean(await getLead(chatId, ak)) ? 'true' : 'false'} current_stage=- bot_enabled_for_lead=- manual_only=- takeover_until=- blocked_reason=${subscriptionAccess.reason}`);
     logBusinessIncomingDecision({
       accountKey: ak,
       chatId,
@@ -4866,6 +4912,7 @@ async function handleBusinessMessage(msg, options = {}) {
   console.log(`[LEAD_LOOKUP] success=${existingLead ? 'true' : 'false'} account_key=${ak} lead_chat_id=${chatId} error=-`);
   if (!existingLead) {
     await logIgnore(chatId, 'no_outreach_session', rawText, ak);
+    console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=false current_stage=- bot_enabled_for_lead=- manual_only=- takeover_until=- blocked_reason=no_admin_started_lead`);
     logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: false, canAutoReply: false, blockReason: 'no_admin_started_lead' });
     return;
   }
@@ -4875,12 +4922,14 @@ async function handleBusinessMessage(msg, options = {}) {
 
   if (lead.stage === STAGE.INFO_SENT_FINISHED) {
     await logIgnore(chatId, 'old_finished_chat', rawText, ak);
+    console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=true current_stage=${lead.current_stage || lead.stage || '-'} bot_enabled_for_lead=${leadBotEnabled(lead) ? 'true' : 'false'} manual_only=${lead.manual_only ? 'true' : 'false'} takeover_until=${lead.admin_active_until || '-'} blocked_reason=old_finished_chat`);
     logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: false, blockReason: 'old_finished_chat' });
     await handlePostFinishSignal(lead, msg, rawText);
     return;
   }
   if (lead.stage === STAGE.PAUSED || lead.stage === STAGE.DISABLED) {
     await logIgnore(chatId, 'blocked_stage', `${lead.stage}: ${rawText}`, ak);
+    console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=true current_stage=${lead.current_stage || lead.stage || '-'} bot_enabled_for_lead=${leadBotEnabled(lead) ? 'true' : 'false'} manual_only=${lead.manual_only ? 'true' : 'false'} takeover_until=${lead.admin_active_until || '-'} blocked_reason=blocked_stage`);
     logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: false, blockReason: 'blocked_stage' });
     return;
   }
@@ -4918,9 +4967,11 @@ async function handleBusinessMessage(msg, options = {}) {
   console.log(`[FLOW_LOOKUP] success=${activeLead?.stage ? 'true' : 'false'} account_key=${ak} lead_chat_id=${chatId} stage=${activeLead?.stage || '-'} error=-`);
   if (!allowed.ok) {
     await logIgnore(chatId, allowed.reason, `${activeLead.stage}: ${rawText}`, ak);
+    console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=true current_stage=${activeLead.current_stage || activeLead.stage || '-'} bot_enabled_for_lead=${leadBotEnabled(activeLead) ? 'true' : 'false'} manual_only=${activeLead.manual_only ? 'true' : 'false'} takeover_until=${activeLead.admin_active_until || '-'} blocked_reason=${allowed.reason}`);
     logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: false, blockReason: allowed.reason });
     return;
   }
+  console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=true current_stage=${activeLead.current_stage || activeLead.stage || '-'} bot_enabled_for_lead=${leadBotEnabled(activeLead) ? 'true' : 'false'} manual_only=${activeLead.manual_only ? 'true' : 'false'} takeover_until=${activeLead.admin_active_until || '-'} blocked_reason=-`);
   logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: true, blockReason: 'ok' });
 
   if (text) {
@@ -4991,7 +5042,8 @@ async function processLeadBatch(initialLead, texts) {
   }
   const text = texts.join('\n').trim();
   const ruleIntent = classify(text, lead.stage);
-  const shouldUseAi = ruleIntent === 'unclear' || ['rahmat', 'raxmat', 'qiziqdim', 'tushunarli', 'mayli', 'boladi', 'bo‘ladi', 'ok', 'ho‘p', "ho'p"].some(x => normalize(text).includes(x));
+  const finalRuleIntent = lead.stage === STAGE.ASKED_INFO && ruleIntent === 'unclear' ? 'no_info' : ruleIntent;
+  const shouldUseAi = finalRuleIntent === 'unclear' || ['rahmat', 'raxmat', 'qiziqdim', 'tushunarli', 'mayli', 'boladi', 'bo‘ladi', 'ok', 'ho‘p', "ho'p"].some(x => normalize(text).includes(x));
   let aiDecision = null;
   if (shouldUseAi) {
     const aiAccess = await canWorkspaceAutomate({
@@ -5003,7 +5055,7 @@ async function processLeadBatch(initialLead, texts) {
       await logIgnore(lead.chat_id, aiAccess.reason, 'ai_intent', lead.account_key);
       return;
     }
-    aiDecision = await classifyWithAI(lead, text, ruleIntent);
+    aiDecision = await classifyWithAI(lead, text, finalRuleIntent);
   }
   if (aiDecision && Number(aiDecision.confidence || 0) < 0.65) {
     await updateLead(lead.chat_id, {
@@ -5015,15 +5067,15 @@ async function processLeadBatch(initialLead, texts) {
       bot_enabled_for_lead: false,
       needs_human: true,
       needs_human_reason: 'ai_low_confidence',
-      last_intent: aiDecision.intent || ruleIntent,
+      last_intent: aiDecision.intent || finalRuleIntent,
       last_intent_confidence: Number(aiDecision.confidence || 0)
     }, lead.account_key);
     await logEvent(lead.chat_id, 'ai_low_confidence_handoff', JSON.stringify(aiDecision).slice(0, 1000), lead.account_key);
     await sendAdmin(`⚠️ <b>AI confidence past</b>\nChat ID: <code>${lead.chat_id}</code>\nXabar: ${html(text)}\nBot to‘xtadi, qo‘lda davom ettiring.`, {}, lead.account_key);
     return;
   }
-  const intent = mapAiIntentToRuleIntent(aiDecision, lead.stage, ruleIntent);
-  console.log(`[INTENT_DECISION] account_key=${lead.account_key} lead_chat_id=${lead.chat_id} stage=${lead.stage || '-'} intent=${intent} rule_intent=${ruleIntent} ai_used=${aiDecision ? 'true' : 'false'}`);
+  const intent = mapAiIntentToRuleIntent(aiDecision, lead.stage, finalRuleIntent);
+  console.log(`[INTENT_DECISION] account_key=${lead.account_key} lead_chat_id=${lead.chat_id} stage=${lead.stage || '-'} text=${short(text, 80).replace(/\s+/g, '_')} intent=${ruleIntent} final_intent=${intent} ai_used=${aiDecision ? 'true' : 'false'}`);
   await updateLead(lead.chat_id, {
     last_user_message: text,
     last_message_at: new Date().toISOString(),
@@ -5046,18 +5098,23 @@ async function processLeadBatch(initialLead, texts) {
   // Main info-only flow.
   if (lead.stage === STAGE.OUTREACH_SENT || lead.stage === STAGE.NEW || lead.stage === STAGE.PENDING_APPROVAL) {
     const keys = await flowTemplateKeys(lead.account_key, 'ask_application', ['ask_application']);
+    console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_APPLICATION} template_found=${keys.length ? 'true' : 'false'} send_ok=pending`);
     await sendPackage(lead, 'ask_application', keys, { stage: STAGE.ASKED_APPLICATION, status: 'active', bot_enabled: true, bot_enabled_for_lead: true });
+    console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_APPLICATION} template_found=${keys.length ? 'true' : 'false'} send_ok=true`);
     return;
   }
 
   if (lead.stage === STAGE.ASKED_APPLICATION) {
     if (intent === 'application_confirmed' || intent === 'application_submitted') {
       const keys = await flowTemplateKeys(lead.account_key, 'ask_info', ['ask_info']);
+      console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=${keys.length ? 'true' : 'false'} send_ok=pending`);
       await sendPackage(lead, 'ask_info', keys, { stage: STAGE.ASKED_INFO });
+      console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=${keys.length ? 'true' : 'false'} send_ok=true`);
       return;
     }
     if (intent === 'application_not_submitted') {
       const keys = await flowTemplateKeys(lead.account_key, 'application_link', ['application_link_reply']);
+      console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.INFO_SENT_FINISHED} template_found=${keys.length ? 'true' : 'false'} send_ok=pending`);
       const after = await sendPackage(lead, 'application_link_reply', keys, {
         stage: STAGE.INFO_SENT_FINISHED,
         status: 'application_link_sent',
@@ -5065,6 +5122,7 @@ async function processLeadBatch(initialLead, texts) {
         bot_enabled_for_lead: false,
         finished_at: new Date().toISOString()
       });
+      console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.INFO_SENT_FINISHED} template_found=${keys.length ? 'true' : 'false'} send_ok=true`);
       await sendAdmin(`🔗 <b>Ariza havolasi yuborildi</b>\nChat ID: <code>${lead.chat_id}</code>\nEndi chatni qo‘lda davom ettiring.`, {}, lead.account_key);
       return after;
     }
@@ -5081,17 +5139,16 @@ async function processLeadBatch(initialLead, texts) {
   if (lead.stage === STAGE.ASKED_INFO) {
     if (intent === 'has_info') {
       const keys = await flowTemplateKeys(lead.account_key, 'has_info', ['known_info_preface', 'short_intro', 'offer_end']);
+      console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.INFO_SENT_FINISHED} template_found=${keys.length ? 'true' : 'false'} send_ok=pending`);
       const after = await sendPackage(lead, 'known_info_package', keys, {});
+      console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.INFO_SENT_FINISHED} template_found=${keys.length ? 'true' : 'false'} send_ok=true`);
       await finishAfterInfo(after || lead);
       return;
     }
-    if (intent === 'unclear') {
-      await updateLead(lead.chat_id, { status: 'needs_admin', bot_enabled: false, bot_enabled_for_lead: false, needs_human: true, needs_human_reason: 'asked_info_unclear' }, lead.account_key);
-      await logEvent(lead.chat_id, 'asked_info_unclear_human_needed', text, lead.account_key);
-      return;
-    }
     const keys = await flowTemplateKeys(lead.account_key, 'no_info', ['unknown_info_preface', 'full_intro', 'offer_end']);
+    console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.INFO_SENT_FINISHED} template_found=${keys.length ? 'true' : 'false'} send_ok=pending`);
     const after = await sendPackage(lead, 'unknown_info_package', keys, {});
+    console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.INFO_SENT_FINISHED} template_found=${keys.length ? 'true' : 'false'} send_ok=true`);
     await finishAfterInfo(after || lead);
     return;
   }
