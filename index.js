@@ -767,6 +767,32 @@ async function findBusinessConnectionMapping(businessConnectionId) {
   return data || null;
 }
 
+async function logAccountResolution({ msg = {}, account = null, source = 'unknown' } = {}) {
+  const businessConnectionId = String(msg?.business_connection_id || msg?.business_connection?.id || account?.business_connection_id || '');
+  const fromId = String(msg?.from?.id || '');
+  const normalized = normalizeAccount(account || unknownAccount(businessConnectionId));
+  let tenant = null;
+  try {
+    tenant = await resolveTenantContext({
+      telegramUserId: fromId,
+      accountKey: normalized.account_key,
+      businessConnectionId
+    });
+  } catch (err) {
+    console.error('logAccountResolution tenant:', err.message);
+  }
+  console.log(
+    `[ACCOUNT_RESOLUTION] business_connection_id=${businessConnectionId || '-'} ` +
+    `resolved=${normalized.account_key !== UNKNOWN_ACCOUNT_KEY ? 'true' : 'false'} ` +
+    `account_key=${normalized.account_key || '-'} ` +
+    `workspace_id=${tenant?.workspace_id || '-'} ` +
+    `workspace_business_account_id=${tenant?.account_id || '-'} ` +
+    `business_account_id=${normalized.id || normalized.business_account_id || tenant?.account_id || '-'} ` +
+    `owner_user_id=${normalized.owner_user_id || normalized.business_owner_id || '-'} ` +
+    `source=${source}`
+  );
+}
+
 function findAccountByUserId(accounts, userId) {
   const uid = String(userId || '');
   if (!uid) return null;
@@ -1334,16 +1360,32 @@ async function findAccountForBusinessMessage(msg) {
     const mapped = await findBusinessConnectionMapping(businessConnectionId);
     if (mapped?.account_key) {
       const account = accounts.find(a => a.account_key === mapped.account_key);
-      if (account) return account;
+      if (account) {
+        await logAccountResolution({ msg, account, source: 'business_connection_accounts' });
+        return account;
+      }
     }
     const directConnection = accounts.find(a => a.business_connection_id && String(a.business_connection_id) === businessConnectionId);
-    if (directConnection) return directConnection;
+    if (directConnection) {
+      await logAccountResolution({ msg, account: directConnection, source: 'bot_accounts.business_connection_id' });
+      return directConnection;
+    }
+    const tenant = await resolveTenantContext({ telegramUserId: fromId, businessConnectionId });
+    if (tenant?.account_id) {
+      const tenantKey = normalizeAccountKey(tenant.canonical_account_key);
+      const account = accounts.find(a => accountKeyMatches(a.account_key, tenantKey)) || await getAccount(tenantKey);
+      await logAccountResolution({ msg, account, source: 'workspace_business_accounts' });
+      return account;
+    }
   }
   const directSender = accounts.find(a => (
     (a.business_owner_id && String(a.business_owner_id) === fromId) ||
     (a.admin_chat_id && String(a.admin_chat_id) === fromId)
   ));
-  if (directSender) return directSender;
+  if (directSender) {
+    await logAccountResolution({ msg, account: directSender, source: 'from_owner_or_admin' });
+    return directSender;
+  }
   if (businessConnectionId) {
     let q = supabase.from('business_leads')
       .select('account_key')
@@ -1353,15 +1395,23 @@ async function findAccountForBusinessMessage(msg) {
     if (chatId) q = q.eq('chat_id', chatId);
     const { data } = await q;
     const learnedKey = data?.[0]?.account_key;
-    if (learnedKey) return accounts.find(a => a.account_key === learnedKey) || { ...DEFAULT_ACCOUNT, account_key: learnedKey };
+    if (learnedKey) {
+      const account = accounts.find(a => a.account_key === learnedKey) || { ...DEFAULT_ACCOUNT, account_key: learnedKey };
+      await logAccountResolution({ msg, account, source: 'business_leads_history' });
+      return account;
+    }
     await logEvent(chatId || 'unknown', 'UNMAPPED_BUSINESS_CONNECTION', JSON.stringify({
       business_connection_id: businessConnectionId,
       chat_id: chatId || null,
       from_id: fromId || null
     }).slice(0, 1200), UNKNOWN_ACCOUNT_KEY);
-    return unknownAccount(businessConnectionId);
+    const account = unknownAccount(businessConnectionId);
+    await logAccountResolution({ msg, account, source: 'unknown_business_connection' });
+    return account;
   }
-  return normalizeAccount(DEFAULT_ACCOUNT);
+  const account = normalizeAccount(DEFAULT_ACCOUNT);
+  await logAccountResolution({ msg, account, source: 'fallback_default' });
+  return account;
 }
 
 async function findAccountByBusinessConnectionId(businessConnectionId) {
@@ -3112,6 +3162,12 @@ async function resetMeChat({ chatId, businessConnectionId = null, from = null, a
     campaign_stage: STAGE.OUTREACH_SENT,
     campaign_completed_at: null,
     campaign_expired_at: null,
+    admin_active_until: null,
+    paused_at: null,
+    paused_by: null,
+    pause_reason: null,
+    needs_human: false,
+    needs_human_reason: null,
     assigned_by_admin: true,
     manually_started: true,
     outreach_sent: true,
@@ -3366,6 +3422,27 @@ function adminBusinessContextStopsBot(contextStage = '') {
   return ['price', 'payment', 'documents_requested', 'agreement_waiting'].includes(contextStage);
 }
 
+function isAdminGreetingStart(text = '') {
+  const t = normalize(text);
+  if (!t) return false;
+  const compact = t.replace(/\s+/g, ' ').trim();
+  const greetingExact = [
+    'assalomu alaykum',
+    'assalamu alaykum',
+    'assalom alaykum',
+    'salom',
+    'yaxshimisiz'
+  ];
+  if (greetingExact.includes(compact)) return true;
+  return (
+    compact.startsWith('assalomu alaykum') ||
+    compact.startsWith('assalamu alaykum') ||
+    compact.startsWith('assalom alaykum') ||
+    compact === 'salom yaxshimisiz' ||
+    compact.startsWith('salom yaxshimisiz')
+  );
+}
+
 function leadWasPausedOrFinished(lead = null) {
   if (!lead) return false;
   return Boolean(
@@ -3524,6 +3601,22 @@ async function markManualBusinessReach({ chatId, businessConnectionId, leadProfi
         accountKey,
         match: reachMatch
       });
+      console.log(
+        `[ADMIN_OUTGOING] account_key=${accountKey} ` +
+        `business_connection_id=${businessConnectionId || '-'} ` +
+        `lead_chat_id=${chatId} ` +
+        `original_text=${short(text || '[media]', 120).replace(/\s+/g, '_')} ` +
+        `normalized_text=${short(normalize(text || ''), 120).replace(/\s+/g, '_')} ` +
+        `matched_type=TEMPLATE ` +
+        `matched_flow_stage=${lead?.current_stage || lead?.stage || '-'} ` +
+        `lead_upserted=${lead ? 'true' : 'false'} ` +
+        `bot_enabled_for_lead=${lead?.bot_enabled_for_lead ? 'true' : 'false'} ` +
+        `manual_only=${lead?.manual_only ? 'true' : 'false'} ` +
+        `campaign_active=${lead?.campaign_active ? 'true' : 'false'} ` +
+        `current_stage=${lead?.current_stage || lead?.stage || '-'} ` +
+        `admin_active_until=${lead?.admin_active_until || '-'} ` +
+        `blocked_reason=-`
+      );
       return {
         lead,
         template_match: true,
@@ -3542,8 +3635,17 @@ async function markManualBusinessReach({ chatId, businessConnectionId, leadProfi
   const sentAt = messageDate || now;
   const contextStage = detectAdminBusinessContextStage(adminText);
   const promptStage = detectAdminPromptStage(adminText);
-  const shouldContinueFlow = Boolean(promptStage && !adminBusinessContextStopsBot(contextStage));
-  const stage = shouldContinueFlow ? promptStage : (existing?.stage || STAGE.NEW);
+  const greetingStart = isAdminGreetingStart(adminText);
+  const flowStartStage = promptStage || (greetingStart ? STAGE.OUTREACH_SENT : null);
+  const shouldContinueFlow = Boolean(flowStartStage && !adminBusinessContextStopsBot(contextStage));
+  const stage = shouldContinueFlow ? flowStartStage : (existing?.stage || STAGE.NEW);
+  const matchedType = promptStage === STAGE.ASKED_APPLICATION
+    ? 'ASKED_APPLICATION'
+    : promptStage === STAGE.ASKED_INFO
+      ? 'ASKED_INFO'
+      : greetingStart
+        ? 'GREETING'
+        : 'UNKNOWN';
   const status = shouldContinueFlow ? 'active' : (existing?.status || 'manual_control');
   const sessionId = shouldContinueFlow
     ? (existing?.outreach_session_id || `manual_prompt_${accountKey}_${Date.now()}`)
@@ -3612,15 +3714,20 @@ async function markManualBusinessReach({ chatId, businessConnectionId, leadProfi
   }
   lead = await updateLead(chatId, patch, accountKey) || lead;
   console.log(
-    `[ADMIN_OUTGOING] chat_id=${chatId} ` +
+    `[ADMIN_OUTGOING] account_key=${accountKey} ` +
     `business_connection_id=${businessConnectionId || '-'} ` +
-    `account_key=${accountKey} ` +
-    `text=${short(adminText, 120).replace(/\s+/g, '_')} ` +
-    `matched_flow_stage=${promptStage || '-'} ` +
+    `lead_chat_id=${chatId} ` +
+    `original_text=${short(adminText, 120).replace(/\s+/g, '_')} ` +
+    `normalized_text=${short(normalize(adminText), 120).replace(/\s+/g, '_')} ` +
+    `matched_type=${matchedType} ` +
+    `matched_flow_stage=${flowStartStage || '-'} ` +
     `lead_upserted=${lead ? 'true' : 'false'} ` +
     `bot_enabled_for_lead=${lead?.bot_enabled_for_lead ? 'true' : 'false'} ` +
     `manual_only=${lead?.manual_only ? 'true' : 'false'} ` +
-    `current_stage=${lead?.current_stage || lead?.stage || '-'}`
+    `campaign_active=${lead?.campaign_active ? 'true' : 'false'} ` +
+    `current_stage=${lead?.current_stage || lead?.stage || '-'} ` +
+    `admin_active_until=${lead?.admin_active_until || '-'} ` +
+    `blocked_reason=${shouldContinueFlow ? '-' : (automationBlockReason || reachMatch.reason || 'manual_takeover')}`
   );
   await logEvent(chatId, edited ? 'manual_admin_message_edited' : 'manual_admin_message', adminText, accountKey);
   await writeAuditLog({
@@ -3628,7 +3735,7 @@ async function markManualBusinessReach({ chatId, businessConnectionId, leadProfi
     chatId,
     action: edited ? 'manual_admin_message_edited' : 'manual_admin_message',
     oldValue: existing ? { stage: existing.stage, current_stage: existing.current_stage, bot_enabled_for_lead: existing.bot_enabled_for_lead } : null,
-    newValue: { stage, current_stage: stage, matched_flow_stage: promptStage, message_id: messageId, campaign_active: patch.campaign_active },
+    newValue: { stage, current_stage: stage, matched_type: matchedType, matched_flow_stage: flowStartStage, message_id: messageId, campaign_active: patch.campaign_active },
     actorType: 'admin',
     actorId: adminUser?.id
   });
@@ -4237,7 +4344,7 @@ function classify(text = '', stage = STAGE.NEW) {
   const paymentWords = ['karta', 'tolov', 'to‘lov', "to'lov", 'pul', 'qayerga tolay', 'qayerga to‘lay', 'to‘layman', "to'layman", 'kartaga'];
   if (includesAny(t, paymentWords)) return 'payment_near';
 
-  const exactNo = ['yu', 'yuk', 'yoq', "yo'q"];
+  const exactNo = ['yu', 'yuk', 'yuq', 'yoq', "yo'q"];
   if (stage === STAGE.ASKED_APPLICATION && exactNo.includes(t)) return 'application_not_submitted';
   if (stage === STAGE.ASKED_INFO && exactNo.includes(t)) return 'no_info';
 
@@ -4810,6 +4917,22 @@ function logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound, canAut
   console.log(`[BUSINESS_INCOMING] account_key=${ak} lead_chat_id=${chatId} lead_found=${leadFound ? 'true' : 'false'} can_auto_reply=${canAutoReply ? 'true' : 'false'} block_reason=${blockReason || 'ok'}`);
 }
 
+function logIncomingBusinessState({ accountKey: ak, businessConnectionId = '', chatId = '', lead = null, leadFound = Boolean(lead), canAutoReply = false, blockedReason = '-' } = {}) {
+  console.log(
+    `[INCOMING_BUSINESS] account_key=${ak || '-'} ` +
+    `business_connection_id=${businessConnectionId || lead?.business_connection_id || '-'} ` +
+    `lead_chat_id=${chatId || lead?.chat_id || lead?.lead_chat_id || '-'} ` +
+    `lead_found=${leadFound ? 'true' : 'false'} ` +
+    `current_stage=${lead?.current_stage || lead?.stage || '-'} ` +
+    `bot_enabled_for_lead=${lead ? (leadBotEnabled(lead) ? 'true' : 'false') : '-'} ` +
+    `manual_only=${lead ? (lead.manual_only ? 'true' : 'false') : '-'} ` +
+    `campaign_active=${lead ? (lead.campaign_active ? 'true' : 'false') : '-'} ` +
+    `admin_active_until=${lead?.admin_active_until || '-'} ` +
+    `can_auto_reply=${canAutoReply ? 'true' : 'false'} ` +
+    `blocked_reason=${blockedReason || '-'}`
+  );
+}
+
 async function handleBusinessMessage(msg, options = {}) {
   const chatId = String(msg.chat?.id || '');
   if (!chatId) return;
@@ -4884,8 +5007,9 @@ async function handleBusinessMessage(msg, options = {}) {
 
   if (!canAccountAutoReply(account)) {
     await logIgnore(chatId, 'account_bot_off', businessConnectionId || '', ak);
-    console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=${Boolean(await getLead(chatId, ak)) ? 'true' : 'false'} current_stage=- bot_enabled_for_lead=- manual_only=- takeover_until=- blocked_reason=account_bot_off`);
-    logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: Boolean(await getLead(chatId, ak)), canAutoReply: false, blockReason: 'account_bot_off' });
+    const lead = await getLead(chatId, ak);
+    logIncomingBusinessState({ accountKey: ak, businessConnectionId, chatId, lead, leadFound: Boolean(lead), canAutoReply: false, blockedReason: 'account_bot_off' });
+    logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: Boolean(lead), canAutoReply: false, blockReason: 'account_bot_off' });
     return;
   }
 
@@ -4896,11 +5020,12 @@ async function handleBusinessMessage(msg, options = {}) {
   });
   if (!subscriptionAccess.ok) {
     await logIgnore(chatId, subscriptionAccess.reason, businessConnectionId || '', ak);
-    console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=${Boolean(await getLead(chatId, ak)) ? 'true' : 'false'} current_stage=- bot_enabled_for_lead=- manual_only=- takeover_until=- blocked_reason=${subscriptionAccess.reason}`);
+    const lead = await getLead(chatId, ak);
+    logIncomingBusinessState({ accountKey: ak, businessConnectionId, chatId, lead, leadFound: Boolean(lead), canAutoReply: false, blockedReason: subscriptionAccess.reason });
     logBusinessIncomingDecision({
       accountKey: ak,
       chatId,
-      leadFound: Boolean(await getLead(chatId, ak)),
+      leadFound: Boolean(lead),
       canAutoReply: false,
       blockReason: subscriptionAccess.reason
     });
@@ -4912,7 +5037,7 @@ async function handleBusinessMessage(msg, options = {}) {
   console.log(`[LEAD_LOOKUP] success=${existingLead ? 'true' : 'false'} account_key=${ak} lead_chat_id=${chatId} error=-`);
   if (!existingLead) {
     await logIgnore(chatId, 'no_outreach_session', rawText, ak);
-    console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=false current_stage=- bot_enabled_for_lead=- manual_only=- takeover_until=- blocked_reason=no_admin_started_lead`);
+    logIncomingBusinessState({ accountKey: ak, businessConnectionId, chatId, lead: null, leadFound: false, canAutoReply: false, blockedReason: 'no_admin_started_lead' });
     logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: false, canAutoReply: false, blockReason: 'no_admin_started_lead' });
     return;
   }
@@ -4922,14 +5047,14 @@ async function handleBusinessMessage(msg, options = {}) {
 
   if (lead.stage === STAGE.INFO_SENT_FINISHED) {
     await logIgnore(chatId, 'old_finished_chat', rawText, ak);
-    console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=true current_stage=${lead.current_stage || lead.stage || '-'} bot_enabled_for_lead=${leadBotEnabled(lead) ? 'true' : 'false'} manual_only=${lead.manual_only ? 'true' : 'false'} takeover_until=${lead.admin_active_until || '-'} blocked_reason=old_finished_chat`);
+    logIncomingBusinessState({ accountKey: ak, businessConnectionId, chatId, lead, leadFound: true, canAutoReply: false, blockedReason: 'old_finished_chat' });
     logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: false, blockReason: 'old_finished_chat' });
     await handlePostFinishSignal(lead, msg, rawText);
     return;
   }
   if (lead.stage === STAGE.PAUSED || lead.stage === STAGE.DISABLED) {
     await logIgnore(chatId, 'blocked_stage', `${lead.stage}: ${rawText}`, ak);
-    console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=true current_stage=${lead.current_stage || lead.stage || '-'} bot_enabled_for_lead=${leadBotEnabled(lead) ? 'true' : 'false'} manual_only=${lead.manual_only ? 'true' : 'false'} takeover_until=${lead.admin_active_until || '-'} blocked_reason=blocked_stage`);
+    logIncomingBusinessState({ accountKey: ak, businessConnectionId, chatId, lead, leadFound: true, canAutoReply: false, blockedReason: 'blocked_stage' });
     logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: false, blockReason: 'blocked_stage' });
     return;
   }
@@ -4967,11 +5092,11 @@ async function handleBusinessMessage(msg, options = {}) {
   console.log(`[FLOW_LOOKUP] success=${activeLead?.stage ? 'true' : 'false'} account_key=${ak} lead_chat_id=${chatId} stage=${activeLead?.stage || '-'} error=-`);
   if (!allowed.ok) {
     await logIgnore(chatId, allowed.reason, `${activeLead.stage}: ${rawText}`, ak);
-    console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=true current_stage=${activeLead.current_stage || activeLead.stage || '-'} bot_enabled_for_lead=${leadBotEnabled(activeLead) ? 'true' : 'false'} manual_only=${activeLead.manual_only ? 'true' : 'false'} takeover_until=${activeLead.admin_active_until || '-'} blocked_reason=${allowed.reason}`);
+    logIncomingBusinessState({ accountKey: ak, businessConnectionId, chatId, lead: activeLead, leadFound: true, canAutoReply: false, blockedReason: allowed.reason });
     logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: false, blockReason: allowed.reason });
     return;
   }
-  console.log(`[INCOMING_BUSINESS] chat_id=${chatId} lead_found=true current_stage=${activeLead.current_stage || activeLead.stage || '-'} bot_enabled_for_lead=${leadBotEnabled(activeLead) ? 'true' : 'false'} manual_only=${activeLead.manual_only ? 'true' : 'false'} takeover_until=${activeLead.admin_active_until || '-'} blocked_reason=-`);
+  logIncomingBusinessState({ accountKey: ak, businessConnectionId, chatId, lead: activeLead, leadFound: true, canAutoReply: true, blockedReason: '-' });
   logBusinessIncomingDecision({ accountKey: ak, chatId, leadFound: true, canAutoReply: true, blockReason: 'ok' });
 
   if (text) {
@@ -5042,7 +5167,11 @@ async function processLeadBatch(initialLead, texts) {
   }
   const text = texts.join('\n').trim();
   const ruleIntent = classify(text, lead.stage);
-  const finalRuleIntent = lead.stage === STAGE.ASKED_INFO && ruleIntent === 'unclear' ? 'no_info' : ruleIntent;
+  const finalRuleIntent = lead.stage === STAGE.ASKED_INFO && ruleIntent === 'unclear'
+    ? 'no_info'
+    : lead.stage === STAGE.ASKED_APPLICATION && ruleIntent === 'unclear'
+      ? 'application_not_submitted'
+      : ruleIntent;
   const shouldUseAi = finalRuleIntent === 'unclear' || ['rahmat', 'raxmat', 'qiziqdim', 'tushunarli', 'mayli', 'boladi', 'bo‘ladi', 'ok', 'ho‘p', "ho'p"].some(x => normalize(text).includes(x));
   let aiDecision = null;
   if (shouldUseAi) {
@@ -5075,7 +5204,18 @@ async function processLeadBatch(initialLead, texts) {
     return;
   }
   const intent = mapAiIntentToRuleIntent(aiDecision, lead.stage, finalRuleIntent);
-  console.log(`[INTENT_DECISION] account_key=${lead.account_key} lead_chat_id=${lead.chat_id} stage=${lead.stage || '-'} text=${short(text, 80).replace(/\s+/g, '_')} intent=${ruleIntent} final_intent=${intent} ai_used=${aiDecision ? 'true' : 'false'}`);
+  const matchMethod = aiDecision ? 'ai' : (ruleIntent === 'unclear' && finalRuleIntent !== ruleIntent ? 'fallback_no' : 'exact');
+  console.log(
+    `[INTENT_DECISION] account_key=${lead.account_key} ` +
+    `lead_chat_id=${lead.chat_id} ` +
+    `current_stage=${lead.stage || '-'} ` +
+    `original_text=${short(text, 80).replace(/\s+/g, '_')} ` +
+    `normalized_text=${short(normalize(text), 80).replace(/\s+/g, '_')} ` +
+    `resolved_intent=${ruleIntent} ` +
+    `final_intent=${intent} ` +
+    `match_method=${matchMethod} ` +
+    `confidence=${aiDecision ? Number(aiDecision.confidence || 0) : 1}`
+  );
   await updateLead(lead.chat_id, {
     last_user_message: text,
     last_message_at: new Date().toISOString(),
