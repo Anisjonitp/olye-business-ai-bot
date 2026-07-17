@@ -155,7 +155,8 @@ function addId(set, value) {
 function normalizeAccountKey(value) {
   const key = String(value || '').trim().toLowerCase();
   const secondKey = String(process.env.SECOND_ACCOUNT_KEY || 'second').trim().toLowerCase() || 'second';
-  if (!key || key === LEGACY_DEFAULT_ACCOUNT_KEY || key === DEFAULT_ACCOUNT_KEY) return DEFAULT_ACCOUNT_KEY;
+  if (!key) return '';
+  if (key === LEGACY_DEFAULT_ACCOUNT_KEY || key === DEFAULT_ACCOUNT_KEY) return DEFAULT_ACCOUNT_KEY;
   if (key === 'second' || key === 'liderlar' || key === secondKey) return secondKey;
   return key;
 }
@@ -172,7 +173,6 @@ function getAllowedAdminIds() {
   for (const id of TEST_ADMIN_IDS) addId(ids, id);
   for (const id of PLATFORM_OWNER_IDS) addId(ids, id);
   [
-    ADMIN_CHAT_ID,
     OWNER_TELEGRAM_ID,
     BUSINESS_OWNER_ID,
     process.env.SECOND_ACCOUNT_ADMIN_CHAT_ID,
@@ -255,7 +255,7 @@ function parseAccountsFromEnv() {
       account_key: String(a.account_key || a.key || `account_${i + 1}`),
       label: String(a.label || a.account_key || `Account ${i + 1}`),
       business_owner_id: String(a.business_owner_id || ''),
-      admin_chat_id: String(a.admin_chat_id || ADMIN_CHAT_ID || ''),
+      admin_chat_id: String(a.admin_chat_id || ''),
       business_connection_id: String(a.business_connection_id || ''),
       project_name: String(a.project_name || a.label || a.account_key || `Account ${i + 1}`),
       flow_key: String(a.flow_key || 'info_only'),
@@ -272,7 +272,8 @@ function parseAccountsFromEnv() {
 }
 
 const ENV_ACCOUNTS = parseAccountsFromEnv();
-const DEFAULT_ACCOUNT = ENV_ACCOUNTS[0] || {
+// Legacy UZLYE is an explicit compatibility record, never "the first account".
+const LEGACY_UZLYE_ACCOUNT = ENV_ACCOUNTS.find(account => accountKeyMatches(account.account_key, DEFAULT_ACCOUNT_KEY)) || {
   account_key: DEFAULT_ACCOUNT_KEY,
   label: 'UZLYE',
   business_owner_id: BUSINESS_OWNER_ID || OWNER_TELEGRAM_ID || '',
@@ -292,7 +293,7 @@ function normalizeAccount(account = {}) {
   const adminChatId = String(account.admin_chat_id || '');
   return {
     ...account,
-    account_key: String(account.account_key || DEFAULT_ACCOUNT_KEY),
+    account_key: String(account.account_key || UNKNOWN_ACCOUNT_KEY),
     label: account.label || account.account_key || DEFAULT_ACCOUNT_KEY,
     project_name: account.project_name || account.label || account.account_key || 'Telegram Business',
     owner_user_id: ownerUserId,
@@ -300,6 +301,10 @@ function normalizeAccount(account = {}) {
     owner_username: account.owner_username || account.username || '',
     owner_first_name: account.owner_first_name || account.first_name || '',
     admin_chat_id: adminChatId,
+    notification_chat_id: String(account.notification_chat_id || ''),
+    notifications_enabled: account.notifications_enabled !== false && account.notification_enabled !== false,
+    notification_settings: account.notification_settings || {},
+    admin_bot_token_scope: account.admin_bot_token_scope || '',
     business_connection_id: String(account.business_connection_id || ''),
     bot_enabled: account.bot_enabled !== false,
     auto_reply_enabled: account.auto_reply_enabled !== false,
@@ -332,7 +337,7 @@ function unknownAccount(businessConnectionId = '') {
     bot_enabled: false,
     auto_reply_enabled: false,
     reach_enabled: false,
-    archive_enabled: true,
+    archive_enabled: false,
     archive_notify_enabled: false,
     reports_enabled: false
   });
@@ -346,13 +351,13 @@ function accountDisplayLabel(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   return ak;
 }
 
-function accountKey(accountOrKey = DEFAULT_ACCOUNT_KEY) {
-  if (typeof accountOrKey === 'string') return accountOrKey || DEFAULT_ACCOUNT_KEY;
-  return accountOrKey?.account_key || DEFAULT_ACCOUNT_KEY;
+function accountKey(accountOrKey = '') {
+  if (typeof accountOrKey === 'string') return accountOrKey.trim();
+  return String(accountOrKey?.account_key || '').trim();
 }
 
 function resolveLegacyAccountKey(workspaceBusinessAccount = {}) {
-  return normalizeAccountKey(workspaceBusinessAccount.existing_account_key || workspaceBusinessAccount.account_key || DEFAULT_ACCOUNT_KEY);
+  return normalizeAccountKey(workspaceBusinessAccount.existing_account_key || '');
 }
 
 function newUserOnboardingIsEnabled() {
@@ -635,6 +640,84 @@ function settingKey(key, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   return ak === DEFAULT_ACCOUNT_KEY ? key : `${ak}:${key}`;
 }
 
+async function createAccountContext({ accountOrKey = DEFAULT_ACCOUNT_KEY, businessConnectionId = '', eventType = 'notification' } = {}) {
+  let account = null;
+  if (businessConnectionId) {
+    account = await findAccountByBusinessConnectionId(businessConnectionId);
+    if (!account) {
+      const tenant = await resolveTenantContext({ accountKey: accountKey(accountOrKey), businessConnectionId });
+      if (tenant?.account_id) account = await getAccount(tenant.canonical_account_key);
+    }
+  }
+  if (!account) account = await getAccount(accountOrKey);
+  const normalized = normalizeAccount(account || {});
+  if (!normalized.account_key || normalized.account_key === UNKNOWN_ACCOUNT_KEY || normalized.bot_enabled === false && normalized.auto_reply_enabled === false && normalized.reports_enabled === false) {
+    return {
+      resolved: false,
+      event_type: eventType,
+      workspace_id: null,
+      workspace_business_account_id: null,
+      business_account_id: null,
+      account_key: normalized.account_key || accountKey(accountOrKey),
+      business_connection_id: businessConnectionId || normalized.business_connection_id || '',
+      owner_telegram_user_id: normalized.owner_user_id || normalized.business_owner_id || '',
+      notification_chat_id: '',
+      admin_bot_token_scope: ''
+    };
+  }
+  const tenant = await resolveTenantContext({
+    accountKey: normalized.account_key,
+    businessConnectionId: businessConnectionId || normalized.business_connection_id
+  });
+  const notificationChatId = String(
+    tenant?.workspaceAccount?.notification_chat_id ||
+    normalized.notification_chat_id ||
+    normalized.admin_chat_id ||
+    ''
+  );
+  return {
+    resolved: Boolean(notificationChatId),
+    event_type: eventType,
+    workspace_id: tenant?.workspace_id || null,
+    workspace_business_account_id: tenant?.account_id || null,
+    business_account_id: normalized.id || normalized.business_account_id || tenant?.account_id || null,
+    account_key: normalized.account_key,
+    label: accountDisplayLabel(normalized.account_key),
+    business_connection_id: businessConnectionId || normalized.business_connection_id || '',
+    owner_telegram_user_id: normalized.owner_user_id || normalized.business_owner_id || '',
+    notification_chat_id: notificationChatId,
+    notifications_enabled: normalized.notifications_enabled !== false && normalized.notification_enabled !== false,
+    admin_bot_token_scope: normalized.admin_bot_token_scope || '',
+    account: normalized
+  };
+}
+
+function logAccountNotificationRoute(ctx = {}, { sendOk = false, error = '' } = {}) {
+  console.log(
+    `[ACCOUNT_NOTIFICATION_ROUTE] event_type=${ctx.event_type || '-'} ` +
+    `source_business_connection_id=${ctx.business_connection_id || '-'} ` +
+    `workspace_id=${ctx.workspace_id || '-'} ` +
+    `workspace_business_account_id=${ctx.workspace_business_account_id || '-'} ` +
+    `account_key=${ctx.account_key || '-'} ` +
+    `notification_chat_id=${ctx.notification_chat_id || '-'} ` +
+    `resolved=${ctx.resolved ? 'true' : 'false'} ` +
+    `fallback_used=false ` +
+    `send_ok=${sendOk ? 'true' : 'false'} ` +
+    `error=${error ? String(error).replace(/\s+/g, '_').slice(0, 240) : '-'}`
+  );
+}
+
+function notificationEventTypeFromText(text = '') {
+  const t = normalize(text);
+  if (t.includes('info only yakunlandi') || t.includes('info-only yakunlandi')) return 'info_only_completed';
+  if (t.includes('outreach')) return 'outreach_notification';
+  if (t.includes('operator') || t.includes('qolda davom') || t.includes("qo'lda davom") || t.includes('qo‘lda davom')) return 'manual_handoff';
+  if (t.includes('template topilmadi')) return 'template_missing';
+  if (t.includes('bot xatosi') || t.includes('xatolik')) return 'error_notification';
+  if (t.includes('ai confidence') || t.includes('noaniq lid')) return 'operator_handoff';
+  return 'admin_notification';
+}
+
 // -------------------- Telegram helpers --------------------
 async function tg(method, payload = {}, botToken = BOT_TOKEN) {
   const base = botToken ? `https://api.telegram.org/bot${botToken}` : TG_API;
@@ -710,17 +793,17 @@ async function getAccounts() {
   } else if (error && !String(error.message || '').includes('does not exist')) {
     console.error('getAccounts:', error.message);
   }
-  if (!byKey.size) byKey.set(DEFAULT_ACCOUNT.account_key, normalizeAccount(DEFAULT_ACCOUNT));
+  if (!byKey.size) byKey.set(LEGACY_UZLYE_ACCOUNT.account_key, normalizeAccount(LEGACY_UZLYE_ACCOUNT));
   return [...byKey.values()];
 }
 
 async function getAccount(accountOrKey = DEFAULT_ACCOUNT_KEY) {
-  const key = accountKey(accountOrKey);
+  const key = normalizeAccountKey(accountKey(accountOrKey));
   const accounts = await getAccounts();
-  const found = accounts.find(a => a.account_key === key);
+  const found = accounts.find(a => accountKeyMatches(a.account_key, key));
   if (found) return found;
   if (accountOrKey && typeof accountOrKey === 'object' && accountOrKey.account_key) return accountOrKey;
-  if (key === (process.env.SECOND_ACCOUNT_KEY || 'second')) {
+  if (key === normalizeAccountKey(process.env.SECOND_ACCOUNT_KEY || 'second')) {
     return {
       account_key: process.env.SECOND_ACCOUNT_KEY || 'second',
       label: process.env.SECOND_ACCOUNT_LABEL || 'Ikkinchi akkaunt',
@@ -738,20 +821,27 @@ async function getAccount(accountOrKey = DEFAULT_ACCOUNT_KEY) {
       archive_notify_enabled: false
     };
   }
-  if (key === UNKNOWN_ACCOUNT_KEY) return unknownAccount();
-  return accounts[0] || normalizeAccount(DEFAULT_ACCOUNT);
+  if (!key || key === UNKNOWN_ACCOUNT_KEY) return unknownAccount();
+  if (isDefaultAccountKey(key)) return normalizeAccount(LEGACY_UZLYE_ACCOUNT);
+  return normalizeAccount({
+    account_key: key,
+    label: key,
+    project_name: key,
+    bot_enabled: false,
+    auto_reply_enabled: false,
+    reach_enabled: false,
+    archive_enabled: false,
+    reports_enabled: false
+  });
 }
 
 async function getAdminChatIdForAccount(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const account = await getAccount(accountOrKey);
-  return account.admin_chat_id || (isDefaultAccountKey(account.account_key) ? ADMIN_CHAT_ID : '');
+  return account.notification_chat_id || account.admin_chat_id || '';
 }
 
 async function sendAdminForAccount(accountOrKey, text, extra = {}) {
-  const adminChatId = await getAdminChatIdForAccount(accountOrKey);
-  if (!adminChatId) return false;
-  await tg('sendMessage', { chat_id: adminChatId, text, parse_mode: 'HTML', ...extra });
-  return true;
+  return sendAdmin(text, extra, accountOrKey);
 }
 
 async function findBusinessConnectionMapping(businessConnectionId) {
@@ -1378,14 +1468,6 @@ async function findAccountForBusinessMessage(msg) {
       return account;
     }
   }
-  const directSender = accounts.find(a => (
-    (a.business_owner_id && String(a.business_owner_id) === fromId) ||
-    (a.admin_chat_id && String(a.admin_chat_id) === fromId)
-  ));
-  if (directSender) {
-    await logAccountResolution({ msg, account: directSender, source: 'from_owner_or_admin' });
-    return directSender;
-  }
   if (businessConnectionId) {
     let q = supabase.from('business_leads')
       .select('account_key')
@@ -1396,9 +1478,11 @@ async function findAccountForBusinessMessage(msg) {
     const { data } = await q;
     const learnedKey = data?.[0]?.account_key;
     if (learnedKey) {
-      const account = accounts.find(a => a.account_key === learnedKey) || { ...DEFAULT_ACCOUNT, account_key: learnedKey };
-      await logAccountResolution({ msg, account, source: 'business_leads_history' });
-      return account;
+      const account = accounts.find(a => a.account_key === learnedKey);
+      if (account) {
+        await logAccountResolution({ msg, account, source: 'business_leads_history' });
+        return account;
+      }
     }
     await logEvent(chatId || 'unknown', 'UNMAPPED_BUSINESS_CONNECTION', JSON.stringify({
       business_connection_id: businessConnectionId,
@@ -1409,8 +1493,8 @@ async function findAccountForBusinessMessage(msg) {
     await logAccountResolution({ msg, account, source: 'unknown_business_connection' });
     return account;
   }
-  const account = normalizeAccount(DEFAULT_ACCOUNT);
-  await logAccountResolution({ msg, account, source: 'fallback_default' });
+  const account = unknownAccount(businessConnectionId);
+  await logAccountResolution({ msg, account, source: 'account_resolution_failed_closed' });
   return account;
 }
 
@@ -1490,7 +1574,7 @@ async function resolveArchiveAccount(update = {}, messageId = null, mode = 'dele
     }).slice(0, 1200), UNKNOWN_ACCOUNT_KEY);
     return { account: unknownAccount(businessConnectionId), archived: null, reason: 'unknown_business_connection' };
   }
-  return { account: normalizeAccount(DEFAULT_ACCOUNT), archived: null, reason: 'fallback_default' };
+  return { account: unknownAccount(businessConnectionId), archived: null, reason: 'account_resolution_failed_closed' };
 }
 
 async function rememberAccountBusinessConnection(account, businessConnectionId) {
@@ -1636,17 +1720,31 @@ async function logPlatformUnauthorizedAttempt(telegramUserId, context = '', user
 }
 
 function accountLeadFilter(q, accountOrKey = DEFAULT_ACCOUNT_KEY) {
-  return q.or(accountScopeOr(accountOrKey));
+  const key = normalizeAccountKey(accountKey(accountOrKey));
+  if (!key || key === UNKNOWN_ACCOUNT_KEY) return q.eq('account_key', UNKNOWN_ACCOUNT_KEY);
+  return q.in('account_key', accountKeyAliases(key));
 }
 
 async function sendAdmin(text, extra = {}, accountOrKey = DEFAULT_ACCOUNT_KEY) {
-  const account = await getAccount(accountOrKey);
-  const adminChatId = account.admin_chat_id || ADMIN_CHAT_ID;
-  if (!adminChatId) return;
+  const ctx = await createAccountContext({
+    accountOrKey,
+    businessConnectionId: extra.business_connection_id || extra.source_business_connection_id || '',
+    eventType: extra.event_type || notificationEventTypeFromText(text)
+  });
+  const { business_connection_id, source_business_connection_id, event_type, ...telegramExtra } = extra || {};
+  if (!ctx.resolved || !ctx.notifications_enabled || !ctx.notification_chat_id) {
+    logAccountNotificationRoute(ctx, { sendOk: false, error: ctx.notifications_enabled === false ? 'notifications_disabled' : 'account_context_unresolved' });
+    return false;
+  }
+  const prefix = `[${accountDisplayLabel(ctx.account_key)}]\n`;
   try {
-    await tg('sendMessage', { chat_id: adminChatId, text, parse_mode: 'HTML', ...extra });
+    await tg('sendMessage', { chat_id: ctx.notification_chat_id, text: `${prefix}${text}`, parse_mode: 'HTML', ...telegramExtra });
+    logAccountNotificationRoute(ctx, { sendOk: true });
+    return true;
   } catch (err) {
+    logAccountNotificationRoute(ctx, { sendOk: false, error: err.message });
     console.error('sendAdmin error:', err.message);
+    return false;
   }
 }
 
@@ -1813,9 +1911,28 @@ function enrichLeadPayload(patch = {}, existing = null) {
   return payload;
 }
 
+async function resolveRequiredTenantScope(accountOrKey, businessConnectionId = '', source = 'repository') {
+  const account = await getAccount(accountOrKey);
+  const tenant = await resolveTenantContext({ accountKey: account.account_key, businessConnectionId: businessConnectionId || account.business_connection_id });
+  if (!account.account_key || account.account_key === UNKNOWN_ACCOUNT_KEY || !tenant?.workspace_id || !tenant?.account_id) {
+    console.log(`[TENANT_SCOPE_REJECTED] source=${source} account_key=${account.account_key || '-'} business_connection_id=${businessConnectionId || account.business_connection_id || '-'} workspace_id=${tenant?.workspace_id || '-'} account_id=${tenant?.account_id || '-'} reason=scope_unresolved`);
+    return null;
+  }
+  return { account, tenant };
+}
+
+function applyRequiredTenantScope(q, scope) {
+  return q
+    .eq('workspace_id', scope.tenant.workspace_id)
+    .eq('workspace_business_account_id', scope.tenant.account_id)
+    .eq('account_key', scope.account.account_key);
+}
+
 async function getLead(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const scope = await resolveRequiredTenantScope(accountOrKey, '', 'lead_repository_get');
+  if (!scope) return null;
   let q = supabase.from('business_leads').select('*').eq('chat_id', String(chatId));
-  q = accountLeadFilter(q, accountOrKey);
+  q = applyRequiredTenantScope(q, scope);
   const { data, error } = await q.maybeSingle();
   if (error) {
     console.error('getLead:', error.message);
@@ -1823,7 +1940,7 @@ async function getLead(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   }
   if (data) return data;
   let fallbackQ = supabase.from('business_leads').select('*').eq('lead_chat_id', String(chatId));
-  fallbackQ = accountLeadFilter(fallbackQ, accountOrKey);
+  fallbackQ = applyRequiredTenantScope(fallbackQ, scope);
   const { data: fallback, error: fallbackError } = await fallbackQ.maybeSingle();
   if (fallbackError) {
     console.error('getLead fallback:', fallbackError.message);
@@ -1833,12 +1950,16 @@ async function getLead(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
 }
 
 async function createLead({ chatId, businessConnectionId, from, text, stage = STAGE.NEW, status = 'active', botEnabled = true, accountKey = DEFAULT_ACCOUNT_KEY }) {
+  const scope = await resolveRequiredTenantScope(accountKey, businessConnectionId, 'lead_repository_create');
+  if (!scope) return null;
   const now = new Date().toISOString();
   const payload = enrichLeadPayload({
     chat_id: String(chatId),
     lead_chat_id: String(chatId),
-    account_key: accountKey,
-    business_connection_id: businessConnectionId || null,
+    account_key: scope.account.account_key,
+    business_connection_id: businessConnectionId || scope.account.business_connection_id || null,
+    workspace_id: scope.tenant.workspace_id,
+    workspace_business_account_id: scope.tenant.account_id,
     first_name: from?.first_name || null,
     username: from?.username || null,
     status,
@@ -1863,37 +1984,39 @@ async function createLead({ chatId, businessConnectionId, from, text, stage = ST
     console.error('createLead:', error.message);
     return null;
   }
-  await logEvent(chatId, `lead_created_${stage}`, text || '', accountKey);
+  await logEvent(chatId, `lead_created_${stage}`, text || '', scope.account.account_key);
   return data;
 }
 
 async function updateLead(chatId, patch, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const scope = await resolveRequiredTenantScope(accountOrKey, patch.business_connection_id || '', 'lead_repository_update');
+  if (!scope) return null;
   const changedStage = Object.prototype.hasOwnProperty.call(patch, 'stage');
-  const existing = changedStage ? await getLead(chatId, accountOrKey) : null;
-  const payload = enrichLeadPayload({ ...patch, updated_at: new Date().toISOString() }, existing);
+  const existing = changedStage ? await getLead(chatId, scope.account.account_key) : null;
+  const payload = enrichLeadPayload({ ...patch, account_key: scope.account.account_key, workspace_id: scope.tenant.workspace_id, workspace_business_account_id: scope.tenant.account_id, updated_at: new Date().toISOString() }, existing);
   if (changedStage) payload.stage_started_at = new Date().toISOString();
   let q = supabase.from('business_leads').update(payload).eq('chat_id', String(chatId));
-  q = accountLeadFilter(q, accountOrKey);
+  q = applyRequiredTenantScope(q, scope);
   let { data, error } = await q.select().maybeSingle();
   if (error && isMissingLeadFieldError(error)) {
     let fallbackQ = supabase.from('business_leads').update(stripOptionalLeadFields(payload)).eq('chat_id', String(chatId));
-    fallbackQ = accountLeadFilter(fallbackQ, accountOrKey);
+    fallbackQ = applyRequiredTenantScope(fallbackQ, scope);
     ({ data, error } = await fallbackQ.select().maybeSingle());
   }
   if (!error && !data) {
     let fallbackQ = supabase.from('business_leads').update(payload).eq('lead_chat_id', String(chatId));
-    fallbackQ = accountLeadFilter(fallbackQ, accountOrKey);
+    fallbackQ = applyRequiredTenantScope(fallbackQ, scope);
     ({ data, error } = await fallbackQ.select().maybeSingle());
     if (error && isMissingLeadFieldError(error)) {
       let strippedFallbackQ = supabase.from('business_leads').update(stripOptionalLeadFields(payload)).eq('lead_chat_id', String(chatId));
-      strippedFallbackQ = accountLeadFilter(strippedFallbackQ, accountOrKey);
+      strippedFallbackQ = applyRequiredTenantScope(strippedFallbackQ, scope);
       ({ data, error } = await strippedFallbackQ.select().maybeSingle());
     }
   }
   if (error) console.error('updateLead:', error.message);
   if (!error && changedStage && existing?.stage !== patch.stage) {
     await writeAuditLog({
-      accountKey: accountOrKey,
+      accountKey: scope.account.account_key,
       chatId,
       action: 'stage_changed',
       oldValue: existing?.stage || null,
@@ -2154,21 +2277,21 @@ function accountTemplateKey(accountOrKey, key) {
 }
 
 async function getTemplate(key, accountOrKey = DEFAULT_ACCOUNT_KEY) {
-  const ak = accountKey(accountOrKey);
-  const scoped = await supabase.from('reply_templates')
-    .select('body')
-    .eq('key', accountTemplateKey(ak, key))
-    .eq('account_key', ak)
-    .maybeSingle();
-  if (!scoped.error && scoped.data?.body) return scoped.data.body;
-  if (scoped.error) console.error('getTemplate scoped:', key, scoped.error.message);
-
-  const { data, error } = await supabase.from('reply_templates').select('body').eq('key', key).maybeSingle();
-  if (error) {
-    console.error('getTemplate:', key, error.message);
+  const ak = normalizeAccountKey(accountKey(accountOrKey));
+  if (!ak || ak === UNKNOWN_ACCOUNT_KEY) {
+    console.log(`[TENANT_SCOPE_REJECTED] source=template_repository template_key=${key} reason=account_unresolved`);
     return null;
   }
-  return data?.body || null;
+  const aliases = accountKeyAliases(ak);
+  const scoped = await supabase.from('reply_templates')
+    .select('body')
+    .in('key', [accountTemplateKey(ak, key), key])
+    .in('account_key', aliases)
+    .order('updated_at', { ascending: false })
+    .limit(1);
+  if (!scoped.error && scoped.data?.[0]?.body) return scoped.data[0].body;
+  if (scoped.error) console.error('getTemplate scoped:', key, scoped.error.message);
+  return null;
 }
 
 const REACH_TEMPLATE_KEYS = [
@@ -2214,20 +2337,6 @@ async function getActiveReachTemplates(accountOrKey = DEFAULT_ACCOUNT_KEY) {
     }
   }
 
-  // Legacy global templates belong only to the default UZLYE account.
-  if (normalizeAccountKey(ak) === DEFAULT_ACCOUNT_KEY) {
-    const { data: globalRows, error: globalError } = await supabase.from('reply_templates')
-      .select('key,title,body')
-      .is('account_key', null)
-      .in('key', REACH_TEMPLATE_KEYS);
-    if (globalError) console.error('getActiveReachTemplates global:', globalError.message);
-    for (const row of globalRows || []) {
-      const key = String(row.key || '');
-      if (REACH_TEMPLATE_KEYS.includes(key) && activeReachTemplateBody(row.body) && !templates.some(t => t.key === key)) {
-        templates.push({ key, body: renderTemplate(row.body), source: 'uzlye_legacy' });
-      }
-    }
-  }
   return templates;
 }
 
@@ -2861,7 +2970,10 @@ async function getFlowStep(accountOrKey, stepKey) {
 
 async function flowTemplateKeys(accountOrKey, stepKey, fallbackKeys) {
   const step = await getFlowStep(accountOrKey, stepKey);
-  if (!step?.template_key) return fallbackKeys;
+  if (!step?.template_key) {
+    console.log(`[TENANT_SCOPE_REJECTED] source=flow_repository account_key=${accountKey(accountOrKey) || '-'} step_key=${stepKey} reason=flow_step_missing`);
+    return [];
+  }
   return String(step.template_key).split(/[,\s]+/).map(x => x.trim()).filter(Boolean);
 }
 
@@ -3959,13 +4071,7 @@ async function getSubscriptionWorkspaceMeta(workspaceId) {
     console.error('[SUBSCRIPTION] workspace meta:', workspaceError.message);
     return null;
   }
-  const { data: workspaceAccounts, error: accountError } = await supabase.from('workspace_business_accounts')
-    .select('*')
-    .eq('workspace_id', workspaceId)
-    .order('created_at', { ascending: true })
-    .limit(1);
-  if (accountError) console.error('[SUBSCRIPTION] account meta:', accountError.message);
-  return { workspace, workspaceAccount: workspaceAccounts?.[0] || null };
+  return { workspace, workspaceAccount: null };
 }
 
 async function getWorkspaceOwnerTelegramId(workspace = {}) {
@@ -4307,8 +4413,13 @@ async function maybeFinishAutoReport(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   if (!auto?.enabled) return;
   if (Number(auto.until || 0) > Date.now()) return;
   if (auto.report_sent) return;
-  const account = await getAccount(ak);
-  await sendAutoSessionReport(account.admin_chat_id || ADMIN_CHAT_ID, auto, true, ak);
+  const ctx = await createAccountContext({ accountOrKey: ak, eventType: 'outreach_session_report' });
+  if (ctx.resolved && ctx.notification_chat_id) {
+    await sendAutoSessionReport(ctx.notification_chat_id, auto, true, ak);
+    logAccountNotificationRoute(ctx, { sendOk: true });
+  } else {
+    logAccountNotificationRoute(ctx, { sendOk: false, error: 'account_context_unresolved' });
+  }
   await setSetting(settingKey('auto_outreach', ak), { ...auto, enabled: false, report_sent: true, disabled_at: Date.now() });
 }
 
@@ -4427,7 +4538,7 @@ function messageArchivePayload(msg, account, direction, eventType = 'created') {
   const meta = messageArchiveMeta(msg);
   const businessConnectionId = msg.business_connection_id || msg.business_connection?.id || account?.business_connection_id || 'unknown';
   return {
-    account_key: account?.account_key || DEFAULT_ACCOUNT_KEY,
+    account_key: account?.account_key || UNKNOWN_ACCOUNT_KEY,
     business_connection_id: String(businessConnectionId),
     chat_id: String(msg.chat?.id || ''),
     message_id: msg.message_id || null,
@@ -4450,9 +4561,16 @@ function messageArchivePayload(msg, account, direction, eventType = 'created') {
 }
 
 async function archiveBusinessMessage(msg, account, direction = 'unknown') {
-  if (account?.archive_enabled === false) return null;
+  if (!account?.account_key || account.account_key === UNKNOWN_ACCOUNT_KEY || account?.archive_enabled === false) return null;
   const payload = messageArchivePayload(msg, account, direction, 'created');
   if (!payload.business_connection_id || !payload.chat_id || !payload.message_id) return null;
+  const tenant = await resolveTenantContext({ accountKey: account.account_key, businessConnectionId: payload.business_connection_id });
+  if (!tenant?.workspace_id || !tenant?.account_id) {
+    console.log(`[TENANT_SCOPE_REJECTED] source=archive_repository account_key=${account.account_key} business_connection_id=${payload.business_connection_id} reason=scope_unresolved`);
+    return null;
+  }
+  payload.workspace_id = tenant.workspace_id;
+  payload.workspace_business_account_id = tenant.account_id;
   const existing = await findArchivedMessage({
     accountKey: payload.account_key,
     businessConnectionId: payload.business_connection_id,
@@ -4907,7 +5025,7 @@ async function replyWhoami(msg, messageType = 'message') {
   } catch (err) {
     console.error('whoami reply failed:', err.message);
     try {
-      const account = messageType === 'business_message' ? await findAccountForBusinessMessage(msg) : DEFAULT_ACCOUNT;
+      const account = messageType === 'business_message' ? await findAccountForBusinessMessage(msg) : unknownAccount();
       await logEvent(chatId || 'unknown', 'whoami_reply_failed', err.message || String(err), account?.account_key);
     } catch {}
   }
@@ -5340,10 +5458,12 @@ async function sendAutoSessionReport(chatId, auto = null, final = false, account
   if (!current?.session_id) return tg('sendMessage', { chat_id: chatId, text: 'Hozircha outreach session yo‘q.' });
   const s = await sessionStats(current.session_id, accountOrKey);
   const title = final ? '📣 Bugungi Auto Outreach tugadi' : '📊 Outreach hisoboti';
+  const accountLabel = accountDisplayLabel(accountOrKey);
   return tg('sendMessage', {
     chat_id: chatId,
     parse_mode: 'HTML',
     text:
+      `[${html(accountLabel)}]\n` +
       `<b>${title}</b>\n\n` +
       `Outreach aniqlanganlar: ${s.outreach} ta\n` +
       `Javob berganlar: ${s.replied} ta\n` +
@@ -5367,7 +5487,7 @@ async function getReminderDue(limit = 50, accountOrKey = DEFAULT_ACCOUNT_KEY) {
 async function getReachStartTemplate(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const templates = await getActiveReachTemplates(accountOrKey);
   if (templates[0]?.body) return templates[0].body;
-  return normalizeAccountKey(accountKey(accountOrKey)) === DEFAULT_ACCOUNT_KEY ? DEFAULT_REACH_START_TEXT : null;
+  return null;
 }
 
 function leadChatId(lead = {}) {
@@ -5384,10 +5504,15 @@ async function resolveReachContext(accountOrKey = DEFAULT_ACCOUNT_KEY) {
 }
 
 function applyReachScope(q, accountOrKey = DEFAULT_ACCOUNT_KEY, tenant = null) {
-  const parts = accountScopeOr(accountOrKey).split(',').filter(Boolean);
-  if (tenant?.workspace_id) parts.push(`workspace_id.eq.${tenant.workspace_id}`);
-  if (tenant?.account_id) parts.push(`workspace_business_account_id.eq.${tenant.account_id}`);
-  return q.or([...new Set(parts)].join(','));
+  const scopedAccountKey = normalizeAccountKey(accountKey(accountOrKey));
+  if (!scopedAccountKey || scopedAccountKey === UNKNOWN_ACCOUNT_KEY || !tenant?.workspace_id || !tenant?.account_id) {
+    console.log(`[TENANT_SCOPE_REJECTED] source=outreach_repository account_key=${scopedAccountKey || '-'} workspace_id=${tenant?.workspace_id || '-'} account_id=${tenant?.account_id || '-'} reason=scope_unresolved`);
+    return q.eq('workspace_business_account_id', '__unresolved_tenant__');
+  }
+  return q
+    .eq('workspace_id', tenant.workspace_id)
+    .eq('workspace_business_account_id', tenant.account_id)
+    .eq('account_key', scopedAccountKey);
 }
 
 function applyReachEligibility(q) {
@@ -6226,8 +6351,9 @@ async function getSelectedAccountKey(adminChatId) {
     .eq('telegram_user_id', String(adminChatId))
     .eq('is_active', true)
     .limit(1);
-  if (!adminError && adminRows?.[0]?.account_key) return adminRows[0].account_key;
-  return DEFAULT_ACCOUNT.account_key;
+  if (!adminError && (adminRows || []).length === 1 && adminRows[0]?.account_key) return adminRows[0].account_key;
+  console.log(`[TENANT_SCOPE_REJECTED] source=admin_selection chat_id=${adminChatId || '-'} reason=account_not_selected_or_ambiguous`);
+  return null;
 }
 
 async function getPublicOwnedAccounts(chatId, fromId = '') {
@@ -6284,7 +6410,7 @@ async function getPublicSelectedAccountKey(chatId, fromId = '') {
   const selected = await getSelectedAccountKey(chatId);
   const ownedSelected = owned.find(a => accountKeyMatches(a.account_key, selected));
   if (ownedSelected?.account_key) return ownedSelected.account_key;
-  return owned[0]?.account_key || selected;
+  return null;
 }
 
 async function requirePublicAccountAccess(chatId, fromId, requestedAccountKey) {
@@ -9680,7 +9806,11 @@ app.post('/webhook', async (req, res) => {
     if (update.deleted_business_messages) await handleDeletedBusinessMessages(update.deleted_business_messages);
   } catch (err) {
     console.error('webhook processing error:', err);
-    await sendAdmin(`⚠️ Bot xatosi: ${html(err.message || String(err))}`);
+    const businessConnectionId = updateBusinessConnectionId(req.body || {});
+    await sendAdmin(`⚠️ Bot xatosi: ${html(err.message || String(err))}`, {
+      event_type: 'error_notification',
+      source_business_connection_id: businessConnectionId
+    }, businessConnectionId ? UNKNOWN_ACCOUNT_KEY : DEFAULT_ACCOUNT_KEY);
   }
 });
 
