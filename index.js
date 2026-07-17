@@ -1511,8 +1511,15 @@ async function findAccountByBusinessConnectionId(businessConnectionId) {
 
 async function findArchivedMessage({ businessConnectionId = '', chatId = '', messageId = null, accountKey: ak = null }) {
   if (!ak || !businessConnectionId || !chatId || !messageId) return null;
+  const tenant = await resolveTenantContext({ accountKey: ak, businessConnectionId });
+  if (!tenant?.workspace_id || !tenant?.account_id) {
+    console.log(`[ARCHIVE_DELETE_LOOKUP] account_key=${ak || '-'} chat_id=${chatId || '-'} message_id=${messageId || '-'} found=false lookup_scope=unresolved error=tenant_scope_unresolved`);
+    return null;
+  }
   let q = supabase.from('message_archive')
     .select('*')
+    .eq('workspace_id', tenant.workspace_id)
+    .eq('workspace_business_account_id', tenant.account_id)
     .eq('account_key', ak)
     .eq('business_connection_id', String(businessConnectionId))
     .eq('chat_id', String(chatId))
@@ -1522,6 +1529,7 @@ async function findArchivedMessage({ businessConnectionId = '', chatId = '', mes
   const { data, error } = await q;
   if (error) {
     console.error('findArchivedMessage:', error.message);
+    console.log(`[ARCHIVE_DELETE_LOOKUP] account_key=${ak} chat_id=${chatId} message_id=${messageId} found=false lookup_scope=workspace_id+workspace_business_account_id+business_connection_id+chat_id+message_id error=${String(error.message || error).replace(/\s+/g, '_').slice(0, 180)}`);
     return null;
   }
   return data?.[0] || null;
@@ -1758,11 +1766,20 @@ async function sendBusinessMessage(lead, text) {
     await logEvent(lead?.chat_id || 'unknown', 'send_skipped_no_business_connection', String(text || '').slice(0, 300), lead?.account_key);
     return null;
   }
-  await tg('sendMessage', {
+  const result = await tg('sendMessage', {
     chat_id: lead.chat_id,
     business_connection_id: lead.business_connection_id,
     text
   });
+  const account = await getAccount(lead.account_key);
+  await archiveBusinessMessage({
+    message_id: result?.message_id,
+    chat: { id: lead.chat_id },
+    business_connection_id: lead.business_connection_id,
+    text,
+    date: Math.floor(Date.now() / 1000),
+    from: { id: 'bot', first_name: 'Business Auto' }
+  }, account, 'bot');
   await updateLead(lead.chat_id, { last_bot_message: text, last_message_at: new Date().toISOString(), last_actor: 'bot' }, lead.account_key);
   return true;
 }
@@ -4553,6 +4570,7 @@ function messageArchivePayload(msg, account, direction, eventType = 'created') {
     file_id: meta.fileId || null,
     file_unique_id: meta.fileUniqueId || null,
     file_name: meta.fileName || null,
+    raw_json: msg,
     sent_at: msg.date ? new Date(Number(msg.date) * 1000).toISOString() : new Date().toISOString(),
     is_deleted: false,
     last_event_type: eventType,
@@ -4561,12 +4579,16 @@ function messageArchivePayload(msg, account, direction, eventType = 'created') {
 }
 
 async function archiveBusinessMessage(msg, account, direction = 'unknown') {
-  if (!account?.account_key || account.account_key === UNKNOWN_ACCOUNT_KEY || account?.archive_enabled === false) return null;
+  if (!account?.account_key || account.account_key === UNKNOWN_ACCOUNT_KEY || account?.archive_enabled === false) {
+    console.log(`[ARCHIVE_WRITE] account_key=${account?.account_key || '-'} business_connection_id=${msg?.business_connection_id || '-'} chat_id=${msg?.chat?.id || '-'} message_id=${msg?.message_id || '-'} direction=${direction} text_present=${getMessageText(msg) ? 'true' : 'false'} write_ok=false error=archive_disabled_or_account_unresolved`);
+    return null;
+  }
   const payload = messageArchivePayload(msg, account, direction, 'created');
   if (!payload.business_connection_id || !payload.chat_id || !payload.message_id) return null;
   const tenant = await resolveTenantContext({ accountKey: account.account_key, businessConnectionId: payload.business_connection_id });
   if (!tenant?.workspace_id || !tenant?.account_id) {
     console.log(`[TENANT_SCOPE_REJECTED] source=archive_repository account_key=${account.account_key} business_connection_id=${payload.business_connection_id} reason=scope_unresolved`);
+    console.log(`[ARCHIVE_WRITE] account_key=${account.account_key} business_connection_id=${payload.business_connection_id} chat_id=${payload.chat_id} message_id=${payload.message_id || '-'} direction=${direction} text_present=${getMessageText(msg) ? 'true' : 'false'} write_ok=false error=tenant_scope_unresolved`);
     return null;
   }
   payload.workspace_id = tenant.workspace_id;
@@ -4577,7 +4599,10 @@ async function archiveBusinessMessage(msg, account, direction = 'unknown') {
     chatId: payload.chat_id,
     messageId: payload.message_id
   });
-  if (existing) return existing;
+  if (existing) {
+    console.log(`[ARCHIVE_WRITE] account_key=${payload.account_key} business_connection_id=${payload.business_connection_id} chat_id=${payload.chat_id} message_id=${payload.message_id} direction=${direction} text_present=${getMessageText(msg) ? 'true' : 'false'} write_ok=true error=-`);
+    return existing;
+  }
   const { data, error } = await supabase.from('message_archive').upsert({
     ...payload,
     delete_detected: false,
@@ -4587,16 +4612,24 @@ async function archiveBusinessMessage(msg, account, direction = 'unknown') {
     console.error('archiveBusinessMessage:', error.message);
     await logEvent(payload.chat_id, 'message_archive_error', error.message, payload.account_key);
   }
+  console.log(`[ARCHIVE_WRITE] account_key=${payload.account_key} business_connection_id=${payload.business_connection_id} chat_id=${payload.chat_id} message_id=${payload.message_id} direction=${direction} text_present=${getMessageText(msg) ? 'true' : 'false'} write_ok=${error ? 'false' : 'true'} error=${error ? String(error.message || error).replace(/\s+/g, '_').slice(0, 180) : '-'}`);
   return data || null;
 }
 
 async function archiveEditedBusinessMessage(msg) {
   const resolved = await resolveArchiveAccount(msg, msg.message_id, 'edited');
   const account = resolved.account;
-  if (account?.archive_enabled === false || account?.track_edited_enabled === false) return;
-  const direction = isOwnerMessage(msg) ? 'outgoing' : 'incoming';
+  if (!account?.account_key || account.account_key === UNKNOWN_ACCOUNT_KEY || account?.archive_enabled === false || account?.track_edited_enabled === false) return;
+  const direction = isOwnerMessage(msg) ? 'admin' : 'customer';
   const payload = messageArchivePayload(msg, account, direction, 'edited');
   if (!payload.business_connection_id || !payload.chat_id || !payload.message_id) return;
+  const tenant = await resolveTenantContext({ accountKey: account.account_key, businessConnectionId: payload.business_connection_id });
+  if (!tenant?.workspace_id || !tenant?.account_id) {
+    console.log(`[ARCHIVE_WRITE] account_key=${account.account_key} business_connection_id=${payload.business_connection_id} chat_id=${payload.chat_id} message_id=${payload.message_id} direction=${direction} text_present=${getMessageText(msg) ? 'true' : 'false'} write_ok=false error=tenant_scope_unresolved`);
+    return;
+  }
+  payload.workspace_id = tenant.workspace_id;
+  payload.workspace_business_account_id = tenant.account_id;
 
   const oldRow = resolved.archived || await findArchivedMessage({
     businessConnectionId: payload.business_connection_id,
@@ -4649,21 +4682,29 @@ async function handleDeletedBusinessMessages(update = {}) {
     const account = resolved.account;
     if (account?.archive_enabled === false || account?.track_deleted_enabled === false) continue;
     const ak = account.account_key;
+    const tenant = await resolveTenantContext({ accountKey: ak, businessConnectionId });
+    if (!tenant?.workspace_id || !tenant?.account_id) {
+      console.log(`[ARCHIVE_DELETE_LOOKUP] account_key=${ak || '-'} chat_id=${chatId} message_id=${messageId} found=false lookup_scope=unresolved error=tenant_scope_unresolved`);
+      continue;
+    }
     let oldRow = resolved.archived || await findArchivedMessage({
       businessConnectionId,
       chatId,
       messageId,
       accountKey: ak
     });
+    console.log(`[ARCHIVE_DELETE_LOOKUP] account_key=${ak || '-'} chat_id=${chatId} message_id=${messageId} found=${oldRow ? 'true' : 'false'} lookup_scope=account_key+business_connection_id+chat_id+message_id error=-`);
     if (oldRow?.is_deleted === true || oldRow?.delete_detected === true) continue;
     const patch = {
       account_key: ak,
+      workspace_id: tenant.workspace_id,
+      workspace_business_account_id: tenant.account_id,
       business_connection_id: String(businessConnectionId || oldRow?.business_connection_id || account.business_connection_id || 'unknown'),
       chat_id: chatId,
       message_id: messageId,
       sender: oldRow?.sender || messageArchiveSender(update.chat || {}),
       sent_at: oldRow?.sent_at || null,
-      direction: oldRow?.direction || 'incoming',
+      direction: oldRow?.direction || 'customer',
       deleted_at: new Date().toISOString(),
       is_deleted: true,
       delete_detected: true,
@@ -4745,7 +4786,8 @@ function archiveStoredContent(row = {}) {
 }
 
 function archiveDirectionLabel(row = {}) {
-  return row.direction === 'outgoing' ? 'Admin yuborgan' : 'Mijoz yuborgan';
+  if (row.direction === 'bot') return 'Business Auto yuborgan';
+  return row.direction === 'admin' || row.direction === 'outgoing' ? 'Admin yuborgan' : 'Mijoz yuborgan';
 }
 
 function archiveDetailContent(row = {}, isDeleted = false) {
@@ -5059,8 +5101,9 @@ async function handleBusinessMessage(msg, options = {}) {
   const ak = account.account_key;
   console.log(`[ACCOUNT_LOOKUP] success=${ak !== UNKNOWN_ACCOUNT_KEY ? 'true' : 'false'} account_key=${ak} business_connection_id=${businessConnectionId || '-'} error=-`);
   const text = getMessageText(msg).trim();
-  const direction = isAccountOwnerMessage(msg, account) ? 'outgoing' : 'incoming';
-  if (direction === 'outgoing') await rememberAccountBusinessConnection(account, businessConnectionId);
+  const ownerOutgoing = isAccountOwnerMessage(msg, account);
+  const direction = ownerOutgoing ? 'admin' : 'customer';
+  if (ownerOutgoing) await rememberAccountBusinessConnection(account, businessConnectionId);
   if (!options.skipArchive) await archiveBusinessMessage(msg, account, direction);
   if (normalizeCommandWord(text.split(/\s+/)[0]) === '/whoami') {
     await replyWhoami(msg, 'business_message');
@@ -5072,7 +5115,7 @@ async function handleBusinessMessage(msg, options = {}) {
     return;
   }
 
-  const eventType = direction === 'outgoing'
+  const eventType = ownerOutgoing
     ? (options.edited ? 'business_outgoing_edited' : 'business_outgoing')
     : (options.edited ? 'business_incoming_edited' : 'business_incoming');
   const firstTime = await markProcessedEvent({
@@ -6015,7 +6058,7 @@ async function getArchivePeople(accountOrKey = DEFAULT_ACCOUNT_KEY) {
       existing.total_count += 1;
       if (row.is_deleted) existing.deleted_count += 1;
       existing.edited_count += Number(row.edit_count || 0);
-      if (row.direction === 'incoming' && (row.sender || row.from_username || row.from_first_name)) {
+      if ((row.direction === 'customer' || row.direction === 'incoming') && (row.sender || row.from_username || row.from_first_name)) {
         existing.sender = row.sender || existing.sender;
         existing.from_username = row.from_username || existing.from_username;
         existing.from_first_name = row.from_first_name || existing.from_first_name;
@@ -6025,7 +6068,7 @@ async function getArchivePeople(accountOrKey = DEFAULT_ACCOUNT_KEY) {
       if (candidate > current) {
         existing.last_activity = row.updated_at || row.deleted_at || row.edited_at || row.created_at;
         existing.id = row.id;
-        if (row.direction === 'incoming' || !existing.sender) existing.sender = row.sender || existing.sender;
+        if (row.direction === 'customer' || row.direction === 'incoming' || !existing.sender) existing.sender = row.sender || existing.sender;
       }
       seen.set(key, existing);
     }
@@ -6073,7 +6116,7 @@ function archiveEventButtonText(row = {}) {
   const d = new Date(row.deleted_at || row.edited_at || row.updated_at || row.sent_at || row.created_at || Date.now());
   const date = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
   const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-  const actor = row.direction === 'outgoing' ? '🤖 Admin' : '👤 Mijoz';
+  const actor = row.direction === 'bot' ? '🤖 Business Auto' : (row.direction === 'admin' || row.direction === 'outgoing' ? '🧑‍💼 Admin' : '👤 Mijoz');
   const state = row.is_deleted ? ' 🗑' : (Number(row.edit_count || 0) > 0 ? ' ✏️' : '');
   return `${actor} ${date} ${time}${state} — ${short(archiveStoredContent(row), 28)}`;
 }
@@ -6090,7 +6133,7 @@ async function getArchivePersonSummary(accountOrKey, profile) {
 
 async function getArchivePersonProfile(accountOrKey, profile) {
   const incoming = await getArchiveRows('chat', accountOrKey, profile.chat_id, 1, profile.business_connection_id, 0)
-    .then(rows => rows.find(row => row.direction === 'incoming'));
+    .then(rows => rows.find(row => row.direction === 'customer' || row.direction === 'incoming'));
   if (incoming) return incoming;
   let q = supabase.from('message_archive').select('*')
     .eq('chat_id', String(profile.chat_id))
