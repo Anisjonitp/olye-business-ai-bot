@@ -556,6 +556,10 @@ async function canWorkspaceAutomate({ accountOrKey = DEFAULT_ACCOUNT_KEY, busine
     businessConnectionId
   });
   if (!context.workspace_id || !context.account_id) {
+    const account = await getAccount(accountOrKey);
+    if (await isInternalLegacyBusinessAccount(account)) {
+      return { ok: true, reason: 'legacy_internal_no_context', context };
+    }
     return { ok: false, reason: 'subscription_context_missing', context };
   }
 
@@ -1414,6 +1418,30 @@ function isDefaultAccountKey(ak) {
   return !ak || ak === DEFAULT_ACCOUNT_KEY || ak === LEGACY_DEFAULT_ACCOUNT_KEY;
 }
 
+function accountKeyAliases(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const raw = String(accountKey(accountOrKey) || '').trim().toLowerCase();
+  const normalized = normalizeAccountKey(raw);
+  const aliases = new Set([raw, normalized].filter(Boolean));
+  if (isDefaultAccountKey(normalized)) {
+    aliases.add(DEFAULT_ACCOUNT_KEY);
+    aliases.add(LEGACY_DEFAULT_ACCOUNT_KEY);
+  }
+  const secondKey = normalizeAccountKey(process.env.SECOND_ACCOUNT_KEY || 'second');
+  if (normalized === secondKey) {
+    aliases.add('second');
+    aliases.add('liderlar');
+    aliases.add(secondKey);
+  }
+  return [...aliases].filter(Boolean);
+}
+
+function accountScopeOr(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const aliases = accountKeyAliases(accountOrKey);
+  const parts = aliases.map(key => `account_key.eq.${key}`);
+  if (aliases.some(isDefaultAccountKey)) parts.unshift('account_key.is.null');
+  return [...new Set(parts)].join(',');
+}
+
 async function isPlatformOwner(telegramUserId) {
   const raw = String(telegramUserId || '').trim();
   if (!raw) return false;
@@ -1500,9 +1528,7 @@ async function logPlatformUnauthorizedAttempt(telegramUserId, context = '', user
 }
 
 function accountLeadFilter(q, accountOrKey = DEFAULT_ACCOUNT_KEY) {
-  const ak = accountKey(accountOrKey);
-  if (isDefaultAccountKey(ak)) return q.or(`account_key.is.null,account_key.eq.${DEFAULT_ACCOUNT_KEY},account_key.eq.${LEGACY_DEFAULT_ACCOUNT_KEY}`);
-  return q.eq('account_key', ak);
+  return q.or(accountScopeOr(accountOrKey));
 }
 
 async function sendAdmin(text, extra = {}, accountOrKey = DEFAULT_ACCOUNT_KEY) {
@@ -1687,7 +1713,15 @@ async function getLead(chatId, accountOrKey = DEFAULT_ACCOUNT_KEY) {
     console.error('getLead:', error.message);
     return null;
   }
-  return data || null;
+  if (data) return data;
+  let fallbackQ = supabase.from('business_leads').select('*').eq('lead_chat_id', String(chatId));
+  fallbackQ = accountLeadFilter(fallbackQ, accountOrKey);
+  const { data: fallback, error: fallbackError } = await fallbackQ.maybeSingle();
+  if (fallbackError) {
+    console.error('getLead fallback:', fallbackError.message);
+    return null;
+  }
+  return fallback || null;
 }
 
 async function createLead({ chatId, businessConnectionId, from, text, stage = STAGE.NEW, status = 'active', botEnabled = true, accountKey = DEFAULT_ACCOUNT_KEY }) {
@@ -1737,6 +1771,16 @@ async function updateLead(chatId, patch, accountOrKey = DEFAULT_ACCOUNT_KEY) {
     let fallbackQ = supabase.from('business_leads').update(stripOptionalLeadFields(payload)).eq('chat_id', String(chatId));
     fallbackQ = accountLeadFilter(fallbackQ, accountOrKey);
     ({ data, error } = await fallbackQ.select().maybeSingle());
+  }
+  if (!error && !data) {
+    let fallbackQ = supabase.from('business_leads').update(payload).eq('lead_chat_id', String(chatId));
+    fallbackQ = accountLeadFilter(fallbackQ, accountOrKey);
+    ({ data, error } = await fallbackQ.select().maybeSingle());
+    if (error && isMissingLeadFieldError(error)) {
+      let strippedFallbackQ = supabase.from('business_leads').update(stripOptionalLeadFields(payload)).eq('lead_chat_id', String(chatId));
+      strippedFallbackQ = accountLeadFilter(strippedFallbackQ, accountOrKey);
+      ({ data, error } = await strippedFallbackQ.select().maybeSingle());
+    }
   }
   if (error) console.error('updateLead:', error.message);
   if (!error && changedStage && existing?.stage !== patch.stage) {
@@ -3202,12 +3246,28 @@ async function markOutreach({ chatId, businessConnectionId, from, text, messageI
     last_message_at: new Date().toISOString()
   };
 
+  let marked = null;
   if (existing) {
     if (STOP_REPLY_STAGES.has(existing.stage) || existing.status === 'disabled') return false;
-    await updateLead(chatId, patch, accountKey);
+    marked = await updateLead(chatId, patch, accountKey);
   } else {
     await createLead({ chatId, businessConnectionId, from, text, stage: STAGE.OUTREACH_SENT, status: 'active', botEnabled: true, accountKey });
-    await updateLead(chatId, patch, accountKey);
+    marked = await updateLead(chatId, patch, accountKey);
+  }
+  console.log(
+    `[OUTREACH_SEND] account_key=${accountKey} ` +
+    `workspace_id=${marked?.workspace_id || '-'} ` +
+    `account_id=${marked?.workspace_business_account_id || '-'} ` +
+    `campaign_id=${auto.session_id} ` +
+    `lead_chat_id=${chatId} ` +
+    `telegram_send_ok=true ` +
+    `telegram_message_id=${messageId || '-'} ` +
+    `tracking_saved=${marked ? 'true' : 'false'} ` +
+    `reach_sent_at=${now}`
+  );
+  if (!marked) {
+    await logEvent(chatId, 'outreach_tracking_failed', text, accountKey);
+    return false;
   }
   await logEvent(chatId, 'outreach_sent_detected', text, accountKey);
   await writeAuditLog({ accountKey, chatId, action: 'reach_sent', newValue: { message_id: messageId, text }, actorType: 'admin', actorId: from?.id });
@@ -3350,6 +3410,21 @@ async function startCampaignFromReachTemplate({
     paused_by: null,
     pause_reason: null
   }, accountKey);
+  console.log(
+    `[OUTREACH_SEND] account_key=${accountKey} ` +
+    `workspace_id=${lead?.workspace_id || '-'} ` +
+    `account_id=${lead?.workspace_business_account_id || '-'} ` +
+    `campaign_id=${sessionId} ` +
+    `lead_chat_id=${chatId} ` +
+    `telegram_send_ok=true ` +
+    `telegram_message_id=${messageId || '-'} ` +
+    `tracking_saved=${lead ? 'true' : 'false'} ` +
+    `reach_sent_at=${now}`
+  );
+  if (!lead) {
+    await logEvent(chatId, 'outreach_tracking_failed', text, accountKey);
+    return null;
+  }
   await logEvent(chatId, 'campaign_started_from_reach_template', JSON.stringify({
     template_key: templateKey,
     message_id: messageId || null,
@@ -3627,6 +3702,15 @@ function localNow() {
 
 function localDateKey(d = localNow()) {
   return d.toISOString().slice(0, 10);
+}
+
+function localDayWindowUtc(dateKey = localDateKey()) {
+  const [year, month, day] = String(dateKey).split('-').map(Number);
+  const startMs = Date.UTC(year, (month || 1) - 1, day || 1) - LOCAL_UTC_OFFSET_HOURS * 3600000;
+  return {
+    start: new Date(startMs).toISOString(),
+    end: new Date(startMs + 86400000).toISOString()
+  };
 }
 
 function localHHMM(d = localNow()) {
@@ -3920,18 +4004,75 @@ async function maybeStartDailyAuto(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   );
 }
 
+async function countOutreachFailedEvents(accountOrKey = DEFAULT_ACCOUNT_KEY, window = localDayWindowUtc()) {
+  let q = supabase.from('lead_events')
+    .select('*', { count: 'exact', head: true })
+    .in('event_type', ['manual_reach_send_failed', 'manual_reach_mark_failed', 'outreach_tracking_failed'])
+    .gte('created_at', window.start)
+    .lt('created_at', window.end);
+  q = accountLeadFilter(q, accountOrKey);
+  const { count, error } = await q;
+  if (error) {
+    console.error('countOutreachFailedEvents:', error.message);
+    return 0;
+  }
+  return count || 0;
+}
+
+async function getOutreachMonitorState(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const ak = accountKey(accountOrKey);
+  const { tenant } = await resolveReachContext(ak);
+  const window = localDayWindowUtc(localDateKey());
+  let sentQ = supabase.from('business_leads')
+    .select('*', { count: 'exact', head: true })
+    .eq('reach_sent', true)
+    .eq('outreach_sent', true)
+    .not('reach_message_id', 'is', null)
+    .gte('reach_sent_at', window.start)
+    .lt('reach_sent_at', window.end);
+  sentQ = applyReachScope(sentQ, ak, tenant);
+  const { count: sentCount, error: sentError } = await sentQ;
+  if (sentError) console.error('getOutreachMonitorState sent:', sentError.message);
+  const failedCount = await countOutreachFailedEvents(ak, window);
+  const sentEventsCount = sentError ? 0 : (sentCount || 0);
+  const alertRequired = sentEventsCount === 0;
+  return {
+    account_key: ak,
+    workspace_id: tenant?.workspace_id || null,
+    window_start: window.start,
+    window_end: window.end,
+    sent_events_count: sentEventsCount,
+    failed_events_count: failedCount,
+    alert_required: alertRequired,
+    reason: sentEventsCount > 0 ? 'sent_event_found' : (failedCount > 0 ? 'failed_event_without_sent_event' : 'no_sent_event')
+  };
+}
+
 async function maybeWarnNoOutreach(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   const ak = accountKey(accountOrKey);
   const auto = await getAutoOutreach(ak);
   if (!isAutoActive(auto) || auto.no_outreach_warn_sent) return;
   const startedAt = Number(auto.started_at || 0);
   if (!startedAt || Date.now() - startedAt < DAILY_NO_OUTREACH_WARN_MIN * 60000) return;
-  const count = await countLeads(q => q.eq('outreach_session_id', auto.session_id), ak);
-  if (count > 0) return;
+  const monitor = await getOutreachMonitorState(ak);
+  console.log(
+    `[OUTREACH_MONITOR] account_key=${ak} ` +
+    `workspace_id=${monitor.workspace_id || '-'} ` +
+    `timezone=${PLATFORM_DEFAULT_TIMEZONE || 'Asia/Tashkent'} ` +
+    `window_start=${monitor.window_start} ` +
+    `window_end=${monitor.window_end} ` +
+    `sent_events_count=${monitor.sent_events_count} ` +
+    `failed_events_count=${monitor.failed_events_count} ` +
+    `alert_required=${monitor.alert_required ? 'true' : 'false'} ` +
+    `reason=${monitor.reason}`
+  );
+  if (!monitor.alert_required) return;
+  const failedText = monitor.failed_events_count > 0
+    ? `Bugun ${monitor.failed_events_count} ta outreach yuborish/tracking xatosi ko‘rindi. Render loglarini tekshiring.`
+    : `${DAILY_NO_OUTREACH_WARN_MIN} daqiqa bo‘ldi, lekin bugungi birinchi outreach tracking yozuvi topilmadi. Telegram scheduled xabarlar yoki /reach_start holatini tekshiring.`;
   await sendAdmin(
-    `⚠️ <b>Outreach aniqlanmadi</b>\n\n` +
-    `${DAILY_NO_OUTREACH_WARN_MIN} daqiqa bo‘ldi, lekin bugungi outreach xabarlari ko‘rinmadi. ` +
-    `Telegram scheduled xabarlar yuborilganini tekshiring.`,
+    `⚠️ <b>${monitor.failed_events_count > 0 ? 'Outreach xatosi' : 'Outreach aniqlanmadi'}</b>\n\n` +
+    failedText,
     {},
     ak
   );
@@ -4952,17 +5093,60 @@ async function getReachStartTemplate(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   return normalizeAccountKey(accountKey(accountOrKey)) === DEFAULT_ACCOUNT_KEY ? DEFAULT_REACH_START_TEXT : null;
 }
 
-async function getReachCandidates(accountOrKey = DEFAULT_ACCOUNT_KEY, limit = 30) {
+function leadChatId(lead = {}) {
+  return String(lead.chat_id || lead.lead_chat_id || '').trim();
+}
+
+async function resolveReachContext(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const account = await getAccount(accountOrKey);
+  const tenant = await resolveTenantContext({
+    accountKey: account.account_key,
+    businessConnectionId: account.business_connection_id
+  });
+  return { account, tenant };
+}
+
+function applyReachScope(q, accountOrKey = DEFAULT_ACCOUNT_KEY, tenant = null) {
+  const parts = accountScopeOr(accountOrKey).split(',').filter(Boolean);
+  if (tenant?.workspace_id) parts.push(`workspace_id.eq.${tenant.workspace_id}`);
+  if (tenant?.account_id) parts.push(`workspace_business_account_id.eq.${tenant.account_id}`);
+  return q.or([...new Set(parts)].join(','));
+}
+
+function applyReachEligibility(q) {
+  return q
+    .or('chat_id.not.is.null,lead_chat_id.not.is.null')
+    .not('business_connection_id', 'is', null)
+    .or('reach_sent.is.null,reach_sent.eq.false')
+    .or('outreach_sent.is.null,outreach_sent.eq.false');
+}
+
+async function countReachRows(accountOrKey = DEFAULT_ACCOUNT_KEY, tenant = null, apply = null) {
+  let q = supabase.from('business_leads').select('*', { count: 'exact', head: true });
+  q = applyReachScope(q, accountOrKey, tenant);
+  if (apply) q = apply(q);
+  const { count, error } = await q;
+  if (error) {
+    console.error('countReachRows:', error.message);
+    return 0;
+  }
+  return count || 0;
+}
+
+async function getReachCandidates(accountOrKey = DEFAULT_ACCOUNT_KEY, limit = 30, tenant = null) {
   if (TEST_MODE && !TEST_LEAD_IDS.size) return [];
-  return getLeads(q => {
-    let next = q
-      .not('chat_id', 'is', null)
-      .not('business_connection_id', 'is', null)
-      .or('reach_sent.is.null,reach_sent.eq.false')
-      .or('outreach_sent.is.null,outreach_sent.eq.false');
-    if (TEST_MODE && TEST_LEAD_IDS.size) next = next.in('chat_id', [...TEST_LEAD_IDS]);
-    return next;
-  }, limit, accountOrKey);
+  let q = supabase.from('business_leads').select('*').order('updated_at', { ascending: false }).limit(limit);
+  q = applyReachScope(q, accountOrKey, tenant);
+  q = applyReachEligibility(q);
+  if (TEST_MODE && TEST_LEAD_IDS.size) {
+    q = q.or(`chat_id.in.(${[...TEST_LEAD_IDS].join(',')}),lead_chat_id.in.(${[...TEST_LEAD_IDS].join(',')})`);
+  }
+  const { data, error } = await q;
+  if (error) {
+    console.error('getReachCandidates:', error.message);
+    return [];
+  }
+  return data || [];
 }
 
 function testModeReachNotice() {
@@ -4971,6 +5155,121 @@ function testModeReachNotice() {
     return '\n\n⚠️ TEST_MODE=true va TEST_LEAD_IDS bo‘sh. Shu sabab reach real yangi lidlarga yuborilmaydi. Production uchun TEST_MODE=false qiling yoki test lid IDlarini TEST_LEAD_IDS ga kiriting.';
   }
   return `\n\n⚠️ TEST_MODE=true. Reach faqat TEST_LEAD_IDS ichidagi ${TEST_LEAD_IDS.size} ta lidga yuboriladi.`;
+}
+
+function reachBlockReason(summary = {}) {
+  if (!summary.bot_enabled) return 'account_bot_off';
+  if (!summary.reach_enabled) return 'reach_off';
+  if (!summary.subscription_allowed) return summary.subscription_reason || 'subscription_blocked';
+  if (!summary.business_connected) return 'business_account_disconnected';
+  if (summary.test_mode && !TEST_LEAD_IDS.size) return 'test_mode_blocked';
+  if (!summary.template_found) return 'no_active_reach_template';
+  if (!summary.eligible_leads_count) return 'no_eligible_leads';
+  return 'ok';
+}
+
+async function buildReachDebugSummary(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const { account, tenant } = await resolveReachContext(accountOrKey);
+  const subscription = await canWorkspaceAutomate({
+    accountOrKey: account,
+    businessConnectionId: account.business_connection_id || tenant?.workspaceAccount?.business_connection_id || '',
+    action: 'reach_debug'
+  });
+  const templates = await getActiveReachTemplates(account.account_key);
+  const eligible = await getReachCandidates(account.account_key, 50, subscription.context || tenant);
+  const legacyInternal = await isInternalLegacyBusinessAccount(account);
+  const alreadyReached = await countReachRows(account.account_key, subscription.context || tenant, q => q.or('reach_sent.eq.true,outreach_sent.eq.true'));
+  const scopedWithBusinessConnection = await countReachRows(account.account_key, subscription.context || tenant, q => q.not('business_connection_id', 'is', null));
+  let totalForBusinessConnection = scopedWithBusinessConnection;
+  const businessConnectionId = account.business_connection_id || tenant?.workspaceAccount?.business_connection_id || '';
+  if (businessConnectionId) {
+    const { count, error } = await supabase.from('business_leads')
+      .select('*', { count: 'exact', head: true })
+      .eq('business_connection_id', String(businessConnectionId));
+    if (!error) totalForBusinessConnection = count || 0;
+    else console.error('buildReachDebugSummary business_connection count:', error.message);
+  }
+  const summary = {
+    account_key: account.account_key,
+    workspace_id: subscription.context?.workspace_id || tenant?.workspace_id || null,
+    workspace_business_account_id: subscription.context?.account_id || tenant?.account_id || null,
+    is_platform_internal: subscriptionIsInternal(subscription.context || tenant) || legacyInternal,
+    subscription_status: subscription.context?.subscription?.status || tenant?.subscription?.status || (SUBSCRIPTION_ENFORCEMENT_ENABLED ? 'pending' : 'not_enforced'),
+    subscription_allowed: subscription.ok,
+    subscription_reason: subscription.reason,
+    bot_enabled: canAccountAutoReply(account),
+    reach_enabled: account.reach_enabled !== false,
+    business_status: subscription.context?.workspaceAccount?.status || tenant?.workspaceAccount?.status || (businessConnectionId ? 'connected_legacy' : 'missing'),
+    business_connected: Boolean(
+      businessConnectionId ||
+      subscription.context?.workspaceAccount?.status === 'connected' ||
+      tenant?.workspaceAccount?.status === 'connected' ||
+      subscriptionIsInternal(subscription.context || tenant) ||
+      legacyInternal
+    ),
+    eligible_leads_count: eligible.length,
+    already_reached_count: alreadyReached,
+    missing_scope_count: Math.max(0, totalForBusinessConnection - scopedWithBusinessConnection),
+    test_mode: TEST_MODE,
+    saas_test_user_ids: SAAS_TEST_USER_IDS.size,
+    template_found: templates.length > 0,
+    template_source: templates[0]?.source || '-',
+    can_send_reach: false,
+    block_reason: 'unknown'
+  };
+  summary.block_reason = reachBlockReason(summary);
+  summary.can_send_reach = summary.block_reason === 'ok';
+  return { summary, account, tenant: subscription.context || tenant, templates, eligible };
+}
+
+function logReachPreview(summary = {}) {
+  console.log(
+    `[REACH_PREVIEW] account_key=${summary.account_key || '-'} ` +
+    `workspace_id=${summary.workspace_id || '-'} ` +
+    `account_id=${summary.workspace_business_account_id || '-'} ` +
+    `bot_enabled=${summary.bot_enabled ? 'true' : 'false'} ` +
+    `reach_enabled=${summary.reach_enabled ? 'true' : 'false'} ` +
+    `subscription_allowed=${summary.subscription_allowed ? 'true' : 'false'} ` +
+    `business_connected=${summary.business_connected ? 'true' : 'false'} ` +
+    `eligible_leads=${summary.eligible_leads_count || 0} ` +
+    `blocked_by=${summary.block_reason || '-'}`
+  );
+}
+
+function reachDebugText(summary = {}) {
+  return [
+    'reach_debug',
+    '',
+    `account_key: ${summary.account_key || '-'}`,
+    `workspace_id: ${summary.workspace_id || '-'}`,
+    `workspace_business_account_id: ${summary.workspace_business_account_id || '-'}`,
+    `is_platform_internal: ${summary.is_platform_internal ? 'true' : 'false'}`,
+    `subscription_status: ${summary.subscription_status || '-'}`,
+    `bot_enabled: ${summary.bot_enabled ? 'true' : 'false'}`,
+    `reach_enabled: ${summary.reach_enabled ? 'true' : 'false'}`,
+    `business_status: ${summary.business_status || '-'}`,
+    `eligible_leads_count: ${summary.eligible_leads_count || 0}`,
+    `already_reached_count: ${summary.already_reached_count || 0}`,
+    `missing_scope_count: ${summary.missing_scope_count || 0}`,
+    `test_mode: ${summary.test_mode ? 'true' : 'false'}`,
+    `saas_test_user_ids: ${summary.saas_test_user_ids || 0}`,
+    `template_found: ${summary.template_found ? 'true' : 'false'}`,
+    `template_source: ${summary.template_source || '-'}`,
+    `can_send_reach: ${summary.can_send_reach ? 'true' : 'false'}`,
+    `block_reason: ${summary.block_reason || '-'}`
+  ].join('\n');
+}
+
+async function sendReachDebug(chatId, telegramUserId, selectedAccountKey = DEFAULT_ACCOUNT_KEY) {
+  const allowedAccountKey = await getCommandManagementAccountKey(chatId, telegramUserId, selectedAccountKey);
+  if (!allowedAccountKey) {
+    return isAllowedAdminId(telegramUserId)
+      ? tg('sendMessage', { chat_id: chatId, text: ACCOUNT_NOT_SELECTED_TEXT })
+      : commandManagementDenied(chatId);
+  }
+  const { summary } = await buildReachDebugSummary(allowedAccountKey);
+  logReachPreview(summary);
+  return tg('sendMessage', { chat_id: chatId, text: reachDebugText(summary) });
 }
 
 async function sendAccountDebug(chatId, telegramUserId, selectedAccountKey = DEFAULT_ACCOUNT_KEY) {
@@ -5051,7 +5350,8 @@ async function sendReachStartPreview(chatId, telegramUserId, selectedAccountKey 
       ? tg('sendMessage', { chat_id: chatId, text: ACCOUNT_NOT_SELECTED_TEXT })
       : commandManagementDenied(chatId);
   }
-  let account = await getAccount(allowedAccountKey);
+  const { summary, account, tenant, eligible } = await buildReachDebugSummary(allowedAccountKey);
+  logReachPreview(summary);
   if (!canAccountAutoReply(account)) {
     return tg('sendMessage', {
       chat_id: chatId,
@@ -5064,17 +5364,26 @@ async function sendReachStartPreview(chatId, telegramUserId, selectedAccountKey 
     });
   }
   if (account.reach_enabled === false) {
-    account = await setAccountReachEnabled(allowedAccountKey, true, telegramUserId);
+    return tg('sendMessage', {
+      chat_id: chatId,
+      text:
+        `Akkaunt: ${account.label || account.account_key}\n` +
+        `Bot holati: ON\n` +
+        `Reach holati: OFF\n\n` +
+        `Reach o‘chirilgan. Avval /reachyoq ${allowedAccountKey} bilan yoqing.`,
+      reply_markup: { inline_keyboard: [[{ text: '▶️ Reachni yoqish', callback_data: `account_reach:${allowedAccountKey}:on` }], [{ text: '❌ Bekor qilish', callback_data: 'reach_start_cancel' }]] }
+    });
   }
   const reachText = await getReachStartTemplate(allowedAccountKey);
   if (!reachText) return tg('sendMessage', { chat_id: chatId, text: 'Faol reach shabloni topilmadi. Avval reach_greeting, outreach_start yoki application_confirmation shablonini sozlang.' });
-  const candidates = await getReachCandidates(allowedAccountKey, 50);
   await setAdminSession(chatId, 'reach_start_confirm', {
     telegram_user_id: String(telegramUserId || chatId),
     selected_account_key: allowedAccountKey,
     account_key: allowedAccountKey,
     reach_text: reachText,
-    candidate_count: candidates.length
+    candidate_count: eligible.length,
+    workspace_id: tenant?.workspace_id || null,
+    workspace_business_account_id: tenant?.account_id || null
   });
   return tg('sendMessage', {
     chat_id: chatId,
@@ -5082,7 +5391,8 @@ async function sendReachStartPreview(chatId, telegramUserId, selectedAccountKey 
       `Akkaunt: ${account.label || account.account_key}\n` +
       `Bot holati: ${canAccountAutoReply(account) ? 'ON' : 'OFF'}\n` +
       `Reach holati: ${account.reach_enabled === false ? 'OFF' : 'ON'}\n` +
-      `Yangi lidlar soni: ${candidates.length}\n\n` +
+      `Yangi lidlar soni: ${eligible.length}\n` +
+      `Block reason: ${summary.block_reason}\n\n` +
       `Reach matni:\n${short(reachText, 1200)}` +
       testModeReachNotice(),
     reply_markup: {
@@ -5099,30 +5409,34 @@ async function executeReachStart(chatId, telegramUserId) {
   const payload = session?.payload || {};
   const allowedAccountKey = await getCommandManagementAccountKey(chatId, telegramUserId, payload.selected_account_key || payload.account_key);
   if (!allowedAccountKey) return commandManagementDenied(chatId);
-  let account = await getAccount(allowedAccountKey);
+  const { summary, account, tenant, eligible } = await buildReachDebugSummary(allowedAccountKey);
+  logReachPreview(summary);
   if (!canAccountAutoReply(account)) {
     return tg('sendMessage', { chat_id: chatId, text: 'Bot o‘chirilgan. Avval yoqing.' });
   }
-  if (account.reach_enabled === false) account = await setAccountReachEnabled(allowedAccountKey, true, telegramUserId);
+  if (account.reach_enabled === false) {
+    return tg('sendMessage', { chat_id: chatId, text: `Reach o‘chirilgan. Avval /reachyoq ${allowedAccountKey} bilan yoqing.` });
+  }
   const reachText = payload.reach_text || await getReachStartTemplate(allowedAccountKey);
   if (!reachText) return tg('sendMessage', { chat_id: chatId, text: 'Faol reach shabloni topilmadi.' });
-  const candidates = await getReachCandidates(allowedAccountKey, 50);
+  const candidates = eligible;
   let sent = 0;
   let failed = 0;
   let skipped = 0;
   for (const lead of candidates) {
+    const targetChatId = leadChatId(lead);
     if (lead.reach_sent || lead.outreach_sent) {
       skipped += 1;
       continue;
     }
-    if (!lead.business_connection_id) {
+    if (!targetChatId || !lead.business_connection_id) {
       skipped += 1;
-      await logIgnore(lead.chat_id, 'reach_skipped_no_business_connection', 'manual_reach_start', allowedAccountKey);
+      await logIgnore(targetChatId || 'unknown', 'reach_skipped_no_business_connection', 'manual_reach_start', allowedAccountKey);
       continue;
     }
-    if (!isTestLeadAllowed(lead.chat_id)) {
+    if (!isTestLeadAllowed(targetChatId)) {
       skipped += 1;
-      await logIgnore(lead.chat_id, 'test_mode_blocked', 'manual_reach_start', allowedAccountKey);
+      await logIgnore(targetChatId, 'test_mode_blocked', 'manual_reach_start', allowedAccountKey);
       continue;
     }
     const subscriptionAccess = await canWorkspaceAutomate({
@@ -5132,17 +5446,23 @@ async function executeReachStart(chatId, telegramUserId) {
     });
     if (!subscriptionAccess.ok) {
       skipped += 1;
-      await logIgnore(lead.chat_id, subscriptionAccess.reason, 'manual_reach_start', allowedAccountKey);
+      await logIgnore(targetChatId, subscriptionAccess.reason, 'manual_reach_start', allowedAccountKey);
       continue;
     }
     try {
       const result = await tg('sendMessage', {
-        chat_id: lead.chat_id,
+        chat_id: targetChatId,
         business_connection_id: lead.business_connection_id,
         text: reachText
       });
-      await updateLead(lead.chat_id, {
+      const reachSentAt = new Date().toISOString();
+      const campaignId = `manual_reach_${localDateKey()}`;
+      const patch = {
         account_key: allowedAccountKey,
+        chat_id: targetChatId,
+        lead_chat_id: targetChatId,
+        workspace_id: tenant?.workspace_id || lead.workspace_id || null,
+        workspace_business_account_id: tenant?.account_id || lead.workspace_business_account_id || null,
         stage: STAGE.OUTREACH_SENT,
         current_stage: STAGE.OUTREACH_SENT,
         status: 'active',
@@ -5150,7 +5470,7 @@ async function executeReachStart(chatId, telegramUserId) {
         bot_enabled_for_lead: true,
         manual_only: false,
         campaign_active: true,
-        campaign_started_at: new Date().toISOString(),
+        campaign_started_at: reachSentAt,
         campaign_started_by: telegramUserId ? String(telegramUserId) : 'reach_start',
         campaign_trigger_message_id: result?.message_id ? String(result.message_id) : null,
         campaign_trigger_text: reachText,
@@ -5162,21 +5482,50 @@ async function executeReachStart(chatId, telegramUserId) {
         assigned_by_reach: true,
         assigned_by_admin: false,
         manually_started: false,
-        reach_sent_at: new Date().toISOString(),
-        outreach_at: new Date().toISOString(),
+        reach_sent_at: reachSentAt,
+        outreach_at: reachSentAt,
         reach_message_text: reachText,
         outreach_message: reachText,
         reach_message_id: result?.message_id ? String(result.message_id) : null,
-        reach_batch_id: `manual_reach_${localDateKey()}`,
+        reach_batch_id: campaignId,
         last_admin_message: reachText,
         admin_active_until: null
-      }, allowedAccountKey);
-      await writeAuditLog({ accountKey: allowedAccountKey, chatId: lead.chat_id, action: 'reach_sent', newValue: { manual: true, message_id: result?.message_id || null }, actorType: 'admin', actorId: telegramUserId });
-      sent += 1;
+      };
+      const marked = await updateLead(targetChatId, patch, allowedAccountKey);
+      console.log(
+        `[OUTREACH_SEND] account_key=${allowedAccountKey} ` +
+        `workspace_id=${tenant?.workspace_id || '-'} ` +
+        `account_id=${tenant?.account_id || '-'} ` +
+        `campaign_id=${campaignId} ` +
+        `lead_chat_id=${targetChatId} ` +
+        `telegram_send_ok=true ` +
+        `telegram_message_id=${result?.message_id || '-'} ` +
+        `tracking_saved=${marked ? 'true' : 'false'} ` +
+        `reach_sent_at=${reachSentAt}`
+      );
+      if (marked) {
+        await writeAuditLog({ accountKey: allowedAccountKey, chatId: targetChatId, action: 'reach_sent', newValue: { manual: true, message_id: result?.message_id || null }, actorType: 'admin', actorId: telegramUserId });
+        sent += 1;
+      } else {
+        failed += 1;
+        await logEvent(targetChatId, 'manual_reach_mark_failed', 'Telegram OK, DB mark failed', allowedAccountKey);
+      }
       await sleep(350);
     } catch (err) {
       failed += 1;
-      await logEvent(lead.chat_id, 'manual_reach_send_failed', err.message || String(err), allowedAccountKey);
+      console.log(
+        `[OUTREACH_SEND] account_key=${allowedAccountKey} ` +
+        `workspace_id=${tenant?.workspace_id || '-'} ` +
+        `account_id=${tenant?.account_id || '-'} ` +
+        `campaign_id=manual_reach_${localDateKey()} ` +
+        `lead_chat_id=${targetChatId} ` +
+        `telegram_send_ok=false ` +
+        `telegram_message_id=- ` +
+        `tracking_saved=false ` +
+        `reach_sent_at=- ` +
+        `error=${String(err.message || err).replace(/\s+/g, '_').slice(0, 180)}`
+      );
+      await logEvent(targetChatId, 'manual_reach_send_failed', err.message || String(err), allowedAccountKey);
     }
   }
   await setSelectedAccountKey(chatId, allowedAccountKey, telegramUserId);
@@ -7682,6 +8031,11 @@ async function handleAdminMessage(msg) {
     const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey, 1, ownedAccountKeys);
     if (parsed.denied) return commandManagementDenied(chatId);
     return sendReachStartPreview(chatId, from.id, parsed.accountKey);
+  }
+  if (text === '/reach_debug' || text.startsWith('/reach_debug ')) {
+    const parsed = await parseOptionalAccountArg(text.split(/\s+/), selectedAccountKey, 1, ownedAccountKeys);
+    if (parsed.denied) return commandManagementDenied(chatId);
+    return sendReachDebug(chatId, from.id, parsed.accountKey);
   }
 
   if (!ownedAccountKeys.size && !['/start', '/menu', '/accounts', '/whoami', '/cancel'].includes(text)) {
