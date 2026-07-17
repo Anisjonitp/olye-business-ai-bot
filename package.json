@@ -8,7 +8,9 @@
     "start": "node index.js",
     "check": "node --check index.js",
     "check:phase1": "node scripts/phase1-regression-check.mjs",
-    "check:phase2": "node scripts/phase2-regression-check.mjs"
+    "check:phase2": "node scripts/phase2-regression-check.mjs",
+    "check:phase3": "node scripts/phase3-regression-check.mjs",
+    "check:final": "node scripts/final-platform-regression-check.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.4",

@@ -70,7 +70,7 @@ const COMMAND_MANAGEMENT_ACCOUNT_KEYS = new Set([
 ].filter(Boolean));
 const COMMAND_MANAGEMENT_DENIED_TEXT = 'Bu bo‘limdan foydalanish uchun sizda ruxsat yo‘q.';
 const ACCOUNT_NOT_SELECTED_TEXT = 'Akkaunt tanlanmagan. /menu orqali profilni tanlang.';
-const TEST_MODE = String(process.env.TEST_MODE || 'true') === 'true';
+const TEST_MODE = String(process.env.TEST_MODE || 'false') === 'true';
 const TEST_ADMIN_IDS = envIdSet(process.env.TEST_ADMIN_IDS || '');
 const TEST_LEAD_IDS = envIdSet(process.env.TEST_LEAD_IDS || '');
 const TEST_ALLOW_ADMIN_STARTED_LEADS = String(process.env.TEST_ALLOW_ADMIN_STARTED_LEADS || 'false') === 'true';
@@ -4965,6 +4965,14 @@ async function getReachCandidates(accountOrKey = DEFAULT_ACCOUNT_KEY, limit = 30
   }, limit, accountOrKey);
 }
 
+function testModeReachNotice() {
+  if (!TEST_MODE) return '';
+  if (!TEST_LEAD_IDS.size) {
+    return '\n\n⚠️ TEST_MODE=true va TEST_LEAD_IDS bo‘sh. Shu sabab reach real yangi lidlarga yuborilmaydi. Production uchun TEST_MODE=false qiling yoki test lid IDlarini TEST_LEAD_IDS ga kiriting.';
+  }
+  return `\n\n⚠️ TEST_MODE=true. Reach faqat TEST_LEAD_IDS ichidagi ${TEST_LEAD_IDS.size} ta lidga yuboriladi.`;
+}
+
 async function sendAccountDebug(chatId, telegramUserId, selectedAccountKey = DEFAULT_ACCOUNT_KEY) {
   const session = await getAdminSession(chatId);
   const sessionSelected = session?.payload?.selected_account_key || session?.account_key || selectedAccountKey;
@@ -5075,7 +5083,8 @@ async function sendReachStartPreview(chatId, telegramUserId, selectedAccountKey 
       `Bot holati: ${canAccountAutoReply(account) ? 'ON' : 'OFF'}\n` +
       `Reach holati: ${account.reach_enabled === false ? 'OFF' : 'ON'}\n` +
       `Yangi lidlar soni: ${candidates.length}\n\n` +
-      `Reach matni:\n${short(reachText, 1200)}`,
+      `Reach matni:\n${short(reachText, 1200)}` +
+      testModeReachNotice(),
     reply_markup: {
       inline_keyboard: [
         [{ text: '✅ Reachni boshlash', callback_data: 'reach_start_confirm' }],
@@ -5178,7 +5187,8 @@ async function executeReachStart(chatId, telegramUserId) {
       `Akkaunt: ${account.label || account.account_key}\n` +
       `Yuborildi: ${sent}\n` +
       `O‘tkazib yuborildi: ${skipped}\n` +
-      `Xato: ${failed}`
+      `Xato: ${failed}` +
+      testModeReachNotice()
   });
 }
 

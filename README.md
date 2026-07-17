@@ -25,7 +25,7 @@ Bu versiya ataylab sodda qilingan: bot faqat yangi outreach lidga ma’lumot ber
 - Dialog arxiv: Telegram Business bot ruxsat olgan chatlarda xabar metadata, media metadata, tahrir va o‘chirish hodisalarini saqlaydi.
 - `supabase.sql` eski tahrirlangan shablonlarni overwrite qilmaydi (`on conflict do nothing`).
 - `/resetme`: faqat test qilayotgan shu chat/profil holatini tozalaydi, eski funksiyalarni olib tashlamaydi.
-- Test mode default xavfsiz: `TEST_MODE=true` bo‘lsa avtomatik javob faqat `TEST_LEAD_IDS` ichidagi lidlarga ketadi.
+- Test mode production’da default o‘chiq: `TEST_MODE=false`. Sinovda `TEST_MODE=true` bo‘lsa avtomatik javob faqat `TEST_LEAD_IDS` ichidagi lidlarga ketadi.
 - Har akkauntda Bot ON/OFF va Reach ON/OFF alohida boshqariladi.
 
 ## Render sozlamalari
@@ -79,17 +79,46 @@ Admin Botda `/subscriptions`, `/trials`, `/pros`, `/expired` va `/subscription A
 
 Public botdagi `💎 Tarif` tugmasi workspace planini, statusini, trial/PRO tugash vaqtini va qolgan muddatni ko‘rsatadi. Scheduler trial tugashiga 24 soat, 6 soat qolganda va trial tugaganda notificationni faqat bir marta yuboradi.
 
+### PHASE 3: yangi user onboarding va Business ulanishi
+
+Supabase SQL Editor’da `migrations/20260716_phase3_onboarding.sql` migrationini bir marta Run qiling. Bu migration faqat yangi workspace’lar uchun default template pack va info-only flow pack saqlaydi. UZLYE hamda `second`/Liderlar uchun mavjud shablonlar, flow, account key va subscription yozuvlariga tegmaydi.
+
+Yangi onboarding avval o‘chiq holatda deploy qilinadi:
+
+```text
+SAAS_PLATFORM_ENABLED=true
+NEW_USER_ONBOARDING_ENABLED=false
+NEW_WORKSPACE_TEMPLATE_PACK=info_only_v1
+NEW_WORKSPACE_FLOW_PACK=info_only_v1
+TRIAL_DAYS=3
+```
+
+`NEW_USER_ONBOARDING_ENABLED=true` qilinganda yangi foydalanuvchi `/start` yoki `/onboarding` orqali ulanish holatini ko‘radi. Telegram Business ulanishi muvaffaqiyatli kelganda bot yangi scoped workspace/account yaratadi, default packlarni faqat shu yangi account’ga nusxalaydi va `start_workspace_trial` orqali aynan o‘sha paytda 3 kunlik trialni boshlaydi. Bir xil `business_connection_id` ikkinchi workspace’ga ulanmaydi; avvalgi trial grantlari owner yoki connection bo‘yicha qayta ishlatilmaydi. Trial berilmasa workspace `pending` holatida qoladi va avtomatlashtirish ishga tushmaydi.
+
+### Yakuniy platforma rollout
+
+Yangi production o‘rnatish uchun `migrations/20260716_final_platform.sql` faylini Supabase SQL Editor’da bir marta Run qiling. U avvalgi workspace, subscription va onboarding qatlamlari bilan idempotent ishlaydi; mavjud internal workspace, template matni, legacy flow yoki lid yozuvini almashtirmaydi.
+
+Qo‘shimcha platforma flaglari:
+
+```text
+CRM_PRO_FEATURES_ENABLED=false
+ARCHIVE_ENABLED=true
+```
+
+Flaglar yoqilgach user bot universal workspace menyusini ko‘rsatadi: bot holati, reach, shablonlar, ketma-ketlik, follow-up, lidlar, arxiv, operatorlar, Business ulanishi, tarif va yordam. Workspace chegarasi `workspace_id + workspace_business_account_id` orqali saqlanadi; internal accountlar muddatsiz PRO istisnosida qoladi.
+
 Muhim test-mode sozlamalari:
 
 ```text
-TEST_MODE=true
+TEST_MODE=false
 TEST_ADMIN_IDS=8254451152,8304283149
 TEST_LEAD_IDS=comma,separated,lead_chat_ids
 TEST_ALLOW_ADMIN_STARTED_LEADS=false
 ADMIN_TAKEOVER_MINUTES=10
 ```
 
-`TEST_LEAD_IDS` bo‘sh bo‘lsa va `TEST_MODE=true` bo‘lsa, mijozlarga avtomatik javob yuborilmaydi. Admin menyusi mavjud account ownership orqali ishlaydi; `TEST_ADMIN_IDS` to‘ldirilsa, admin menyu ham shu ro‘yxat bilan cheklanadi.
+Production’da yangi lidlarga reach yuborilishi uchun `TEST_MODE=false` bo‘lishi kerak. `TEST_LEAD_IDS` bo‘sh bo‘lsa va `TEST_MODE=true` bo‘lsa, mijozlarga avtomatik javob yuborilmaydi. Admin menyusi mavjud account ownership orqali ishlaydi; `TEST_ADMIN_IDS` to‘ldirilsa, admin menyu ham shu ro‘yxat bilan cheklanadi.
 
 `TEST_ALLOW_ADMIN_STARTED_LEADS=true` bo‘lsa, test rejimida ham faqat ruxsatli admin Telegram Business orqali qo‘lda boshlagan leadlar `TEST_LEAD_IDS` ro‘yxatisiz javob olishi mumkin. `reach_enabled` faqat birinchi outreach yuborishni boshqaradi; admin allaqachon qo‘lda yozgan leadning javobini bloklamaydi. `bot_enabled` va lead darajasidagi pause/manual-only flaglari baribir ustun turadi.
 
