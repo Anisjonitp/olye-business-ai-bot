@@ -43,6 +43,8 @@ const DAILY_NO_OUTREACH_WARN_MIN = Number(process.env.DAILY_NO_OUTREACH_WARN_MIN
 const OUTREACH_MONITOR_ENABLED = String(process.env.OUTREACH_MONITOR_ENABLED || 'false') === 'true';
 const REMINDER_AFTER_MS = Number(process.env.REMINDER_AFTER_MS || 3600000);
 const SCHEDULER_TICK_MS = Number(process.env.SCHEDULER_TICK_MS || 60000);
+const TELEGRAM_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.TELEGRAM_REQUEST_TIMEOUT_MS || 15000));
+const TELEGRAM_SEND_MAX_RETRIES = Math.max(0, Math.min(2, Number(process.env.TELEGRAM_SEND_MAX_RETRIES || 1)));
 const MEDIA_ARCHIVE_ENABLED = String(process.env.MEDIA_ARCHIVE_ENABLED || 'true') === 'true';
 const MEDIA_ARCHIVE_DOWNLOAD = String(process.env.MEDIA_ARCHIVE_DOWNLOAD || 'false') === 'true';
 const MEDIA_ARCHIVE_MAX_BYTES = Number(process.env.MEDIA_ARCHIVE_MAX_BYTES || 20000000);
@@ -138,6 +140,19 @@ const IGNORE_REASONS = [
 ];
 const buffers = new Map();
 let schedulerBusy = false;
+const runtimeStatus = {
+  updates_received: 0,
+  updates_processed: 0,
+  updates_failed: 0,
+  last_update_at: null,
+  last_update_type: null,
+  last_update_trace_id: null,
+  last_error_at: null,
+  last_error: null,
+  scheduler_last_started_at: null,
+  scheduler_last_finished_at: null,
+  scheduler_last_error: null
+};
 
 function envIdSet(value = '') {
   return new Set(String(value || '').split(',').map(id => id.trim()).filter(Boolean));
@@ -721,7 +736,9 @@ function notificationEventTypeFromText(text = '') {
 // -------------------- Telegram helpers --------------------
 async function tg(method, payload = {}, botToken = BOT_TOKEN) {
   const base = botToken ? `https://api.telegram.org/bot${botToken}` : TG_API;
-  if (method?.startsWith('send')) {
+  const isSend = method?.startsWith('send');
+  const maxAttempts = isSend ? TELEGRAM_SEND_MAX_RETRIES + 1 : 1;
+  if (isSend) {
     console.log(
       `[TELEGRAM_SEND_ATTEMPT] method=${method} ` +
       `chat_id=${payload.chat_id || '-'} ` +
@@ -729,34 +746,55 @@ async function tg(method, payload = {}, botToken = BOT_TOKEN) {
       `template_key=${payload.template_key || '-'}`
     );
   }
-  const res = await fetch(`${base}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  const data = await res.json().catch(() => null);
-  if (!res.ok || !data?.ok) {
-    if (method?.startsWith('send')) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), TELEGRAM_REQUEST_TIMEOUT_MS);
+    let res;
+    let data;
+    let requestError = null;
+    try {
+      res = await fetch(`${base}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      data = await res.json().catch(() => null);
+    } catch (err) {
+      requestError = err;
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!requestError && res.ok && data?.ok) {
+      if (isSend) {
+        console.log(
+          `[TELEGRAM_SEND_RESULT] ok=true message_id=${data.result?.message_id || '-'} ` +
+          `attempt=${attempt} error_code=- description=-`
+        );
+      }
+      return data.result;
+    }
+    const errorCode = data?.error_code || res?.status || (requestError?.name === 'AbortError' ? 'timeout' : '-');
+    const description = String(data?.description || requestError?.message || res?.statusText || '').replace(/\s+/g, '_').slice(0, 300);
+    const retryAfter = Number(data?.parameters?.retry_after || 0);
+    const retryable = isSend && (requestError || errorCode === 429 || Number(errorCode) >= 500);
+    if (isSend) {
       console.log(
         `[TELEGRAM_SEND_RESULT] ok=false ` +
         `message_id=- ` +
-        `error_code=${data?.error_code || res.status || '-'} ` +
-        `description=${String(data?.description || res.statusText || '').replace(/\s+/g, '_').slice(0, 300)}`
+        `attempt=${attempt} error_code=${errorCode} description=${description} retry_after=${retryAfter || '-'}`
       );
     }
-    console.error('Telegram API error:', method, data);
-    const err = new Error(data?.description || `Telegram API error: ${method}`);
-    err.telegram = data || { ok: false, error_code: res.status, description: res.statusText };
+    if (retryable && attempt < maxAttempts) {
+      await sleep(Math.min(Math.max(retryAfter * 1000, 500), 5000));
+      continue;
+    }
+    console.error('Telegram API error:', method, data || requestError?.message || res?.statusText);
+    const err = new Error(data?.description || requestError?.message || `Telegram API error: ${method}`);
+    err.telegram = data || { ok: false, error_code: errorCode, description };
     throw err;
   }
-  if (method?.startsWith('send')) {
-    console.log(
-      `[TELEGRAM_SEND_RESULT] ok=true ` +
-      `message_id=${data.result?.message_id || '-'} ` +
-      `error_code=- description=-`
-    );
-  }
-  return data.result;
+  throw new Error(`Telegram API retry loop exhausted: ${method}`);
 }
 
 async function adminTg(method, payload = {}) {
@@ -1469,21 +1507,6 @@ async function findAccountForBusinessMessage(msg) {
     }
   }
   if (businessConnectionId) {
-    let q = supabase.from('business_leads')
-      .select('account_key')
-      .eq('business_connection_id', businessConnectionId)
-      .order('updated_at', { ascending: false })
-      .limit(1);
-    if (chatId) q = q.eq('chat_id', chatId);
-    const { data } = await q;
-    const learnedKey = data?.[0]?.account_key;
-    if (learnedKey) {
-      const account = accounts.find(a => a.account_key === learnedKey);
-      if (account) {
-        await logAccountResolution({ msg, account, source: 'business_leads_history' });
-        return account;
-      }
-    }
     await logEvent(chatId || 'unknown', 'UNMAPPED_BUSINESS_CONNECTION', JSON.stringify({
       business_connection_id: businessConnectionId,
       chat_id: chatId || null,
@@ -1772,14 +1795,14 @@ async function sendBusinessMessage(lead, text) {
     text
   });
   const account = await getAccount(lead.account_key);
-  await archiveBusinessMessage({
+  runBestEffort('archive_outgoing_bot_message', () => archiveBusinessMessage({
     message_id: result?.message_id,
     chat: { id: lead.chat_id },
     business_connection_id: lead.business_connection_id,
     text,
     date: Math.floor(Date.now() / 1000),
     from: { id: 'bot', first_name: 'Business Auto' }
-  }, account, 'bot');
+  }, account, 'bot'), { accountKey: lead.account_key, chatId: lead.chat_id });
   await updateLead(lead.chat_id, { last_bot_message: text, last_message_at: new Date().toISOString(), last_actor: 'bot' }, lead.account_key);
   return true;
 }
@@ -4258,6 +4281,7 @@ async function cleanupExpiredMessageArchives() {
 async function runSchedulerTick(source = 'interval') {
   if (schedulerBusy) return;
   schedulerBusy = true;
+  runtimeStatus.scheduler_last_started_at = new Date().toISOString();
   try {
     try {
       await cleanupExpiredMessageArchives();
@@ -4295,9 +4319,11 @@ async function runSchedulerTick(source = 'interval') {
       }
     }
   } catch (err) {
+    runtimeStatus.scheduler_last_error = String(err?.message || err).slice(0, 300);
     console.error('scheduler tick error:', err);
     await logEvent('system', 'scheduler_error', err.message || String(err));
   } finally {
+    runtimeStatus.scheduler_last_finished_at = new Date().toISOString();
     schedulerBusy = false;
   }
 }
@@ -5094,17 +5120,20 @@ function logIncomingBusinessState({ accountKey: ak, businessConnectionId = '', c
 }
 
 async function handleBusinessMessage(msg, options = {}) {
+  const traceId = options.traceId || `biz_${options.updateId || msg.message_id || Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const startedAt = Date.now();
   const chatId = String(msg.chat?.id || '');
   if (!chatId) return;
   const businessConnectionId = msg.business_connection_id || msg.business_connection?.id || null;
   const account = await findAccountForBusinessMessage(msg);
   const ak = account.account_key;
-  console.log(`[ACCOUNT_LOOKUP] success=${ak !== UNKNOWN_ACCOUNT_KEY ? 'true' : 'false'} account_key=${ak} business_connection_id=${businessConnectionId || '-'} error=-`);
+  console.log(`[BUSINESS_FLOW_START] trace_id=${traceId} account_key=${ak} chat_id=${chatId} message_id=${msg.message_id || '-'} business_connection_id=${businessConnectionId || '-'}`);
+  console.log(`[ACCOUNT_LOOKUP] trace_id=${traceId} success=${ak !== UNKNOWN_ACCOUNT_KEY ? 'true' : 'false'} account_key=${ak} business_connection_id=${businessConnectionId || '-'} error=-`);
   const text = getMessageText(msg).trim();
   const ownerOutgoing = isAccountOwnerMessage(msg, account);
   const direction = ownerOutgoing ? 'admin' : 'customer';
   if (ownerOutgoing) await rememberAccountBusinessConnection(account, businessConnectionId);
-  if (!options.skipArchive) await archiveBusinessMessage(msg, account, direction);
+  if (!options.skipArchive) runBestEffort('archive_business_message', () => archiveBusinessMessage(msg, account, direction), { traceId, accountKey: ak, chatId });
   if (normalizeCommandWord(text.split(/\s+/)[0]) === '/whoami') {
     await replyWhoami(msg, 'business_message');
     return;
@@ -5112,6 +5141,7 @@ async function handleBusinessMessage(msg, options = {}) {
 
   if (ak === UNKNOWN_ACCOUNT_KEY) {
     await logIgnore(chatId, 'unmapped_business_connection_no_flow', businessConnectionId || '', ak);
+    console.log(`[BUSINESS_FLOW_END] trace_id=${traceId} replied=false final_stage=- duration_ms=${Date.now() - startedAt} stop_reason=tenant_unresolved`);
     return;
   }
 
@@ -5127,6 +5157,7 @@ async function handleBusinessMessage(msg, options = {}) {
   });
   if (!firstTime) {
     await logIgnore(chatId, 'duplicate_message', `${eventType}:${msg.message_id || msg.date || ''}`, ak);
+    console.log(`[BUSINESS_FLOW_END] trace_id=${traceId} replied=false final_stage=- duration_ms=${Date.now() - startedAt} stop_reason=duplicate_update`);
     return;
   }
   if (isBotMessage(msg)) return;
@@ -5275,7 +5306,8 @@ async function handleBusinessMessage(msg, options = {}) {
   }
 
   console.log(`[INTENT_DECISION] account_key=${ak} lead_chat_id=${chatId} stage=${activeLead.stage || '-'} text_len=${text.length}`);
-  enqueueLeadMessage(activeLead, text);
+  enqueueLeadMessage(activeLead, text, traceId);
+  console.log(`[BUSINESS_FLOW_END] trace_id=${traceId} replied=pending final_stage=${activeLead.stage || '-'} duration_ms=${Date.now() - startedAt} stop_reason=buffered_for_processing`);
 }
 
 async function handlePostFinishSignal(lead, msg, rawText) {
@@ -5299,20 +5331,32 @@ async function handlePostFinishSignal(lead, msg, rawText) {
   await logEvent(lead.chat_id, `post_finish_${intent}`, text || '[media]', lead.account_key);
 }
 
-function enqueueLeadMessage(lead, text) {
+function bufferKeyForLead(lead = {}) {
+  return `${accountKey(lead.account_key)}:${String(lead.business_connection_id || '-')}:${String(lead.chat_id)}`;
+}
+
+function runBestEffort(name, task, context = {}) {
+  Promise.resolve().then(task).catch(err => {
+    console.error(`[AUXILIARY_ERROR] module=${name} trace_id=${context.traceId || '-'} account_key=${context.accountKey || '-'} chat_id=${context.chatId || '-'} error=${String(err?.message || err).replace(/\s+/g, '_').slice(0, 300)}`);
+  });
+}
+
+function enqueueLeadMessage(lead, text, traceId = '') {
   const chatId = String(lead.chat_id);
-  const existing = buffers.get(chatId) || { lead, texts: [], timer: null };
+  const bufferKey = bufferKeyForLead(lead);
+  const existing = buffers.get(bufferKey) || { lead, texts: [], timer: null, traceId };
   existing.lead = lead;
+  existing.traceId = traceId || existing.traceId;
   existing.texts.push(text);
   if (existing.timer) clearTimeout(existing.timer);
   existing.timer = setTimeout(() => {
-    buffers.delete(chatId);
+    buffers.delete(bufferKey);
     processLeadBatch(existing.lead, existing.texts).catch(async err => {
-      console.error('processLeadBatch:', err);
+      console.error(`[BUSINESS_FLOW_ERROR] trace_id=${existing.traceId || '-'} stage=batch error=${err?.stack || err}`);
       await logEvent(chatId, 'process_error', err.message || String(err));
     });
   }, MESSAGE_BUFFER_MS);
-  buffers.set(chatId, existing);
+  buffers.set(bufferKey, existing);
 }
 
 async function processLeadBatch(initialLead, texts) {
@@ -9713,14 +9757,20 @@ function updateBusinessConnectionId(update = {}) {
 }
 
 function logUpdateReceived(update = {}, bot = 'user') {
+  const traceId = `${bot}_${update.update_id || 'noid'}_${Date.now().toString(36)}`;
+  runtimeStatus.updates_received += 1;
+  runtimeStatus.last_update_at = new Date().toISOString();
+  runtimeStatus.last_update_type = updateType(update);
+  runtimeStatus.last_update_trace_id = traceId;
   console.log(
-    `[UPDATE_RECEIVED] update_id=${update.update_id || '-'} ` +
+    `[UPDATE_RECEIVED] trace_id=${traceId} update_id=${update.update_id || '-'} ` +
     `update_type=${updateType(update)} ` +
     `bot=${bot} ` +
     `business_connection_id=${updateBusinessConnectionId(update) || '-'} ` +
     `chat_id=${updateChatId(update) || '-'} ` +
     `message_id=${updateMessageId(update) || '-'}`
   );
+  return traceId;
 }
 
 async function setWebhookResponse(req, res, allowedUpdates) {
@@ -9784,6 +9834,21 @@ app.get('/webhook-info', async (_, res) => {
   }
 });
 
+app.get('/debug/status', async (_, res) => {
+  const dbOk = await probeDatabase();
+  res.json({
+    ok: true,
+    started_at: STARTED_AT,
+    database: dbOk ? 'connected' : databaseStatus,
+    update_mode: UPDATE_MODE,
+    scheduler_busy: schedulerBusy,
+    buffered_conversations: buffers.size,
+    runtime: runtimeStatus,
+    telegram_request_timeout_ms: TELEGRAM_REQUEST_TIMEOUT_MS,
+    telegram_send_max_retries: TELEGRAM_SEND_MAX_RETRIES
+  });
+});
+
 app.get('/set-admin-webhook', async (req, res) => {
   try {
     const url = ADMIN_BOT_WEBHOOK_URL || `${req.protocol}://${req.get('host')}/admin-webhook`;
@@ -9829,7 +9894,7 @@ app.post('/webhook', async (req, res) => {
   res.json({ ok: true });
   try {
     const update = req.body || {};
-    logUpdateReceived(update, 'user');
+    const traceId = logUpdateReceived(update, 'user');
     if (update.callback_query) await handleCallback(update.callback_query);
     if (update.message) {
       if (await handleUserOnboardingMessage(update.message)) return;
@@ -9841,13 +9906,17 @@ app.post('/webhook', async (req, res) => {
       }
     }
     if (update.business_connection) await handleBusinessConnectionUpdate(update.business_connection);
-    if (update.business_message) await handleBusinessMessage(update.business_message, { updateId: update.update_id });
+    if (update.business_message) await handleBusinessMessage(update.business_message, { updateId: update.update_id, traceId });
     if (update.edited_business_message) {
-      await archiveEditedBusinessMessage(update.edited_business_message);
-      await handleBusinessMessage(update.edited_business_message, { updateId: update.update_id, edited: true, skipArchive: true });
+      runBestEffort('archive_edited_business_message', () => archiveEditedBusinessMessage(update.edited_business_message), { traceId });
+      await handleBusinessMessage(update.edited_business_message, { updateId: update.update_id, edited: true, skipArchive: true, traceId });
     }
-    if (update.deleted_business_messages) await handleDeletedBusinessMessages(update.deleted_business_messages);
+    if (update.deleted_business_messages) runBestEffort('archive_deleted_business_messages', () => handleDeletedBusinessMessages(update.deleted_business_messages), { traceId });
+    runtimeStatus.updates_processed += 1;
   } catch (err) {
+    runtimeStatus.updates_failed += 1;
+    runtimeStatus.last_error_at = new Date().toISOString();
+    runtimeStatus.last_error = String(err?.message || err).slice(0, 300);
     console.error('webhook processing error:', err);
     const businessConnectionId = updateBusinessConnectionId(req.body || {});
     await sendAdmin(`⚠️ Bot xatosi: ${html(err.message || String(err))}`, {

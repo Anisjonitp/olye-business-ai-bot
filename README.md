@@ -48,6 +48,8 @@ Arxiv retention muddati `ARCHIVE_RETENTION_DAYS=30` orqali boshqariladi. Bot kun
 
 `OUTREACH_MONITOR_ENABLED=false` bo‘lsa outreach monitor ogohlantirishlari vaqtincha o‘chiq turadi; Telegram Business auto-reply oqimi monitor holatidan mustaqil ishlaydi.
 
+Production diagnostikasi uchun `GET /debug/status` (runtime health, scheduler va buffered conversation soni) hamda `GET /webhook-info` (Telegram webhook holati) mavjud. `TELEGRAM_REQUEST_TIMEOUT_MS=15000` Telegram so‘rovining yuqori vaqt chegarasini, `TELEGRAM_SEND_MAX_RETRIES=1` esa faqat vaqtinchalik send xatolari (429/5xx/network) uchun bounded retry sonini belgilaydi.
+
 SaaS workspace qatlami dastlab passiv holatda deploy qilinadi:
 
 ```text
