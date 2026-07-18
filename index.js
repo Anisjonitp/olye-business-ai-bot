@@ -3361,6 +3361,75 @@ async function sendPackage(lead, actionName, templateKeys, nextPatch = {}, { tra
   return { ...currentLead, _telegram_message_id: telegramMessageId };
 }
 
+const ASK_INFO_EMERGENCY_TEXT = 'Arizangiz haqida batafsil ma’lumot yuboring. Ism-familiyangiz, ta’lim muassasangiz, faoliyatingiz va erishgan yutuqlaringizni yozib qoldiring.';
+
+async function resolveAskInfoTemplate(accountContext = {}, traceId = '') {
+  const account = accountContext.account || await getAccount(accountContext.accountKey || DEFAULT_ACCOUNT_KEY);
+  const tenant = accountContext.tenant || await resolveTenantContext({
+    accountKey: account.account_key,
+    businessConnectionId: account.business_connection_id
+  });
+  const accountKey = account.account_key;
+  const candidates = [
+    { source: 'tenant_exact', templateKey: 'ask_info', tenantScoped: true },
+    { source: 'tenant_namespaced', templateKey: `${accountKey}:ask_info`, tenantScoped: true },
+    { source: 'legacy_account_exact', templateKey: 'ask_info', tenantScoped: false },
+    { source: 'legacy_account_namespaced', templateKey: `${accountKey}:ask_info`, tenantScoped: false }
+  ];
+  let lastError = '';
+  for (const candidate of candidates) {
+    if (candidate.tenantScoped && (!tenant?.workspace_id || !tenant?.account_id)) continue;
+    try {
+      let query = supabase.from('reply_templates')
+        .select('body,key,template_key,account_key')
+        .eq('account_key', accountKey)
+        .eq('is_active', true)
+        .or(`key.eq.${candidate.templateKey},template_key.eq.${candidate.templateKey}`)
+        .order('updated_at', { ascending: false })
+        .limit(1);
+      if (candidate.tenantScoped) {
+        query = query
+          .eq('workspace_id', tenant.workspace_id)
+          .eq('workspace_business_account_id', tenant.account_id);
+      }
+      const { data, error } = await query;
+      if (error) {
+        lastError = `${error.code || '-'}:${String(error.message || error).replace(/\s+/g, '_').slice(0, 180)}`;
+        console.log(`[ASK_INFO_TEMPLATE_RESOLUTION] trace_id=${traceId || '-'} account_key=${accountKey} source=${candidate.source} template_key=${candidate.templateKey} found=false text_length=0 error=${lastError}`);
+        continue;
+      }
+      const row = data?.[0];
+      const text = String(row?.body || '').trim();
+      if (text) {
+        console.log(`[ASK_INFO_TEMPLATE_RESOLUTION] trace_id=${traceId || '-'} account_key=${accountKey} source=${candidate.source} template_key=${row.template_key || row.key || candidate.templateKey} found=true text_length=${text.length} error=-`);
+        return { found: true, text, templateKey: row.template_key || row.key || candidate.templateKey, source: candidate.source };
+      }
+      console.log(`[ASK_INFO_TEMPLATE_RESOLUTION] trace_id=${traceId || '-'} account_key=${accountKey} source=${candidate.source} template_key=${candidate.templateKey} found=false text_length=0 error=-`);
+    } catch (err) {
+      lastError = String(err?.message || err).replace(/\s+/g, '_').slice(0, 180);
+      console.log(`[ASK_INFO_TEMPLATE_RESOLUTION] trace_id=${traceId || '-'} account_key=${accountKey} source=${candidate.source} template_key=${candidate.templateKey} found=false text_length=0 error=${lastError}`);
+    }
+  }
+  console.log(`[ASK_INFO_TEMPLATE_RESOLUTION] trace_id=${traceId || '-'} account_key=${accountKey} source=missing template_key=ask_info found=false text_length=0 error=${lastError || '-'}`);
+  return { found: false, text: null, templateKey: null, source: 'missing' };
+}
+
+async function sendAskInfoReply(lead, { text, source, templateKey }, traceId = '') {
+  console.log(`[ASK_INFO_SEND_ATTEMPT] trace_id=${traceId || '-'} account_key=${lead.account_key} chat_id=${lead.chat_id} source=${source} text_length=${String(text || '').length}`);
+  try {
+    const sent = await sendBusinessMessage(lead, text, { traceId, templateKey: templateKey || 'ask_info' });
+    if (!sent?.message_id) {
+      console.log(`[ASK_INFO_SEND_RESULT] trace_id=${traceId || '-'} account_key=${lead.account_key} sender_type=bot ok=false telegram_message_id=- error_code=missing_message_id error_description=telegram_result_missing_message_id`);
+      return { sent: false, messageId: null, source, error: 'missing_message_id' };
+    }
+    console.log(`[ASK_INFO_SEND_RESULT] trace_id=${traceId || '-'} account_key=${lead.account_key} sender_type=bot ok=true telegram_message_id=${sent.message_id} error_code=- error_description=-`);
+    return { sent: true, messageId: sent.message_id, source, error: null };
+  } catch (err) {
+    console.log(`[ASK_INFO_SEND_RESULT] trace_id=${traceId || '-'} account_key=${lead.account_key} sender_type=bot ok=false telegram_message_id=- error_code=${err?.telegram?.error_code || '-'} error_description=${String(err?.telegram?.description || err?.message || '-').replace(/\s+/g, '_').slice(0, 240)}`);
+    return { sent: false, messageId: null, source, error: err?.message || String(err) };
+  }
+}
+
 async function finishAfterInfo(lead) {
   const updated = await updateLead(lead.chat_id, {
     stage: STAGE.INFO_SENT_FINISHED,
@@ -5454,10 +5523,16 @@ function enqueueLeadMessage(lead, text, traceId = '') {
   if (existing.timer) clearTimeout(existing.timer);
   existing.timer = setTimeout(() => {
     buffers.delete(bufferKey);
-    processLeadBatch(existing.lead, existing.texts, existing.traceId).catch(async err => {
-      console.error(`[BUSINESS_FLOW_ERROR] trace_id=${existing.traceId || '-'} stage=batch error=${err?.stack || err}`);
-      await logEvent(chatId, 'process_error', err.message || String(err));
-    });
+    (async () => {
+      try {
+        await processLeadBatch(existing.lead, existing.texts, existing.traceId);
+      } catch (err) {
+        console.error(`[BUSINESS_FLOW_ERROR] trace_id=${existing.traceId || '-'} stage=batch error=${err?.stack || err}`);
+        await logEvent(chatId, 'process_error', err.message || String(err));
+      } finally {
+        if (buffers.get(bufferKey) === existing) buffers.delete(bufferKey);
+      }
+    })();
   }, MESSAGE_BUFFER_MS);
   buffers.set(bufferKey, existing);
 }
@@ -5554,10 +5629,21 @@ async function processLeadBatch(initialLead, texts, traceId = '') {
 
   if (lead.stage === STAGE.ASKED_APPLICATION) {
     if (intent === 'application_confirmed' || intent === 'application_submitted') {
-      const keys = await flowTemplateKeys(lead.account_key, 'ask_info', ['ask_info'], traceId);
-      console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=${keys.length ? 'true' : 'false'} fallback_used=false send_ok=pending telegram_message_id=-`);
-      const after = await sendPackage(lead, 'ask_info', keys, { stage: STAGE.ASKED_INFO }, { traceId });
-      console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=${keys.length ? 'true' : 'false'} fallback_used=false send_ok=${after ? 'true' : 'false'} telegram_message_id=${after?._telegram_message_id || '-'} stop_reason=${after ? '-' : 'flow_or_template_missing_or_send_failed'}`);
+      const account = await getAccount(lead.account_key);
+      const tenant = await resolveTenantContext({ accountKey: account.account_key, businessConnectionId: lead.business_connection_id || account.business_connection_id });
+      // Flow lookup remains diagnostic/config-aware, but a missing row must not silence this reply.
+      await getFlowSteps(account.account_key, { traceId, stepKeys: ['ask_info', 'asked_info', 'info', 'info_question'] });
+      let resolved = await resolveAskInfoTemplate({ account, tenant }, traceId);
+      if (!resolved.found) {
+        resolved = { found: true, text: ASK_INFO_EMERGENCY_TEXT, templateKey: 'emergency_text', source: 'emergency_text' };
+        console.log(`[ASK_INFO_TEMPLATE_RESOLUTION] trace_id=${traceId || '-'} account_key=${lead.account_key} source=emergency_text template_key=emergency_text found=true text_length=${ASK_INFO_EMERGENCY_TEXT.length} error=-`);
+      }
+      const sendResult = await sendAskInfoReply(lead, resolved, traceId);
+      let after = null;
+      if (sendResult.sent && sendResult.messageId) {
+        after = await updateLead(lead.chat_id, { stage: STAGE.ASKED_INFO, status: 'active' }, lead.account_key) || lead;
+      }
+      console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_source=${resolved.source} send_ok=${sendResult.sent && sendResult.messageId ? 'true' : 'false'} telegram_message_id=${sendResult.messageId || '-'} stop_reason=${after ? '-' : (sendResult.error || 'telegram_send_failed')}`);
       return;
     }
     if (intent === 'application_not_submitted') {
