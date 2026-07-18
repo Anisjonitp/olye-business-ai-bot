@@ -2354,8 +2354,21 @@ async function getTemplate(key, accountOrKey = DEFAULT_ACCOUNT_KEY, { traceId = 
     .order('updated_at', { ascending: false })
     .limit(1);
   if (!scoped.error && scoped.data?.[0]?.body) return scoped.data[0].body;
+  // Older UZLYE templates predate tenant columns. Keep the lookup account-scoped
+  // so an edited legacy ask_info template continues to be used, never another account's template.
+  const legacy = await supabase.from('reply_templates')
+    .select('body')
+    .in('key', [accountTemplateKey(ak, key), key])
+    .in('account_key', aliases)
+    .order('updated_at', { ascending: false })
+    .limit(1);
+  if (!legacy.error && legacy.data?.[0]?.body) {
+    console.log(`[TEMPLATE_RESOLUTION] trace_id=${traceId || '-'} template_key=${key} tenant_template_found=true source=legacy_account_template fallback_used=${fallbackUsed ? 'true' : 'false'} fallback_reason=${fallbackReason}`);
+    return legacy.data[0].body;
+  }
   console.log(`[TEMPLATE_RESOLUTION] trace_id=${traceId || '-'} template_key=${key} tenant_template_found=false fallback_used=${fallbackUsed ? 'true' : 'false'} fallback_reason=${fallbackReason}`);
   if (scoped.error) console.error('getTemplate scoped:', key, scoped.error.message);
+  if (legacy.error) console.error('getTemplate legacy account scope:', key, legacy.error.message);
   return null;
 }
 
@@ -3346,27 +3359,6 @@ async function sendPackage(lead, actionName, templateKeys, nextPatch = {}, { tra
     currentLead = await updateLead(lead.chat_id, nextPatch, lead.account_key) || currentLead;
   }
   return { ...currentLead, _telegram_message_id: telegramMessageId };
-}
-
-const APPLICATION_CONFIRMED_SAFE_FALLBACK = 'Arizangiz haqida batafsil ma’lumot yuboring. Ism-familiyangiz, ta’lim muassasangiz va erishgan yutuqlaringizni yozib qoldiring.';
-
-async function sendApplicationConfirmedSafeFallback(lead, traceId = '') {
-  try {
-    const sent = await sendBusinessMessage(lead, APPLICATION_CONFIRMED_SAFE_FALLBACK, {
-      traceId,
-      templateKey: 'safe_application_confirmed_fallback'
-    });
-    if (!sent?.message_id) {
-      console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=false fallback_used=true send_ok=false telegram_message_id=- stop_reason=telegram_send_failed`);
-      return null;
-    }
-    const updated = await updateLead(lead.chat_id, { stage: STAGE.ASKED_INFO, status: 'active' }, lead.account_key) || lead;
-    console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=false fallback_used=true fallback_reason=flow_or_template_missing send_ok=true telegram_message_id=${sent.message_id} stop_reason=-`);
-    return updated;
-  } catch (err) {
-    console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=false fallback_used=true send_ok=false telegram_message_id=- stop_reason=telegram_send_failed`);
-    return null;
-  }
 }
 
 async function finishAfterInfo(lead) {
@@ -5564,10 +5556,8 @@ async function processLeadBatch(initialLead, texts, traceId = '') {
     if (intent === 'application_confirmed' || intent === 'application_submitted') {
       const keys = await flowTemplateKeys(lead.account_key, 'ask_info', ['ask_info'], traceId);
       console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=${keys.length ? 'true' : 'false'} fallback_used=false send_ok=pending telegram_message_id=-`);
-      const after = keys.length
-        ? await sendPackage(lead, 'ask_info', keys, { stage: STAGE.ASKED_INFO }, { traceId })
-        : await sendApplicationConfirmedSafeFallback(lead, traceId);
-      console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=${keys.length ? 'true' : 'false'} fallback_used=${keys.length ? 'false' : 'true'} send_ok=${after ? 'true' : 'false'} telegram_message_id=${after?._telegram_message_id || '-'} stop_reason=${after ? '-' : 'flow_or_template_missing_or_send_failed'}`);
+      const after = await sendPackage(lead, 'ask_info', keys, { stage: STAGE.ASKED_INFO }, { traceId });
+      console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=${keys.length ? 'true' : 'false'} fallback_used=false send_ok=${after ? 'true' : 'false'} telegram_message_id=${after?._telegram_message_id || '-'} stop_reason=${after ? '-' : 'flow_or_template_missing_or_send_failed'}`);
       return;
     }
     if (intent === 'application_not_submitted') {
