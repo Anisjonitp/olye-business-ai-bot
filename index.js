@@ -1779,7 +1779,7 @@ async function sendAdmin(text, extra = {}, accountOrKey = DEFAULT_ACCOUNT_KEY) {
   }
 }
 
-async function sendBusinessMessage(lead, text) {
+async function sendBusinessMessage(lead, text, { traceId = '', templateKey = '' } = {}) {
   const allowed = await canLeadAutoReply(lead, lead?.account_key);
   if (!allowed.ok) {
     await logIgnore(lead?.chat_id || 'unknown', allowed.reason || 'lead_auto_reply_off', String(text || '').slice(0, 300), lead?.account_key);
@@ -1789,11 +1789,24 @@ async function sendBusinessMessage(lead, text) {
     await logEvent(lead?.chat_id || 'unknown', 'send_skipped_no_business_connection', String(text || '').slice(0, 300), lead?.account_key);
     return null;
   }
-  const result = await tg('sendMessage', {
-    chat_id: lead.chat_id,
-    business_connection_id: lead.business_connection_id,
-    text
-  });
+  console.log(`[TELEGRAM_SEND_ATTEMPT] trace_id=${traceId || '-'} sender_type=bot account_key=${lead.account_key} chat_id=${lead.chat_id} business_connection_id=${lead.business_connection_id} template_key=${templateKey || '-'}`);
+  let result;
+  try {
+    result = await tg('sendMessage', {
+      chat_id: lead.chat_id,
+      business_connection_id: lead.business_connection_id,
+      text
+    });
+  } catch (err) {
+    console.log(`[TELEGRAM_SEND_RESULT] trace_id=${traceId || '-'} sender_type=bot ok=false telegram_message_id=- error_code=${err?.telegram?.error_code || '-'} error_description=${String(err?.telegram?.description || err?.message || '-').replace(/\s+/g, '_').slice(0, 240)}`);
+    throw err;
+  }
+  if (!result?.message_id) {
+    const err = new Error('Telegram sendMessage returned no message_id');
+    console.log(`[TELEGRAM_SEND_RESULT] trace_id=${traceId || '-'} sender_type=bot ok=false telegram_message_id=- error_code=missing_message_id error_description=telegram_result_missing_message_id`);
+    throw err;
+  }
+  console.log(`[TELEGRAM_SEND_RESULT] trace_id=${traceId || '-'} sender_type=bot ok=true telegram_message_id=${result?.message_id || '-'}`);
   const account = await getAccount(lead.account_key);
   runBestEffort('archive_outgoing_bot_message', () => archiveBusinessMessage({
     message_id: result?.message_id,
@@ -1804,7 +1817,7 @@ async function sendBusinessMessage(lead, text) {
     from: { id: 'bot', first_name: 'Business Auto' }
   }, account, 'bot'), { accountKey: lead.account_key, chatId: lead.chat_id });
   await updateLead(lead.chat_id, { last_bot_message: text, last_message_at: new Date().toISOString(), last_actor: 'bot' }, lead.account_key);
-  return true;
+  return result || true;
 }
 
 async function answerCallback(callbackQueryId, text = '') {
@@ -2316,10 +2329,19 @@ function accountTemplateKey(accountOrKey, key) {
   return `${ak}:${key}`;
 }
 
-async function getTemplate(key, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+async function getTemplate(key, accountOrKey = DEFAULT_ACCOUNT_KEY, { traceId = '', fallbackUsed = false, fallbackReason = '-' } = {}) {
   const ak = normalizeAccountKey(accountKey(accountOrKey));
   if (!ak || ak === UNKNOWN_ACCOUNT_KEY) {
     console.log(`[TENANT_SCOPE_REJECTED] source=template_repository template_key=${key} reason=account_unresolved`);
+    return null;
+  }
+  const account = await getAccount(ak);
+  const tenant = await resolveTenantContext({
+    accountKey: account.account_key,
+    businessConnectionId: account.business_connection_id
+  });
+  if (!tenant?.workspace_id || !tenant?.account_id) {
+    console.log(`[TENANT_SCOPE_REJECTED] source=template_repository account_key=${ak} template_key=${key} reason=tenant_scope_unresolved`);
     return null;
   }
   const aliases = accountKeyAliases(ak);
@@ -2327,9 +2349,12 @@ async function getTemplate(key, accountOrKey = DEFAULT_ACCOUNT_KEY) {
     .select('body')
     .in('key', [accountTemplateKey(ak, key), key])
     .in('account_key', aliases)
+    .eq('workspace_id', tenant.workspace_id)
+    .eq('workspace_business_account_id', tenant.account_id)
     .order('updated_at', { ascending: false })
     .limit(1);
   if (!scoped.error && scoped.data?.[0]?.body) return scoped.data[0].body;
+  console.log(`[TEMPLATE_RESOLUTION] trace_id=${traceId || '-'} template_key=${key} tenant_template_found=false fallback_used=${fallbackUsed ? 'true' : 'false'} fallback_reason=${fallbackReason}`);
   if (scoped.error) console.error('getTemplate scoped:', key, scoped.error.message);
   return null;
 }
@@ -2987,15 +3012,37 @@ async function handleCommandCreateInput({ chatId, from = {}, text, session, sele
 }
 
 
-async function getFlowSteps(accountOrKey = DEFAULT_ACCOUNT_KEY) {
+async function getFlowSteps(accountOrKey = DEFAULT_ACCOUNT_KEY, { traceId = '', stepKeys = [] } = {}) {
   const account = await getAccount(accountOrKey);
+  const tenant = await resolveTenantContext({
+    accountKey: account.account_key,
+    businessConnectionId: account.business_connection_id
+  });
+  if (!tenant?.workspace_id || !tenant?.account_id) {
+    console.log(
+      `[TENANT_SCOPE_REJECTED] trace_id=${traceId || '-'} source=flow_repository ` +
+      `account_key=${account.account_key} workspace_id=- workspace_business_account_id=- ` +
+      `step_key=${stepKeys.join(',') || '-'} reason=tenant_scope_unresolved`
+    );
+    return [];
+  }
+  const resolvedFlowKeys = resolveInfoFlowKeys(account);
   let q = supabase.from('account_flow_steps')
     .select('*')
     .eq('account_key', account.account_key)
-    .eq('flow_key', account.flow_key || 'info_only')
+    .in('flow_key', resolvedFlowKeys)
+    .eq('workspace_id', tenant.workspace_id)
+    .eq('workspace_business_account_id', tenant.account_id)
     .eq('is_active', true)
     .order('sort_order', { ascending: true });
+  if (stepKeys.length) q = q.in('step_key', stepKeys);
   const { data, error } = await q;
+  console.log(
+    `[FLOW_QUERY] trace_id=${traceId || '-'} table=account_flow_steps ` +
+    `account_key=${account.account_key} resolved_flow_keys=${resolvedFlowKeys.join(',') || '-'} requested_step_key=${stepKeys[0] || '-'} step_candidates=${stepKeys.join(',') || '-'} ` +
+    `workspace_id=${tenant.workspace_id} workspace_business_account_id=${tenant.account_id} row_count=${data?.length || 0} ` +
+    `error=${error?.code || '-'}:${error ? String(error.message).replace(/\s+/g, '_').slice(0, 160) : '-'}`
+  );
   if (error) {
     console.error('getFlowSteps:', error.message);
     return [];
@@ -3003,18 +3050,47 @@ async function getFlowSteps(accountOrKey = DEFAULT_ACCOUNT_KEY) {
   return data || [];
 }
 
-async function getFlowStep(accountOrKey, stepKey) {
-  const steps = await getFlowSteps(accountOrKey);
+function resolveInfoFlowKeys(account = {}) {
+  const values = [];
+  const rawFlowKey = String(account.flow_key || '').trim();
+  const resolvedAccountKey = normalizeAccountKey(accountKey(account));
+  if (rawFlowKey) values.push(rawFlowKey.endsWith('_info_only') ? rawFlowKey : `${rawFlowKey}_info_only`);
+  if (resolvedAccountKey) values.push(`${resolvedAccountKey}_info_only`);
+  return [...new Set(values.filter(Boolean))];
+}
+
+async function getFlowStep(accountOrKey, stepKey, traceId = '') {
+  const steps = await getFlowSteps(accountOrKey, { traceId, stepKeys: [stepKey] });
   return steps.find(s => s.step_key === stepKey) || null;
 }
 
-async function flowTemplateKeys(accountOrKey, stepKey, fallbackKeys) {
-  const step = await getFlowStep(accountOrKey, stepKey);
-  if (!step?.template_key) {
-    console.log(`[TENANT_SCOPE_REJECTED] source=flow_repository account_key=${accountKey(accountOrKey) || '-'} step_key=${stepKey} reason=flow_step_missing`);
-    return [];
+const CANONICAL_FLOW_STEP_ALIASES = {
+  ask_info: ['ask_info', 'asked_info', 'info', 'info_question']
+};
+
+async function flowTemplateKeys(accountOrKey, stepKey, fallbackKeys = [], traceId = '') {
+  const candidates = [...new Set([stepKey, ...(CANONICAL_FLOW_STEP_ALIASES[stepKey] || [])])];
+  const steps = await getFlowSteps(accountOrKey, { traceId, stepKeys: candidates });
+  const step = candidates.map(candidate => steps.find(row => row.step_key === candidate)).find(Boolean);
+  if (step?.template_key) {
+    const keys = String(step.template_key).split(/[,\s]+/).map(x => x.trim()).filter(Boolean);
+    const usable = [];
+    for (const key of keys) if (await getTemplate(key, accountOrKey, { traceId, fallbackUsed: false })) usable.push(key);
+    console.log(`[TEMPLATE_RESOLUTION] trace_id=${traceId || '-'} template_key=${keys.join(',') || '-'} tenant_template_found=${usable.length ? 'true' : 'false'} fallback_used=false fallback_reason=${usable.length ? '-' : 'template_missing'}`);
+    return usable;
   }
-  return String(step.template_key).split(/[,\s]+/).map(x => x.trim()).filter(Boolean);
+  const canonicalTemplateKeys = [...new Set([...fallbackKeys, ...candidates])];
+  const available = [];
+  for (const key of canonicalTemplateKeys) {
+    if (await getTemplate(key, accountOrKey, { traceId, fallbackUsed: true, fallbackReason: 'flow_step_missing' })) available.push(key);
+  }
+  if (available.length) {
+    console.log(`[TEMPLATE_RESOLUTION] trace_id=${traceId || '-'} template_key=${available.join(',')} tenant_template_found=true fallback_used=true fallback_reason=flow_step_missing`);
+    return available;
+  }
+  console.log(`[TEMPLATE_RESOLUTION] trace_id=${traceId || '-'} template_key=${stepKey} tenant_template_found=false fallback_used=true fallback_reason=flow_or_template_missing`);
+  console.log(`[TENANT_SCOPE_REJECTED] trace_id=${traceId || '-'} source=flow_repository account_key=${accountKey(accountOrKey) || '-'} step_key=${stepKey} reason=flow_step_missing`);
+  return [];
 }
 
 async function upsertFlowStep({ accountKey: ak, stepKey, templateKey, displayName, waitForReply = true, nextYes, nextNo, nextPartial, nextUnknown, nextConfirm, nextReject, nextNeedsInfo, nextUnclear, humanNeededOnUnclear = true, stopAfterSend, sortOrder = 100 }) {
@@ -3224,42 +3300,73 @@ function renderTemplate(body = '') {
   return String(body || '').replaceAll('{APPLICATION_LINK}', APPLICATION_LINK);
 }
 
-async function sendTemplate(lead, templateKey) {
-  const body = await getTemplate(templateKey, lead.account_key);
+async function sendTemplate(lead, templateKey, { traceId = '' } = {}) {
+  const body = await getTemplate(templateKey, lead.account_key, { traceId });
   if (!body) {
     await sendAdmin(`⚠️ Template topilmadi: <b>${templateKey}</b>`, {}, lead.account_key);
     await logEvent(lead.chat_id, 'missing_template', templateKey, lead.account_key);
     return false;
   }
   const text = renderTemplate(body);
-  const sent = await sendBusinessMessage(lead, text);
+  const sent = await sendBusinessMessage(lead, text, { traceId, templateKey });
   if (!sent) return false;
   await logEvent(lead.chat_id, `sent_${templateKey}`, text.slice(0, 300), lead.account_key);
   await writeAuditLog({ accountKey: lead.account_key, chatId: lead.chat_id, action: 'template_sent', newValue: templateKey, actorType: 'bot' });
-  return true;
+  return sent;
 }
 
-async function sendPackage(lead, actionName, templateKeys, nextPatch = {}) {
+async function sendPackage(lead, actionName, templateKeys, nextPatch = {}, { traceId = '' } = {}) {
   const allowed = await canLeadAutoReply(lead, lead.account_key);
   if (!allowed.ok) {
     await logIgnore(lead.chat_id, allowed.reason, actionName, lead.account_key);
-    return lead;
+    return null;
+  }
+  if (!templateKeys.length) {
+    await logEvent(lead.chat_id, 'flow_step_missing', actionName, lead.account_key);
+    console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${nextPatch.stage || '-'} template_found=false fallback_used=false send_ok=false telegram_message_id=- stop_reason=empty_package`);
+    return null;
   }
   const reserved = await reserveAction(lead.chat_id, lead.stage, actionName, lead.account_key);
   if (!reserved) {
     await logEvent(lead.chat_id, `duplicate_action_skipped_${actionName}`, '', lead.account_key);
-    return lead;
+    return null;
   }
   let currentLead = lead;
+  let telegramMessageId = null;
   for (const key of templateKeys) {
-    const sent = await sendTemplate(currentLead, key);
-    if (!sent) return currentLead;
+    const sent = await sendTemplate(currentLead, key, { traceId });
+    if (!sent) {
+      console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${nextPatch.stage || '-'} template_found=true send_ok=false stop_reason=telegram_send_failed`);
+      return null;
+    }
+    telegramMessageId = sent.message_id || telegramMessageId;
     await sleep(350);
   }
   if (Object.keys(nextPatch).length) {
     currentLead = await updateLead(lead.chat_id, nextPatch, lead.account_key) || currentLead;
   }
-  return currentLead;
+  return { ...currentLead, _telegram_message_id: telegramMessageId };
+}
+
+const APPLICATION_CONFIRMED_SAFE_FALLBACK = 'Arizangiz haqida batafsil ma’lumot yuboring. Ism-familiyangiz, ta’lim muassasangiz va erishgan yutuqlaringizni yozib qoldiring.';
+
+async function sendApplicationConfirmedSafeFallback(lead, traceId = '') {
+  try {
+    const sent = await sendBusinessMessage(lead, APPLICATION_CONFIRMED_SAFE_FALLBACK, {
+      traceId,
+      templateKey: 'safe_application_confirmed_fallback'
+    });
+    if (!sent?.message_id) {
+      console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=false fallback_used=true send_ok=false telegram_message_id=- stop_reason=telegram_send_failed`);
+      return null;
+    }
+    const updated = await updateLead(lead.chat_id, { stage: STAGE.ASKED_INFO, status: 'active' }, lead.account_key) || lead;
+    console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=false fallback_used=true fallback_reason=flow_or_template_missing send_ok=true telegram_message_id=${sent.message_id} stop_reason=-`);
+    return updated;
+  } catch (err) {
+    console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=false fallback_used=true send_ok=false telegram_message_id=- stop_reason=telegram_send_failed`);
+    return null;
+  }
 }
 
 async function finishAfterInfo(lead) {
@@ -3469,6 +3576,10 @@ async function markOutreach({ chatId, businessConnectionId, from, text, messageI
   }
   const auto = await getAutoOutreach(accountKey);
   if (!isAutoActive(auto)) return false;
+  if (!messageId) {
+    await logEvent(chatId, 'outreach_tracking_failed', 'admin_outgoing_message_id_missing', accountKey);
+    return false;
+  }
   if (!(await isOutreachStartMessage({ accountKey, messageText: text }))) {
     await logEvent(chatId, 'manual_admin_message_not_outreach', text || '[media]', accountKey);
     return false;
@@ -3526,7 +3637,7 @@ async function markOutreach({ chatId, businessConnectionId, from, text, messageI
     `account_id=${marked?.workspace_business_account_id || '-'} ` +
     `campaign_id=${auto.session_id} ` +
     `lead_chat_id=${chatId} ` +
-    `telegram_send_ok=true ` +
+    `sender_type=admin telegram_message_observed=true ` +
     `telegram_message_id=${messageId || '-'} ` +
     `tracking_saved=${marked ? 'true' : 'false'} ` +
     `reach_sent_at=${now}`
@@ -5188,7 +5299,7 @@ async function handleBusinessMessage(msg, options = {}) {
       edited: Boolean(options.edited)
     });
     console.log(
-      `[BUSINESS_OUTGOING] account_key=${ak} lead_chat_id=${chatId} message_id=${msg.message_id || '-'} ` +
+      `[BUSINESS_OUTGOING] trace_id=${traceId} sender_type=admin account_key=${ak} lead_chat_id=${chatId} message_id=${msg.message_id || '-'} ` +
       `template_match=${outgoingResult?.template_match ? 'true' : 'false'} ` +
       `matched_template_key=${outgoingResult?.matched_template_key || '-'} ` +
       `campaign_started=${outgoingResult?.campaign_started ? 'true' : 'false'} ` +
@@ -5351,7 +5462,7 @@ function enqueueLeadMessage(lead, text, traceId = '') {
   if (existing.timer) clearTimeout(existing.timer);
   existing.timer = setTimeout(() => {
     buffers.delete(bufferKey);
-    processLeadBatch(existing.lead, existing.texts).catch(async err => {
+    processLeadBatch(existing.lead, existing.texts, existing.traceId).catch(async err => {
       console.error(`[BUSINESS_FLOW_ERROR] trace_id=${existing.traceId || '-'} stage=batch error=${err?.stack || err}`);
       await logEvent(chatId, 'process_error', err.message || String(err));
     });
@@ -5359,7 +5470,7 @@ function enqueueLeadMessage(lead, text, traceId = '') {
   buffers.set(bufferKey, existing);
 }
 
-async function processLeadBatch(initialLead, texts) {
+async function processLeadBatch(initialLead, texts, traceId = '') {
   let lead = await getLead(initialLead.chat_id, initialLead.account_key) || initialLead;
   const allowed = await canLeadAutoReply(lead, lead.account_key);
   if (!allowed.ok) {
@@ -5411,7 +5522,7 @@ async function processLeadBatch(initialLead, texts) {
   const intent = mapAiIntentToRuleIntent(aiDecision, lead.stage, finalRuleIntent);
   const matchMethod = aiDecision ? 'ai' : (ruleIntent === 'unclear' && finalRuleIntent !== ruleIntent ? 'fallback_no' : 'exact');
   console.log(
-    `[INTENT_DECISION] account_key=${lead.account_key} ` +
+    `[INTENT_DECISION] trace_id=${traceId || '-'} account_key=${lead.account_key} ` +
     `lead_chat_id=${lead.chat_id} ` +
     `current_stage=${lead.stage || '-'} ` +
     `original_text=${short(text, 80).replace(/\s+/g, '_')} ` +
@@ -5442,19 +5553,21 @@ async function processLeadBatch(initialLead, texts) {
 
   // Main info-only flow.
   if (lead.stage === STAGE.OUTREACH_SENT || lead.stage === STAGE.NEW || lead.stage === STAGE.PENDING_APPROVAL) {
-    const keys = await flowTemplateKeys(lead.account_key, 'ask_application', ['ask_application']);
-    console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_APPLICATION} template_found=${keys.length ? 'true' : 'false'} send_ok=pending`);
-    await sendPackage(lead, 'ask_application', keys, { stage: STAGE.ASKED_APPLICATION, status: 'active', bot_enabled: true, bot_enabled_for_lead: true });
-    console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_APPLICATION} template_found=${keys.length ? 'true' : 'false'} send_ok=true`);
+    const keys = await flowTemplateKeys(lead.account_key, 'ask_application', ['ask_application'], traceId);
+    console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_APPLICATION} template_found=${keys.length ? 'true' : 'false'} send_ok=pending`);
+    const after = await sendPackage(lead, 'ask_application', keys, { stage: STAGE.ASKED_APPLICATION, status: 'active', bot_enabled: true, bot_enabled_for_lead: true }, { traceId });
+    console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_APPLICATION} template_found=${keys.length ? 'true' : 'false'} send_ok=${after ? 'true' : 'false'} stop_reason=${after ? '-' : 'flow_step_missing_or_send_failed'}`);
     return;
   }
 
   if (lead.stage === STAGE.ASKED_APPLICATION) {
     if (intent === 'application_confirmed' || intent === 'application_submitted') {
-      const keys = await flowTemplateKeys(lead.account_key, 'ask_info', ['ask_info']);
-      console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=${keys.length ? 'true' : 'false'} send_ok=pending`);
-      await sendPackage(lead, 'ask_info', keys, { stage: STAGE.ASKED_INFO });
-      console.log(`[FLOW_CONTINUE] current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=${keys.length ? 'true' : 'false'} send_ok=true`);
+      const keys = await flowTemplateKeys(lead.account_key, 'ask_info', ['ask_info'], traceId);
+      console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=${keys.length ? 'true' : 'false'} fallback_used=false send_ok=pending telegram_message_id=-`);
+      const after = keys.length
+        ? await sendPackage(lead, 'ask_info', keys, { stage: STAGE.ASKED_INFO }, { traceId })
+        : await sendApplicationConfirmedSafeFallback(lead, traceId);
+      console.log(`[FLOW_CONTINUE] trace_id=${traceId || '-'} sender_type=bot current_stage=${lead.stage || '-'} next_stage=${STAGE.ASKED_INFO} template_found=${keys.length ? 'true' : 'false'} fallback_used=${keys.length ? 'false' : 'true'} send_ok=${after ? 'true' : 'false'} telegram_message_id=${after?._telegram_message_id || '-'} stop_reason=${after ? '-' : 'flow_or_template_missing_or_send_failed'}`);
       return;
     }
     if (intent === 'application_not_submitted') {
