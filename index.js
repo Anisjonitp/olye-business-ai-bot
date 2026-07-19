@@ -2125,6 +2125,36 @@ function canAccountReach(account = {}) {
   return canAccountAutoReply(account) && normalizeAccount(account).reach_enabled !== false;
 }
 
+function isTerminalLeadStage(stage = '') {
+  return [STAGE.INFO_SENT_FINISHED, STAGE.PAUSED, STAGE.DISABLED].includes(String(stage || '').trim().toLowerCase());
+}
+
+function reachEligibility(lead = {}, accountOrKey = DEFAULT_ACCOUNT_KEY) {
+  const currentStage = lead.current_stage || lead.stage || '';
+  const reachSent = lead.reach_sent === true || lead.outreach_sent === true;
+  // business_leads has no separate article/post relation; a completed lead is recorded by finished_at.
+  const published = Boolean(lead.finished_at);
+  let reason = 'eligible_new_lead';
+  if (isTerminalLeadStage(currentStage)) reason = 'terminal_stage';
+  else if (reachSent) reason = 'already_reached';
+  else if (lead.finished_at || lead.campaign_completed_at) reason = 'completed';
+  else if (lead.manual_only === true) reason = 'manual_only';
+  else if (lead.bot_enabled_for_lead === false || lead.bot_enabled === false) reason = 'lead_bot_off';
+  else if (lead.reach_batch_id || lead.outreach_session_id) reason = 'campaign_already_processed';
+  const eligible = reason === 'eligible_new_lead';
+  console.log(
+    `[REACH_ELIGIBILITY] account_key=${accountKey(accountOrKey) || lead.account_key || '-'} ` +
+    `lead_chat_id=${leadChatId(lead) || '-'} ` +
+    `current_stage=${currentStage || '-'} ` +
+    `reach_sent=${reachSent ? 'true' : 'false'} ` +
+    `terminal_stage=${isTerminalLeadStage(currentStage) ? 'true' : 'false'} ` +
+    `published=${published ? 'true' : 'false'} ` +
+    `eligible=${eligible ? 'true' : 'false'} ` +
+    `reason=${reason}`
+  );
+  return { eligible, reason, currentStage, published };
+}
+
 function leadAssignmentActive(lead = {}) {
   return Boolean(lead.reach_sent || lead.outreach_sent || lead.assigned_by_reach || lead.assigned_by_admin || lead.manually_started);
 }
@@ -3647,6 +3677,11 @@ async function markOutreach({ chatId, businessConnectionId, from, text, messageI
   }
 
   const existing = await getLead(chatId, accountKey);
+  const existingEligibility = existing ? reachEligibility(existing, accountKey) : null;
+  if (existing && !existingEligibility.eligible) {
+    await logEvent(chatId, 'outreach_tracking_skipped', existingEligibility.reason, accountKey);
+    return false;
+  }
   const now = new Date().toISOString();
   const patch = {
     account_key: accountKey,
@@ -3808,6 +3843,12 @@ async function startCampaignFromReachTemplate({
   const flowStage = flowStageForReachTemplate(templateKey);
   const campaignStage = campaignStageForReachTemplate(templateKey);
   const sessionId = `template_match_${accountKey}_${Date.now()}`;
+
+  const existingEligibility = existing ? reachEligibility(existing, accountKey) : null;
+  if (existing && !existingEligibility.eligible) {
+    await logEvent(chatId, 'reach_campaign_restart_skipped', existingEligibility.reason, accountKey);
+    return existing;
+  }
 
   if (!existing) {
     await createLead({
@@ -5813,8 +5854,15 @@ function applyReachEligibility(q) {
   return q
     .or('chat_id.not.is.null,lead_chat_id.not.is.null')
     .not('business_connection_id', 'is', null)
+    .or(`stage.is.null,stage.not.in.(${STAGE.INFO_SENT_FINISHED},${STAGE.PAUSED},${STAGE.DISABLED})`)
+    .is('finished_at', null)
+    .is('campaign_completed_at', null)
+    .or('manual_only.is.null,manual_only.eq.false')
+    .or('bot_enabled_for_lead.is.null,bot_enabled_for_lead.eq.true')
     .or('reach_sent.is.null,reach_sent.eq.false')
-    .or('outreach_sent.is.null,outreach_sent.eq.false');
+    .or('outreach_sent.is.null,outreach_sent.eq.false')
+    .is('reach_batch_id', null)
+    .is('outreach_session_id', null);
 }
 
 async function countReachRows(accountOrKey = DEFAULT_ACCOUNT_KEY, tenant = null, apply = null) {
@@ -6121,8 +6169,10 @@ async function executeReachStart(chatId, telegramUserId) {
   let skipped = 0;
   for (const lead of candidates) {
     const targetChatId = leadChatId(lead);
-    if (lead.reach_sent || lead.outreach_sent) {
+    const eligibility = reachEligibility(lead, allowedAccountKey);
+    if (!eligibility.eligible) {
       skipped += 1;
+      await logIgnore(targetChatId || 'unknown', eligibility.reason, 'manual_reach_start', allowedAccountKey);
       continue;
     }
     if (!targetChatId || !lead.business_connection_id) {
@@ -6188,6 +6238,7 @@ async function executeReachStart(chatId, telegramUserId) {
         admin_active_until: null
       };
       const marked = await updateLead(targetChatId, patch, allowedAccountKey);
+      console.log(`[REACH_SEND_RESULT] account_key=${allowedAccountKey} lead_chat_id=${targetChatId} telegram_message_id=${result?.message_id || '-'} success=${marked ? 'true' : 'false'} stage_before=${eligibility.currentStage || '-'} stage_after=${marked?.current_stage || marked?.stage || '-'}`);
       console.log(
         `[OUTREACH_SEND] account_key=${allowedAccountKey} ` +
         `workspace_id=${tenant?.workspace_id || '-'} ` +
@@ -6209,6 +6260,7 @@ async function executeReachStart(chatId, telegramUserId) {
       await sleep(350);
     } catch (err) {
       failed += 1;
+      console.log(`[REACH_SEND_RESULT] account_key=${allowedAccountKey} lead_chat_id=${targetChatId} telegram_message_id=- success=false stage_before=${eligibility.currentStage || '-'} stage_after=${eligibility.currentStage || '-'}`);
       console.log(
         `[OUTREACH_SEND] account_key=${allowedAccountKey} ` +
         `workspace_id=${tenant?.workspace_id || '-'} ` +
