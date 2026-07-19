@@ -4131,14 +4131,9 @@ async function syncAdminContext({ chatId, businessConnectionId, from, text, acco
 }
 
 function strongUserApplicationAnswer(text = '') {
-  const t = normalize(text);
-  if (!t) return null;
-  if (includesAny(t, ['ha', 'xa', 'ha shunday', 'xa shunday', 'shunday', 'togri', "to'g'ri", 'to‘g‘ri', 'ariza qoldirdim', 'qoldirdim', 'qoldirgandim', 'ha qoldirgandim', 'instagramda', 'instagramda qoldirgandim', 'yozgandim', 'dostim aytdi', "do'stim aytdi", 'do‘stim aytdi'])) {
-    return 'application_confirmed';
-  }
-  if (includesAny(t, ['ariza qoldirmadim', 'qoldirmadim', 'qoldirmaganman', 'hali qoldirmadim', 'qanday qoshil', "qanday qo'shil", 'qanday qo‘shil', 'qoshilsam', "qo'shilsam", 'qo‘shilsam', 'link yubor', 'havola yubor', 'ariza qayer'])) {
-    return 'application_not_submitted';
-  }
+  const applicationIntent = matchApplicationIntent(text);
+  if (applicationIntent.intent === 'application_confirmed') return 'application_confirmed';
+  if (applicationIntent.intent === 'application_denied') return 'application_not_submitted';
   return null;
 }
 
@@ -4642,12 +4637,12 @@ async function maybeFinishAutoReport(accountOrKey = DEFAULT_ACCOUNT_KEY) {
 function normalize(text = '') {
   return String(text || '')
     .toLowerCase()
-    .replace(/[’‘`]/g, "'")
-    .replace(/[ў]/g, "o'")
+    .replace(/[’‘`']/g, '')
+    .replace(/[ў]/g, 'o')
     .replace(/[ғ]/g, 'g')
     .replace(/[қ]/g, 'q')
     .replace(/[ҳ]/g, 'h')
-    .replace(/[.,!?！？:;()\[\]{}]+/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -4656,8 +4651,39 @@ function includesAny(t, arr) {
   return arr.some(x => t.includes(x));
 }
 
-function classify(text = '', stage = STAGE.NEW) {
+function matchApplicationIntent(text = '', { traceId = '' } = {}) {
+  const normalizedText = normalize(text);
+  const yesRules = [
+    'ha', 'xa', 'haa', 'ha shunday', 'xa shunday', 'shunday', 'shunaqa', 'ha shunaqa', 'xa shunaqa', 'shunaqami ha',
+    'togri', 'ha togri', 'aynan', 'albatta', 'qoldirganman', 'ha qoldirganman', 'ariza qoldirganman',
+    'ariza qoldirdim', 'qoldirdim', 'qoldirgandim', 'ha qoldirgandim', 'instagramda', 'yozgandim', 'dostim aytdi'
+  ];
+  const noRules = [
+    'yoq', 'yoq qoldirmaganman', 'qoldirmaganman', 'ariza qoldirmadim', 'men qoldirmaganman', 'adashibsiz', 'notogri'
+  ];
+  let matchedIntent = 'unknown';
+  let matchedRule = 'none';
+
+  if (yesRules.includes(normalizedText)) {
+    matchedIntent = 'application_confirmed';
+    matchedRule = `exact_yes:${normalizedText}`;
+  } else if (noRules.includes(normalizedText)) {
+    matchedIntent = 'application_denied';
+    matchedRule = `exact_no:${normalizedText}`;
+  }
+
+  console.log(`[APPLICATION_INTENT_MATCH] trace_id=${traceId || '-'} raw_text=${JSON.stringify(String(text || ''))} normalized_text=${JSON.stringify(normalizedText)} matched_intent=${matchedIntent} matched_rule=${matchedRule} stage=${STAGE.ASKED_APPLICATION}`);
+  return { intent: matchedIntent, normalizedText, matchedRule };
+}
+
+function classify(text = '', stage = STAGE.NEW, { traceId = '' } = {}) {
   const t = normalize(text);
+  if (stage === STAGE.ASKED_APPLICATION) {
+    const applicationIntent = matchApplicationIntent(text, { traceId });
+    if (applicationIntent.intent === 'application_confirmed') return 'application_confirmed';
+    if (applicationIntent.intent === 'application_denied') return 'application_not_submitted';
+  }
+
   const hardReject = ['kerak emas', 'kerakmas', 'qiziq emas', 'yozmang', 'bezovta qilmang', 'stop', 'rad qilaman', 'xohlamayman'];
   if (includesAny(t, hardReject)) return 'hard_reject';
 
@@ -4670,22 +4696,14 @@ function classify(text = '', stage = STAGE.NEW) {
   const paymentWords = ['karta', 'tolov', 'to‘lov', "to'lov", 'pul', 'qayerga tolay', 'qayerga to‘lay', 'to‘layman', "to'layman", 'kartaga'];
   if (includesAny(t, paymentWords)) return 'payment_near';
 
-  const exactNo = ['yu', 'yuk', 'yuq', 'yoq', "yo'q"];
-  if (stage === STAGE.ASKED_APPLICATION && exactNo.includes(t)) return 'application_not_submitted';
+  const exactNo = ['yu', 'yuk', 'yuq', 'yoq'];
   if (stage === STAGE.ASKED_INFO && exactNo.includes(t)) return 'no_info';
 
-  const applicationLink = [
-    'yoq', "yo'q", 'qoldirmagan', 'qoldirmadim', 'ariza qoldirmadim', 'hali qoldirmadim',
-    'qanday qoshil', "qanday qo'shil", 'qanday qo‘shil', 'qoshilsam', "qo'shilsam", 'qo‘shilsam',
-    'qanday ariza', 'ariza qayer', 'link yubor', 'havola yubor', 'qayerdan qoldir'
-  ];
-  if (stage === STAGE.ASKED_APPLICATION && includesAny(t, applicationLink)) return 'application_not_submitted';
+  const applicationLinkRequests = ['hali qoldirmadim', 'qanday qoshil', 'qoshilsam', 'qanday ariza', 'ariza qayer', 'link yubor', 'havola yubor', 'qayerdan qoldir'];
+  if (stage === STAGE.ASKED_APPLICATION && applicationLinkRequests.includes(t)) return 'application_not_submitted';
 
   const submitted = ['ariza qoldirdim', 'qoldirdim', 'yubordim', 'toldirdim', "to'ldirdim", 'to‘ldirdim'];
   if (includesAny(t, submitted)) return 'application_submitted';
-
-  const yes = ['ha', 'xa', 'haa', 'ha shunday', 'shunday', 'albatta', 'togri', "to'g'ri", 'to‘g‘ri', 'instagramda', 'yozgandim', 'dostim aytdi', "do'stim aytdi", 'do‘stim aytdi', 'qoldirgandim'];
-  if (stage === STAGE.ASKED_APPLICATION && includesAny(t, yes)) return 'application_confirmed';
 
   const noInfo = ['yoq', "yo'q", 'bilmayman', 'malumotga ega emas', "ma'lumotga ega emas", 'ma’lumotga ega emas', 'xabardor emas', 'tushuntiring', 'malumot bering', "ma'lumot bering", 'ma’lumot bering', 'qanaqa loyiha', 'batafsil ayting'];
   if (stage === STAGE.ASKED_INFO && includesAny(t, noInfo)) return 'no_info';
@@ -5549,7 +5567,7 @@ async function processLeadBatch(initialLead, texts, traceId = '') {
     return;
   }
   const text = texts.join('\n').trim();
-  const ruleIntent = classify(text, lead.stage);
+  const ruleIntent = classify(text, lead.stage, { traceId });
   const finalRuleIntent = lead.stage === STAGE.ASKED_INFO && ruleIntent === 'unclear'
     ? 'no_info'
     : lead.stage === STAGE.ASKED_APPLICATION && ruleIntent === 'unclear'
