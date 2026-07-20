@@ -70,6 +70,7 @@ const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-t
 const OPENAI_TRANSCRIBE_TIMEOUT_MS = Math.max(1000, Number(process.env.OPENAI_TRANSCRIBE_TIMEOUT_MS || 60000));
 const ADMIN_VOICE_MAX_SECONDS = Math.max(1, Number(process.env.ADMIN_VOICE_MAX_SECONDS || 600));
 const ADMIN_VOICE_MAX_BYTES = Math.max(1, Number(process.env.ADMIN_VOICE_MAX_BYTES || 25000000));
+const ADMIN_VOICE_DOWNLOAD_TIMEOUT_MS = Math.max(1000, Number(process.env.ADMIN_VOICE_DOWNLOAD_TIMEOUT_MS || 30000));
 const UNKNOWN_ACCOUNT_KEY = 'unknown';
 const COMMAND_MANAGEMENT_ACCOUNT_KEYS = new Set([
   DEFAULT_ACCOUNT_KEY,
@@ -10171,6 +10172,19 @@ function adminVoiceBackoffMs(attempt) {
   return Math.min(500 * (2 ** (attempt - 1)), 4000);
 }
 
+// Fine-grained, secret-free diagnostics for each stage of the pipeline so failures
+// are never lost inside one generic catch block.
+function logAdminVoiceStep(step, { ok, status, contentType, bytes, error } = {}) {
+  const errorName = error?.name || '-';
+  const errorCode = error?.code || (status !== undefined && status !== null ? String(status) : '-');
+  const errorMessage = error ? String(error.message || error).replace(/\s+/g, '_').slice(0, 300) : '-';
+  console.log(
+    `[ADMIN_VOICE_STEP] step=${step} ok=${Boolean(ok)} status=${status ?? '-'} ` +
+    `content_type=${contentType || '-'} bytes=${bytes ?? '-'} ` +
+    `error_name=${errorName} error_code=${errorCode} error_message=${errorMessage}`
+  );
+}
+
 async function fetchWithRetry(url, options = {}, { maxRetries = 2, timeoutMs = 15000 } = {}) {
   let lastErr = null;
   for (let attempt = 1; attempt <= maxRetries + 1; attempt += 1) {
@@ -10192,34 +10206,109 @@ async function fetchWithRetry(url, options = {}, { maxRetries = 2, timeoutMs = 1
   throw lastErr || new Error('fetch_retry_exhausted');
 }
 
-async function downloadTelegramVoiceFile(voice) {
-  const fileInfo = await tg('getFile', { file_id: voice.file_id });
-  const filePath = String(fileInfo?.file_path || '');
-  if (!filePath || filePath.includes('..') || !/^[\w\-./]+$/.test(filePath)) {
-    throw Object.assign(new Error('invalid_file_path'), { code: 'invalid_file_path' });
+async function getTelegramFilePath(fileId) {
+  try {
+    const fileInfo = await tg('getFile', { file_id: fileId });
+    const filePath = String(fileInfo?.file_path || '');
+    if (!filePath || filePath.includes('..') || !/^[\w\-./]+$/.test(filePath)) {
+      throw Object.assign(new Error('invalid_file_path'), { code: 'invalid_file_path' });
+    }
+    logAdminVoiceStep('get_file', { ok: true, status: 200, bytes: fileInfo?.file_size });
+    return filePath;
+  } catch (err) {
+    logAdminVoiceStep('get_file', { ok: false, error: err });
+    throw err;
   }
+}
+
+async function downloadTelegramVoiceFile(voice) {
+  const filePath = await getTelegramFilePath(voice.file_id);
   const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
-  const res = await fetchWithRetry(fileUrl, {}, { maxRetries: 2, timeoutMs: TELEGRAM_REQUEST_TIMEOUT_MS });
-  if (!res.ok) throw Object.assign(new Error(`telegram_download_http_${res.status}`), { code: String(res.status) });
-  return Buffer.from(await res.arrayBuffer());
+  try {
+    const res = await fetchWithRetry(fileUrl, {}, { maxRetries: 2, timeoutMs: ADMIN_VOICE_DOWNLOAD_TIMEOUT_MS });
+    const contentType = res.headers.get('content-type') || '-';
+    if (!res.ok) {
+      throw Object.assign(new Error(`telegram_download_http_${res.status}`), { code: String(res.status), status: res.status });
+    }
+    const arrayBuffer = await res.arrayBuffer();
+    if (!arrayBuffer || arrayBuffer.byteLength === 0) {
+      throw Object.assign(new Error('empty_download'), { code: 'empty_download', status: res.status });
+    }
+    logAdminVoiceStep('download', { ok: true, status: res.status, contentType, bytes: arrayBuffer.byteLength });
+    return Buffer.from(arrayBuffer);
+  } catch (err) {
+    logAdminVoiceStep('download', { ok: false, status: err.status, error: err });
+    throw err;
+  }
 }
 
 async function transcribeVoiceWithOpenAI(audioBuffer, mimeType = 'audio/ogg') {
-  if (!OPENAI_API_KEY) throw Object.assign(new Error('openai_api_key_missing'), { code: 'config' });
-  const form = new FormData();
-  form.append('file', new Blob([audioBuffer], { type: mimeType || 'audio/ogg' }), 'voice.ogg');
-  form.append('model', OPENAI_TRANSCRIBE_MODEL);
-  form.append('language', 'uz');
-  form.append('temperature', '0');
-  form.append('prompt', ADMIN_VOICE_TRANSCRIBE_PROMPT);
-  const res = await fetchWithRetry('https://api.openai.com/v1/audio/transcriptions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: form
-  }, { maxRetries: 2, timeoutMs: OPENAI_TRANSCRIBE_TIMEOUT_MS });
-  const data = await res.json().catch(() => null);
-  if (!res.ok) throw Object.assign(new Error(data?.error?.message || `openai_transcription_http_${res.status}`), { code: String(res.status) });
-  return String(data?.text || '');
+  if (!OPENAI_API_KEY) {
+    const err = Object.assign(new Error('openai_api_key_missing'), { code: 'config' });
+    logAdminVoiceStep('openai_request', { ok: false, error: err });
+    throw err;
+  }
+
+  let form;
+  try {
+    form = new FormData();
+    // Wrap as Uint8Array explicitly: the most portable BlobPart across Node/undici versions.
+    form.append('file', new Blob([new Uint8Array(audioBuffer)], { type: mimeType || 'audio/ogg' }), 'voice.ogg');
+    form.append('model', OPENAI_TRANSCRIBE_MODEL);
+    form.append('language', 'uz');
+    form.append('temperature', '0');
+    form.append('prompt', ADMIN_VOICE_TRANSCRIBE_PROMPT);
+    logAdminVoiceStep('form_data', { ok: true, bytes: audioBuffer.length, contentType: mimeType || 'audio/ogg' });
+  } catch (err) {
+    logAdminVoiceStep('form_data', { ok: false, error: err });
+    throw err;
+  }
+
+  let res;
+  try {
+    // Do not set Content-Type manually - fetch computes the multipart boundary itself.
+    res = await fetchWithRetry('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      body: form
+    }, { maxRetries: 2, timeoutMs: OPENAI_TRANSCRIBE_TIMEOUT_MS });
+    logAdminVoiceStep('openai_request', { ok: true, status: res.status, contentType: res.headers.get('content-type') });
+  } catch (err) {
+    logAdminVoiceStep('openai_request', { ok: false, error: err });
+    throw err;
+  }
+
+  // Read the body exactly once as text, then attempt JSON parsing locally, so a
+  // non-JSON error body (proxy/gateway page, truncated response) is never silently lost.
+  const rawText = await res.text().catch(() => '');
+  let data = null;
+  let parseError = null;
+  if (rawText) {
+    try {
+      data = JSON.parse(rawText);
+    } catch (err) {
+      parseError = err;
+    }
+  }
+
+  if (!res.ok) {
+    const apiError = data?.error || {};
+    const err = Object.assign(
+      new Error(apiError.message || parseError?.message || `openai_transcription_http_${res.status}`),
+      { code: apiError.code || String(res.status) }
+    );
+    logAdminVoiceStep('openai_response', { ok: false, status: res.status, error: err });
+    throw err;
+  }
+
+  if (parseError) {
+    logAdminVoiceStep('openai_response', { ok: false, status: res.status, error: parseError });
+    throw Object.assign(new Error('openai_invalid_json_response'), { code: String(res.status) });
+  }
+
+  const text = typeof data?.text === 'string' ? data.text : '';
+  logAdminVoiceStep('openai_response', { ok: true, status: res.status, bytes: text.length });
+  return text;
 }
 
 function splitTranscriptIntoChunks(text, minLen = ADMIN_VOICE_CHUNK_MIN, maxLen = ADMIN_VOICE_CHUNK_MAX) {
@@ -10249,15 +10338,18 @@ async function sendOrEditAdminVoiceMessage(chatId, messageId, text) {
   if (messageId) {
     try {
       await tg('editMessageText', { chat_id: chatId, message_id: messageId, text });
+      logAdminVoiceStep('telegram_reply', { ok: true, status: 200 });
       return messageId;
     } catch (err) {
       console.error('[ADMIN_VOICE_EDIT_FAILED]', err?.message || err);
     }
   }
   const sent = await tg('sendMessage', { chat_id: chatId, text }).catch(err => {
+    logAdminVoiceStep('telegram_reply', { ok: false, error: err });
     console.error('[ADMIN_VOICE_SEND_FAILED]', err?.message || err);
     return null;
   });
+  if (sent) logAdminVoiceStep('telegram_reply', { ok: true, status: 200 });
   return sent?.message_id || null;
 }
 
@@ -10266,6 +10358,8 @@ async function handleAdminVoiceTranscription(msg) {
   const chatId = String(msg.chat.id);
   const adminUserId = String(msg.from?.id || '');
   const fileUniqueId = voice.file_unique_id || '';
+
+  console.log(`[ADMIN_VOICE_CONFIG] openai_key_present=${Boolean(OPENAI_API_KEY)} bot_token_present=${Boolean(BOT_TOKEN)}`);
 
   if (Number(voice.duration || 0) > ADMIN_VOICE_MAX_SECONDS || Number(voice.file_size || 0) > ADMIN_VOICE_MAX_BYTES) {
     await tg('sendMessage', { chat_id: chatId, text: ADMIN_VOICE_LIMIT_TEXT }).catch(() => {});
@@ -10337,6 +10431,7 @@ async function handleAdminVoiceUpdate(update = {}) {
   const chatId = String(msg.chat?.id || '');
   const adminUserId = String(msg.from?.id || '');
   const authorized = await isKnownAdminMessage(msg);
+  logAdminVoiceStep('authorization', { ok: authorized });
   console.log(
     `[ADMIN_VOICE_RECEIVED] admin_user_id=${adminUserId || '-'} chat_id=${chatId || '-'} ` +
     `file_unique_id=${voice.file_unique_id || '-'} duration_seconds=${voice.duration ?? '-'} ` +
