@@ -66,7 +66,10 @@ const AI_INTENT_ENABLED = String(process.env.AI_INTENT_ENABLED || 'true') === 't
 const AI_TEMPLATE_EDITOR_ENABLED = String(process.env.AI_TEMPLATE_EDITOR_ENABLED || 'true') === 'true';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-transcribe';
+// whisper-1 has reliable, broad multilingual support including Uzbek (language=uz).
+// gpt-4o-transcribe rejects language=uz outright (error_code=invalid_value) and, left to
+// auto-detect without that parameter, mis-identifies Uzbek speech as Turkish.
+const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || 'whisper-1';
 const OPENAI_TRANSCRIBE_TIMEOUT_MS = Math.max(1000, Number(process.env.OPENAI_TRANSCRIBE_TIMEOUT_MS || 60000));
 const ADMIN_VOICE_MAX_SECONDS = Math.max(1, Number(process.env.ADMIN_VOICE_MAX_SECONDS || 600));
 const ADMIN_VOICE_MAX_BYTES = Math.max(1, Number(process.env.ADMIN_VOICE_MAX_BYTES || 25000000));
@@ -10249,10 +10252,9 @@ async function transcribeVoiceWithOpenAI(audioBuffer, mimeType = 'audio/ogg', la
     throw err;
   }
 
-  // language is intentionally NOT sent on the primary request: OpenAI's gpt-4o-transcribe
-  // rejects "uz" with error_code=invalid_value. The Uzbek-language instruction lives in
-  // ADMIN_VOICE_TRANSCRIBE_PROMPT instead. `language` stays an optional argument only so a
-  // future caller can still pass one; see the fallback below if it's ever rejected again.
+  // Caller passes language='uz' explicitly (see OPENAI_TRANSCRIBE_MODEL note above) so the
+  // model doesn't have to auto-detect it - without this, Uzbek speech gets misidentified as
+  // a related language rather than relying on ADMIN_VOICE_TRANSCRIBE_PROMPT alone.
   const postForm = async (lang) => {
     const form = new FormData();
     // Wrap as Uint8Array explicitly: the most portable BlobPart across Node/undici versions.
@@ -10406,10 +10408,10 @@ async function handleAdminVoiceTranscription(msg) {
     const transcribeStartedAt = Date.now();
     let transcript = '';
     try {
-      transcript = await transcribeVoiceWithOpenAI(audioBuffer, voice.mime_type);
-      console.log(`[ADMIN_VOICE_TRANSCRIPTION] file_unique_id=${fileUniqueId || '-'} model=${OPENAI_TRANSCRIBE_MODEL} language_hint=prompt language_parameter_sent=false ok=true text_length=${transcript.length} duration_ms=${Date.now() - transcribeStartedAt} error_code=- error_description=-`);
+      transcript = await transcribeVoiceWithOpenAI(audioBuffer, voice.mime_type, 'uz');
+      console.log(`[ADMIN_VOICE_TRANSCRIPTION] file_unique_id=${fileUniqueId || '-'} model=${OPENAI_TRANSCRIBE_MODEL} language_hint=parameter language_parameter_sent=true ok=true text_length=${transcript.length} duration_ms=${Date.now() - transcribeStartedAt} error_code=- error_description=-`);
     } catch (err) {
-      console.log(`[ADMIN_VOICE_TRANSCRIPTION] file_unique_id=${fileUniqueId || '-'} model=${OPENAI_TRANSCRIBE_MODEL} language_hint=prompt language_parameter_sent=false ok=false text_length=0 duration_ms=${Date.now() - transcribeStartedAt} error_code=${err?.code || '-'} error_description=${String(err?.message || '').replace(/\s+/g, '_').slice(0, 200)}`);
+      console.log(`[ADMIN_VOICE_TRANSCRIPTION] file_unique_id=${fileUniqueId || '-'} model=${OPENAI_TRANSCRIBE_MODEL} language_hint=parameter language_parameter_sent=true ok=false text_length=0 duration_ms=${Date.now() - transcribeStartedAt} error_code=${err?.code || '-'} error_description=${String(err?.message || '').replace(/\s+/g, '_').slice(0, 200)}`);
       throw err;
     }
 

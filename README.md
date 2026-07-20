@@ -425,7 +425,7 @@ Flow komandalar:
 Ruxsatli admin asosiy botga (mavjud admin authorization helper orqali tanilgan) shaxsiy chatdan (business chat emas) voice message yuborsa, bot ovozni yuklab oladi va OpenAI orqali o‘zbekcha matnga aylantirib aynan o‘sha chatga qaytaradi. Mustaqil funksiya: Telegram Business customer oqimi, reach/outreach, reply_templates, lead stage, arxiv, admin takeover va notification routingga tegmaydi.
 
 ```text
-OPENAI_TRANSCRIBE_MODEL=gpt-4o-transcribe
+OPENAI_TRANSCRIBE_MODEL=whisper-1
 OPENAI_TRANSCRIBE_TIMEOUT_MS=60000
 ADMIN_VOICE_MAX_SECONDS=600
 ADMIN_VOICE_MAX_BYTES=25000000
@@ -433,6 +433,8 @@ ADMIN_VOICE_DOWNLOAD_TIMEOUT_MS=30000
 ```
 
 `OPENAI_API_KEY` bo‘lmasa transkripsiya xato xabari bilan yakunlanadi, boshqa hech qanday bot funksiyasiga ta’sir qilmaydi. Belgilangan davomiylik yoki hajmdan katta ovozli xabar OpenAI’ga yuborilmaydi. Bitta admin uchun bir vaqtda faqat bitta audio qayta ishlanadi (per-admin lock); audio hech qachon diskka yoki DB’ga saqlanmaydi.
+
+Model sifatida `whisper-1` ishlatiladi va so‘rovga `language=uz` aniq yuboriladi — `gpt-4o-transcribe` `uz` kodini rad etadi (`invalid_value`) va tilni avtomatik aniqlashga qoldirilsa, o‘zbekcha nutqni boshqa (turkiy) til deb tanib qo‘yishi mumkin edi.
 
 Har bir bosqich (`authorization`, `get_file`, `download`, `form_data`, `openai_request`, `openai_response`, `telegram_reply`) `[ADMIN_VOICE_STEP]` logi bilan alohida kuzatiladi — muammo aynan qaysi bosqichda ekani va HTTP status/real xato matni (kalitlarsiz) Render loglarida ko‘rinadi.
 
