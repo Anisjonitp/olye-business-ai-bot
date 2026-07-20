@@ -66,6 +66,10 @@ const AI_INTENT_ENABLED = String(process.env.AI_INTENT_ENABLED || 'true') === 't
 const AI_TEMPLATE_EDITOR_ENABLED = String(process.env.AI_TEMPLATE_EDITOR_ENABLED || 'true') === 'true';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-transcribe';
+const OPENAI_TRANSCRIBE_TIMEOUT_MS = Math.max(1000, Number(process.env.OPENAI_TRANSCRIBE_TIMEOUT_MS || 60000));
+const ADMIN_VOICE_MAX_SECONDS = Math.max(1, Number(process.env.ADMIN_VOICE_MAX_SECONDS || 600));
+const ADMIN_VOICE_MAX_BYTES = Math.max(1, Number(process.env.ADMIN_VOICE_MAX_BYTES || 25000000));
 const UNKNOWN_ACCOUNT_KEY = 'unknown';
 const COMMAND_MANAGEMENT_ACCOUNT_KEYS = new Set([
   DEFAULT_ACCOUNT_KEY,
@@ -10145,6 +10149,204 @@ app.post('/admin-webhook', async (req, res) => {
   }
 });
 
+// -------------------- Admin voice transcription (isolated feature) --------------------
+// Personal-chat admin voice notes -> Uzbek text, via OpenAI audio transcription.
+// Does not touch business_message flow, reach/outreach, templates, stages, or archive.
+const ADMIN_VOICE_TRANSCRIBE_PROMPT = 'Audio o‘zbek tilida. Matnni o‘zbek lotin yozuvida aniq ko‘chiring. So‘zlarni tarjima qilmang va mazmun qo‘shmang. Ism-familiyalar, ta’lim muassasalari, tashkilotlar, joy nomlari va quyidagi loyiha nomlarini ehtiyotkor yozing: O‘zbekiston Lider Yoshlari Ensiklopediyasi, UZLYE, O‘zbekiston Bunyodkor Yoshlari Ensiklopediyasi, OBYE, Smart Combinator, Telegram Business, Supabase, Render, OpenAI. Tinish belgilarini tabiiy qo‘ying.';
+const ADMIN_VOICE_STATUS_TEXT = '🎙 Ovozli xabar matnga aylantirilmoqda...';
+const ADMIN_VOICE_EMPTY_TEXT = '⚠️ Ovoz aniq tanilmadi. Tinchroq joyda, mikrofonga yaqinroq gapirib qayta yuboring.';
+const ADMIN_VOICE_ERROR_TEXT = '❌ Ovozli xabarni matnga aylantirib bo‘lmadi. Birozdan keyin qayta urinib ko‘ring.';
+const ADMIN_VOICE_LIMIT_TEXT = '⚠️ Ovozli xabar juda uzun yoki hajmi katta. Uni qismlarga bo‘lib yuboring.';
+const ADMIN_VOICE_BUSY_TEXT = 'Oldingi audio hali qayta ishlanmoqda.';
+const ADMIN_VOICE_RESULT_HEADER = '📝 Ovozli xabar matni:\n\n';
+const ADMIN_VOICE_CHUNK_MIN = 3500;
+const ADMIN_VOICE_CHUNK_MAX = 3800;
+const adminVoiceProcessingLocks = new Set();
+
+function isPrivateAdminChat(msg = {}) {
+  return !msg.chat?.type || msg.chat.type === 'private';
+}
+
+function adminVoiceBackoffMs(attempt) {
+  return Math.min(500 * (2 ** (attempt - 1)), 4000);
+}
+
+async function fetchWithRetry(url, options = {}, { maxRetries = 2, timeoutMs = 15000 } = {}) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timer);
+      const retryableStatus = res.status === 429 || res.status >= 500;
+      if (res.ok || !retryableStatus || attempt > maxRetries) return res;
+      await sleep(adminVoiceBackoffMs(attempt));
+    } catch (err) {
+      clearTimeout(timer);
+      lastErr = err?.name === 'AbortError' ? Object.assign(new Error('request_timeout'), { code: 'timeout' }) : err;
+      if (attempt > maxRetries) throw lastErr;
+      await sleep(adminVoiceBackoffMs(attempt));
+    }
+  }
+  throw lastErr || new Error('fetch_retry_exhausted');
+}
+
+async function downloadTelegramVoiceFile(voice) {
+  const fileInfo = await tg('getFile', { file_id: voice.file_id });
+  const filePath = String(fileInfo?.file_path || '');
+  if (!filePath || filePath.includes('..') || !/^[\w\-./]+$/.test(filePath)) {
+    throw Object.assign(new Error('invalid_file_path'), { code: 'invalid_file_path' });
+  }
+  const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+  const res = await fetchWithRetry(fileUrl, {}, { maxRetries: 2, timeoutMs: TELEGRAM_REQUEST_TIMEOUT_MS });
+  if (!res.ok) throw Object.assign(new Error(`telegram_download_http_${res.status}`), { code: String(res.status) });
+  return Buffer.from(await res.arrayBuffer());
+}
+
+async function transcribeVoiceWithOpenAI(audioBuffer, mimeType = 'audio/ogg') {
+  if (!OPENAI_API_KEY) throw Object.assign(new Error('openai_api_key_missing'), { code: 'config' });
+  const form = new FormData();
+  form.append('file', new Blob([audioBuffer], { type: mimeType || 'audio/ogg' }), 'voice.ogg');
+  form.append('model', OPENAI_TRANSCRIBE_MODEL);
+  form.append('language', 'uz');
+  form.append('temperature', '0');
+  form.append('prompt', ADMIN_VOICE_TRANSCRIBE_PROMPT);
+  const res = await fetchWithRetry('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: form
+  }, { maxRetries: 2, timeoutMs: OPENAI_TRANSCRIBE_TIMEOUT_MS });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw Object.assign(new Error(data?.error?.message || `openai_transcription_http_${res.status}`), { code: String(res.status) });
+  return String(data?.text || '');
+}
+
+function splitTranscriptIntoChunks(text, minLen = ADMIN_VOICE_CHUNK_MIN, maxLen = ADMIN_VOICE_CHUNK_MAX) {
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > maxLen) {
+    let cut = -1;
+    const newlineIdx = remaining.lastIndexOf('\n', maxLen);
+    if (newlineIdx >= minLen) cut = newlineIdx + 1;
+    if (cut === -1) {
+      const sentenceIdx = remaining.lastIndexOf('. ', maxLen);
+      if (sentenceIdx >= minLen) cut = sentenceIdx + 2;
+    }
+    if (cut === -1) {
+      const spaceIdx = remaining.lastIndexOf(' ', maxLen);
+      if (spaceIdx >= minLen) cut = spaceIdx + 1;
+    }
+    if (cut === -1) cut = maxLen;
+    chunks.push(remaining.slice(0, cut).trim());
+    remaining = remaining.slice(cut);
+  }
+  if (remaining.trim()) chunks.push(remaining.trim());
+  return chunks;
+}
+
+async function sendOrEditAdminVoiceMessage(chatId, messageId, text) {
+  if (messageId) {
+    try {
+      await tg('editMessageText', { chat_id: chatId, message_id: messageId, text });
+      return messageId;
+    } catch (err) {
+      console.error('[ADMIN_VOICE_EDIT_FAILED]', err?.message || err);
+    }
+  }
+  const sent = await tg('sendMessage', { chat_id: chatId, text }).catch(err => {
+    console.error('[ADMIN_VOICE_SEND_FAILED]', err?.message || err);
+    return null;
+  });
+  return sent?.message_id || null;
+}
+
+async function handleAdminVoiceTranscription(msg) {
+  const voice = msg.voice;
+  const chatId = String(msg.chat.id);
+  const adminUserId = String(msg.from?.id || '');
+  const fileUniqueId = voice.file_unique_id || '';
+
+  if (Number(voice.duration || 0) > ADMIN_VOICE_MAX_SECONDS || Number(voice.file_size || 0) > ADMIN_VOICE_MAX_BYTES) {
+    await tg('sendMessage', { chat_id: chatId, text: ADMIN_VOICE_LIMIT_TEXT }).catch(() => {});
+    return;
+  }
+
+  if (adminVoiceProcessingLocks.has(adminUserId)) {
+    await tg('sendMessage', { chat_id: chatId, text: ADMIN_VOICE_BUSY_TEXT }).catch(() => {});
+    return;
+  }
+  adminVoiceProcessingLocks.add(adminUserId);
+
+  let statusMessageId = null;
+  let replyOk = false;
+  let replyParts = 0;
+  let replyError = '-';
+  try {
+    const status = await tg('sendMessage', { chat_id: chatId, text: ADMIN_VOICE_STATUS_TEXT });
+    statusMessageId = status?.message_id || null;
+
+    const downloadStartedAt = Date.now();
+    let audioBuffer;
+    try {
+      audioBuffer = await downloadTelegramVoiceFile(voice);
+      console.log(`[ADMIN_VOICE_DOWNLOAD] file_unique_id=${fileUniqueId || '-'} ok=true bytes=${audioBuffer.length} duration_ms=${Date.now() - downloadStartedAt} error_code=-`);
+    } catch (err) {
+      console.log(`[ADMIN_VOICE_DOWNLOAD] file_unique_id=${fileUniqueId || '-'} ok=false bytes=- duration_ms=${Date.now() - downloadStartedAt} error_code=${err?.code || '-'}`);
+      throw err;
+    }
+
+    const transcribeStartedAt = Date.now();
+    let transcript = '';
+    try {
+      transcript = await transcribeVoiceWithOpenAI(audioBuffer, voice.mime_type);
+      console.log(`[ADMIN_VOICE_TRANSCRIPTION] file_unique_id=${fileUniqueId || '-'} model=${OPENAI_TRANSCRIBE_MODEL} language=uz ok=true text_length=${transcript.length} duration_ms=${Date.now() - transcribeStartedAt} error_code=- error_description=-`);
+    } catch (err) {
+      console.log(`[ADMIN_VOICE_TRANSCRIPTION] file_unique_id=${fileUniqueId || '-'} model=${OPENAI_TRANSCRIBE_MODEL} language=uz ok=false text_length=0 duration_ms=${Date.now() - transcribeStartedAt} error_code=${err?.code || '-'} error_description=${String(err?.message || '').replace(/\s+/g, '_').slice(0, 200)}`);
+      throw err;
+    }
+
+    if (!transcript.trim()) {
+      await sendOrEditAdminVoiceMessage(chatId, statusMessageId, ADMIN_VOICE_EMPTY_TEXT);
+      replyOk = true;
+      replyParts = 1;
+      return;
+    }
+
+    const chunks = splitTranscriptIntoChunks(transcript.trim());
+    await sendOrEditAdminVoiceMessage(chatId, statusMessageId, ADMIN_VOICE_RESULT_HEADER + chunks[0]);
+    for (let i = 1; i < chunks.length; i += 1) {
+      await tg('sendMessage', { chat_id: chatId, text: chunks[i] });
+    }
+    replyOk = true;
+    replyParts = chunks.length;
+  } catch (err) {
+    replyError = String(err?.message || err).replace(/\s+/g, '_').slice(0, 200);
+    await sendOrEditAdminVoiceMessage(chatId, statusMessageId, ADMIN_VOICE_ERROR_TEXT);
+  } finally {
+    adminVoiceProcessingLocks.delete(adminUserId);
+    console.log(`[ADMIN_VOICE_REPLY] admin_user_id=${adminUserId || '-'} ok=${replyOk} parts=${replyParts} error=${replyOk ? '-' : replyError}`);
+  }
+}
+
+async function handleAdminVoiceUpdate(update = {}) {
+  const msg = update.message;
+  if (!msg?.voice || update.business_message) return false;
+  if (isBotMessage(msg) || !isPrivateAdminChat(msg)) return false;
+  const voice = msg.voice;
+  const chatId = String(msg.chat?.id || '');
+  const adminUserId = String(msg.from?.id || '');
+  const authorized = await isKnownAdminMessage(msg);
+  console.log(
+    `[ADMIN_VOICE_RECEIVED] admin_user_id=${adminUserId || '-'} chat_id=${chatId || '-'} ` +
+    `file_unique_id=${voice.file_unique_id || '-'} duration_seconds=${voice.duration ?? '-'} ` +
+    `file_size=${voice.file_size ?? '-'} authorized=${authorized}`
+  );
+  if (!authorized) return false;
+  await handleAdminVoiceTranscription(msg);
+  return true;
+}
+
 app.post('/webhook', async (req, res) => {
   if (WEBHOOK_SECRET) {
     const header = req.get('x-telegram-bot-api-secret-token');
@@ -10154,6 +10356,10 @@ app.post('/webhook', async (req, res) => {
   try {
     const update = req.body || {};
     const traceId = logUpdateReceived(update, 'user');
+    if (await handleAdminVoiceUpdate(update)) {
+      runtimeStatus.updates_processed += 1;
+      return;
+    }
     if (update.callback_query) await handleCallback(update.callback_query);
     if (update.message) {
       if (await handleUserOnboardingMessage(update.message)) return;
