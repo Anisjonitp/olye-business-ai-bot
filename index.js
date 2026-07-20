@@ -10153,7 +10153,7 @@ app.post('/admin-webhook', async (req, res) => {
 // -------------------- Admin voice transcription (isolated feature) --------------------
 // Personal-chat admin voice notes -> Uzbek text, via OpenAI audio transcription.
 // Does not touch business_message flow, reach/outreach, templates, stages, or archive.
-const ADMIN_VOICE_TRANSCRIBE_PROMPT = 'Audio o‘zbek tilida. Matnni o‘zbek lotin yozuvida aniq ko‘chiring. So‘zlarni tarjima qilmang va mazmun qo‘shmang. Ism-familiyalar, ta’lim muassasalari, tashkilotlar, joy nomlari va quyidagi loyiha nomlarini ehtiyotkor yozing: O‘zbekiston Lider Yoshlari Ensiklopediyasi, UZLYE, O‘zbekiston Bunyodkor Yoshlari Ensiklopediyasi, OBYE, Smart Combinator, Telegram Business, Supabase, Render, OpenAI. Tinish belgilarini tabiiy qo‘ying.';
+const ADMIN_VOICE_TRANSCRIBE_PROMPT = 'Bu audio o‘zbek tilida. Nutqni o‘zbek lotin yozuvida aynan matnga ko‘chiring. Tarjima qilmang, qisqartirmang va mazmun qo‘shmang. Ism-familiyalar, tashkilotlar va joy nomlarini ehtiyotkor yozing.';
 const ADMIN_VOICE_STATUS_TEXT = '🎙 Ovozli xabar matnga aylantirilmoqda...';
 const ADMIN_VOICE_EMPTY_TEXT = '⚠️ Ovoz aniq tanilmadi. Tinchroq joyda, mikrofonga yaqinroq gapirib qayta yuboring.';
 const ADMIN_VOICE_ERROR_TEXT = '❌ Ovozli xabarni matnga aylantirib bo‘lmadi. Birozdan keyin qayta urinib ko‘ring.';
@@ -10242,52 +10242,65 @@ async function downloadTelegramVoiceFile(voice) {
   }
 }
 
-async function transcribeVoiceWithOpenAI(audioBuffer, mimeType = 'audio/ogg') {
+async function transcribeVoiceWithOpenAI(audioBuffer, mimeType = 'audio/ogg', language) {
   if (!OPENAI_API_KEY) {
     const err = Object.assign(new Error('openai_api_key_missing'), { code: 'config' });
     logAdminVoiceStep('openai_request', { ok: false, error: err });
     throw err;
   }
 
-  let form;
-  try {
-    form = new FormData();
+  // language is intentionally NOT sent on the primary request: OpenAI's gpt-4o-transcribe
+  // rejects "uz" with error_code=invalid_value. The Uzbek-language instruction lives in
+  // ADMIN_VOICE_TRANSCRIBE_PROMPT instead. `language` stays an optional argument only so a
+  // future caller can still pass one; see the fallback below if it's ever rejected again.
+  const postForm = async (lang) => {
+    const form = new FormData();
     // Wrap as Uint8Array explicitly: the most portable BlobPart across Node/undici versions.
     form.append('file', new Blob([new Uint8Array(audioBuffer)], { type: mimeType || 'audio/ogg' }), 'voice.ogg');
     form.append('model', OPENAI_TRANSCRIBE_MODEL);
-    form.append('language', 'uz');
+    if (lang) form.append('language', lang);
     form.append('temperature', '0');
     form.append('prompt', ADMIN_VOICE_TRANSCRIBE_PROMPT);
-    logAdminVoiceStep('form_data', { ok: true, bytes: audioBuffer.length, contentType: mimeType || 'audio/ogg' });
-  } catch (err) {
-    logAdminVoiceStep('form_data', { ok: false, error: err });
-    throw err;
-  }
-
-  let res;
-  try {
     // Do not set Content-Type manually - fetch computes the multipart boundary itself.
-    res = await fetchWithRetry('https://api.openai.com/v1/audio/transcriptions', {
+    const res = await fetchWithRetry('https://api.openai.com/v1/audio/transcriptions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
       body: form
     }, { maxRetries: 2, timeoutMs: OPENAI_TRANSCRIBE_TIMEOUT_MS });
+    // Read the body exactly once as text, then attempt JSON parsing locally, so a
+    // non-JSON error body (proxy/gateway page, truncated response) is never silently lost.
+    const rawText = await res.text().catch(() => '');
+    let data = null;
+    let parseError = null;
+    if (rawText) {
+      try {
+        data = JSON.parse(rawText);
+      } catch (err) {
+        parseError = err;
+      }
+    }
+    return { res, data, parseError };
+  };
+
+  let res, data, parseError;
+  try {
+    logAdminVoiceStep('form_data', { ok: true, bytes: audioBuffer.length, contentType: mimeType || 'audio/ogg' });
+    ({ res, data, parseError } = await postForm(language));
     logAdminVoiceStep('openai_request', { ok: true, status: res.status, contentType: res.headers.get('content-type') });
   } catch (err) {
     logAdminVoiceStep('openai_request', { ok: false, error: err });
     throw err;
   }
 
-  // Read the body exactly once as text, then attempt JSON parsing locally, so a
-  // non-JSON error body (proxy/gateway page, truncated response) is never silently lost.
-  const rawText = await res.text().catch(() => '');
-  let data = null;
-  let parseError = null;
-  if (rawText) {
+  // Safe compatibility fallback: if a language code is ever supplied again and OpenAI
+  // rejects it as an unrecognized value, retry once without the language parameter.
+  if (!res.ok && language && data?.error?.code === 'invalid_value' && /language/i.test(data?.error?.message || '')) {
     try {
-      data = JSON.parse(rawText);
+      ({ res, data, parseError } = await postForm(undefined));
+      logAdminVoiceStep('openai_request', { ok: true, status: res.status, contentType: res.headers.get('content-type') });
     } catch (err) {
-      parseError = err;
+      logAdminVoiceStep('openai_request', { ok: false, error: err });
+      throw err;
     }
   }
 
@@ -10394,9 +10407,9 @@ async function handleAdminVoiceTranscription(msg) {
     let transcript = '';
     try {
       transcript = await transcribeVoiceWithOpenAI(audioBuffer, voice.mime_type);
-      console.log(`[ADMIN_VOICE_TRANSCRIPTION] file_unique_id=${fileUniqueId || '-'} model=${OPENAI_TRANSCRIBE_MODEL} language=uz ok=true text_length=${transcript.length} duration_ms=${Date.now() - transcribeStartedAt} error_code=- error_description=-`);
+      console.log(`[ADMIN_VOICE_TRANSCRIPTION] file_unique_id=${fileUniqueId || '-'} model=${OPENAI_TRANSCRIBE_MODEL} language_hint=prompt language_parameter_sent=false ok=true text_length=${transcript.length} duration_ms=${Date.now() - transcribeStartedAt} error_code=- error_description=-`);
     } catch (err) {
-      console.log(`[ADMIN_VOICE_TRANSCRIPTION] file_unique_id=${fileUniqueId || '-'} model=${OPENAI_TRANSCRIBE_MODEL} language=uz ok=false text_length=0 duration_ms=${Date.now() - transcribeStartedAt} error_code=${err?.code || '-'} error_description=${String(err?.message || '').replace(/\s+/g, '_').slice(0, 200)}`);
+      console.log(`[ADMIN_VOICE_TRANSCRIPTION] file_unique_id=${fileUniqueId || '-'} model=${OPENAI_TRANSCRIBE_MODEL} language_hint=prompt language_parameter_sent=false ok=false text_length=0 duration_ms=${Date.now() - transcribeStartedAt} error_code=${err?.code || '-'} error_description=${String(err?.message || '').replace(/\s+/g, '_').slice(0, 200)}`);
       throw err;
     }
 
